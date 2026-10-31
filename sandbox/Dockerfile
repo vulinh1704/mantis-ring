@@ -10,7 +10,7 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates \
- && npm install -g @vulinh1704/mantis@0.4.0 \
+ && npm install -g @vulinh1704/mantis@0.7.1 \
  && node "$(npm root -g)/@vulinh1704/mantis/node_modules/playwright/cli.js" install --with-deps --only-shell chromium \
  && rm -rf /var/lib/apt/lists/* /root/.npm /tmp/*
 
