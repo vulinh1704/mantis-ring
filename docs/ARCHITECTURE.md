@@ -62,6 +62,9 @@ Both suites take `RING_RUNTIME=runsc` to run the sandboxes in gVisor.
 
 | Part | AI? | When |
 |---|---|---|
-| Mantis CLI (MIT, npm `@vulinh1704/mantis`) | no | before; an existing open-source library |
-| Sandbox image, allowlist proxy, runner, containment tests (this repository up to the kickoff tag) | no | before (30 Oct – 3 Nov) |
-| Agent loop, prompts, tools, Serverless Inference client, cover-up gate, web app, Vultr deployment | yes / product | during (3–9 Nov) |
+| Mantis CLI (MIT, npm `@vulinh1704/mantis`), including its cover-up detection | no | before; an existing open-source library |
+| Mantis agent skills (`plugins/mantis/skills/`, including the `mantis-fix` prompt) and MCP server (`src/mcp.js`) | yes (prompts, tool schemas) | before; published with Mantis, listed in the README |
+| Sandbox image, allowlist proxy, runner, containment tests and fixtures, VM bootstrap script (this repository up to the `pre-event-final` tag) | no | before (30 Oct – 3 Nov, 22:00 ICT) |
+| Ring's prompts and tool schemas (written fresh), Serverless Inference client, the agent loop that the existing Mantis cover-up check gates, vision-model check, web app, Vultr deployment | yes / product | during (3–9 Nov) |
+
+The README's "Built before the event" section has the details and the tags.
