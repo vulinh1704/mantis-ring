@@ -6,7 +6,8 @@ import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 
 export const LIMITS = { memory: '3g', cpus: '2', pids: 512, shm: '512m', work: '2g', tmp: '512m', home: '1g' };
-const PROXY = 'http://ring-proxy:8888';
+const PROXY_NAME = 'ring-proxy';
+const PROXY = `http://${PROXY_NAME}:8888`;
 
 /** Run a command; resolve with its exit code and output. `input` is piped to stdin. */
 export function run(cmd, args, { input, timeoutMs = 0, onData } = {}) {
@@ -27,9 +28,15 @@ export class Sandbox {
   /** Start a fresh container. `runtime: 'runsc'` uses gVisor where it is installed (the Vultr VM). */
   static async create({ image = 'mantis-ring/sandbox', runtime, limits = LIMITS } = {}) {
     const name = `ring-${randomBytes(4).toString('hex')}`;
+    // The proxy's name goes into the sandbox's /etc/hosts. Under gVisor (runsc), Docker's embedded
+    // DNS on a user-defined network cannot be reached, so `ring-proxy` would not resolve; see "DNS
+    // doesn't work on a Docker user defined bridge network" in https://gvisor.dev/docs/user_guide/faq/.
+    const ip = await run('docker', ['inspect', '-f', `{{(index .NetworkSettings.Networks "ring-internal").IPAddress}}`, PROXY_NAME]);
+    const proxyIp = ip.stdout.trim();
+    if (ip.code !== 0 || !/^\d{1,3}(\.\d{1,3}){3}$/.test(proxyIp)) throw new Error(`${PROXY_NAME} is not running on ring-internal: run scripts/setup.sh`);
     const args = [
       'run', '-d', '--name', name, '--label', 'mantis-ring=task',
-      '--network', 'ring-internal',
+      '--network', 'ring-internal', '--add-host', `${PROXY_NAME}:${proxyIp}`,
       '--read-only',
       // Writable scratch space, owned by the sandbox user (uid 10001); everything else is read-only.
       '--tmpfs', `/work:rw,exec,size=${limits.work},uid=10001,gid=10001,mode=0755`,

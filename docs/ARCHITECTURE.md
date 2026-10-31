@@ -24,7 +24,7 @@ Browser ──► Vultr VM (Cloud Compute)
    - `--read-only`, with tmpfs for `/work`, `/tmp` and the home directory;
    - `--memory 3g` (no swap), `--cpus 2`, `--pids-limit 512`, `--cap-drop ALL`, `no-new-privileges`;
    - an unprivileged user (uid 10001);
-   - on the `ring-internal` network only. Its single exit is `ring-proxy`, which lets through `registry.npmjs.org` and GitHub and refuses every other host;
+   - on the `ring-internal` network only. Its single exit is `ring-proxy`, which lets through `registry.npmjs.org` and GitHub and refuses every other host. The proxy's address is written into the sandbox's `/etc/hosts` (`--add-host`), because under gVisor Docker's embedded DNS cannot be reached and the name would not resolve;
    - no environment from the host. API keys and the GitHub token stay with the orchestrator.
 3. The repository is cloned inside the sandbox through the proxy, or copied in as a tar stream. Then dependencies are installed and the dev server is started.
 4. `mantis look` checks every route × viewport × theme × language and writes `report.json`.
@@ -47,7 +47,7 @@ Browser ──► Vultr VM (Cloud Compute)
 | No direct internet | A TCP connect to 1.1.1.1:443 fails |
 | Allowlisted egress only | `git ls-remote` works for github.com and is refused for gitlab.com |
 | No exfiltration | `fetch('https://example.com')` fails |
-| Process cap | Trying to start 700 processes ends at or below 512 |
+| Process cap | Trying to start 700 processes ends at or below 512. Under gVisor the cap also counts the sandbox kernel's own threads, so the bomb stops the whole sandbox before 700 processes start |
 | Memory cap | An allocation loop is killed |
 | Time limit | A task whose dev server never answers is stopped and its container removed |
 | Cleanup | No container is left after a task |

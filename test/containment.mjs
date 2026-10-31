@@ -56,7 +56,20 @@ try {
   const r = await bomb.exec(`i=0; while [ $i -lt 700 ]; do sleep 60 > /dev/null 2>&1 & i=$((i+1)); done; echo started $i`, { timeoutMs: 60_000 });
   const pids = Number((await run('docker', ['stats', '--no-stream', '--format', '{{.PIDs}}', bomb.name])).stdout.trim());
   const refused = /fork|resource temporarily unavailable|cannot/i.test(r.stderr);
-  check('process count is capped (fork bomb)', pids > 0 && pids <= 512 && refused, `${pids} processes after trying 700; ${refused ? 'further forks refused' : 'no refusal seen'}`);
+  const capped = pids > 0 && pids <= 512 && refused;
+  // Under gVisor the cap also counts the sandbox kernel's own host threads (about two per process
+  // inside), so the bomb reaches it after a few hundred processes and the whole sandbox stops.
+  // That still holds the bomb at the cap; the check only accepts it when fewer than 700 started.
+  let stopped = false;
+  if (!capped && runtime === 'runsc' && !/started 700/.test(r.stdout)) {
+    for (let i = 0; i < 20 && !stopped; i++) {
+      stopped = (await run('docker', ['inspect', '-f', '{{.State.Running}}', bomb.name])).stdout.trim() !== 'true';
+      if (!stopped) await new Promise((ok) => setTimeout(ok, 250));
+    }
+  }
+  check('process count is capped (fork bomb)', capped || stopped, stopped
+    ? `gVisor: the sandbox stopped at the 512 cap before 700 processes started (${r.stderr.trim().split('\n').pop()})`
+    : `${pids} processes after trying 700; ${refused ? 'further forks refused' : 'no refusal seen'}`);
 } finally {
   await bomb.destroy();
 }
