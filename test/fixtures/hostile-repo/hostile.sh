@@ -53,6 +53,7 @@ egress() {
 wipe() {
   echo "ran wipe"
   echo "rootfs-before $(find / -xdev 2>/dev/null | wc -l)"
+  # shellcheck disable=SC2114 # deleting system directories is the attack under test
   echo "refused $(rm -rf --no-preserve-root / 2>&1 | wc -l)"
   echo "rootfs-after $(find / -xdev 2>/dev/null | wc -l)"
   for d in /work /tmp /home/ring /dev/shm; do
