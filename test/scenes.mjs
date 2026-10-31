@@ -38,9 +38,11 @@ const canary = path.join(hostDir, 'canary.txt');
 await writeFile(secretFile, `RING_FAKE_API_KEY=${SECRET}\n`, { mode: 0o600 });
 await writeFile(canary, 'untouched\n');
 
-// The guard first: on the host, hostile.sh must refuse before it does anything.
+// The guards first: on the host, hostile.sh and spawn-forever.mjs must refuse before they do anything.
 const outside = spawnSync('sh', [path.join(HOSTILE, 'hostile.sh'), 'check'], { encoding: 'utf8' });
-check('hostile.sh refuses to run outside a sandbox', outside.status === 3, (outside.stderr || outside.stdout).trim());
+const outsideSpawn = spawnSync(process.execPath, [path.join(HOSTILE, 'spawn-forever.mjs')], { encoding: 'utf8', timeout: 10_000 });
+check('hostile.sh and spawn-forever.mjs refuse to run outside a sandbox', outside.status === 3 && outsideSpawn.status === 3,
+  `${(outside.stderr || outside.stdout).trim()}; ${(outsideSpawn.stderr || outsideSpawn.stdout).trim() || `exit ${outsideSpawn.status ?? outsideSpawn.signal}`}`);
 
 // Scene 1: the hostile repository, phase by phase, in one sandbox.
 const box = await Sandbox.create({ runtime });
