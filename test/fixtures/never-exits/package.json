@@ -1,0 +1,8 @@
+{
+  "name": "never-exits",
+  "private": true,
+  "description": "TEST DATA for test/scenes.mjs: a dev server that accepts connections, never answers and ignores SIGTERM.",
+  "scripts": {
+    "dev": "node server-never-exits.mjs"
+  }
+}

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Containment checks for the task sandbox. Each check runs against a fresh container and prints
 // PASS or FAIL. These are the "blast radius" claims made in the README, measured.
-// Usage: node test/containment.mjs   (after scripts/setup.sh)
+// Usage: node test/containment.mjs   (after scripts/setup.sh; RING_RUNTIME=runsc runs the sandboxes in gVisor)
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -11,11 +11,13 @@ import { runTask } from '../runner/run-task.mjs';
 const results = [];
 const check = (name, pass, detail) => { results.push({ name, pass, detail }); console.log(`${pass ? 'PASS' : 'FAIL'}  ${name}${detail ? `  (${detail})` : ''}`); };
 const gone = async (name) => (await run('docker', ['ps', '-aq', '--filter', `name=^${name}$`])).stdout.trim() === '';
+const runtime = process.env.RING_RUNTIME || undefined;
+console.log(`runtime: ${runtime ?? 'docker default'}`);
 
 // A secret on the host that must never reach the sandbox.
 process.env.RING_FAKE_API_KEY = 'sk-should-never-leak';
 
-const box = await Sandbox.create();
+const box = await Sandbox.create({ runtime });
 try {
   const env = await box.exec('env');
   const leaked = env.stdout.split('\n').filter((l) => /KEY|TOKEN|SECRET|PASSWORD/i.test(l));
@@ -49,7 +51,7 @@ check('container is gone after destroy()', await gone(box.name));
 
 // Fork bomb last, in its own sandbox: once the cap is hit nothing new can start inside, so the
 // process count is read from the host (the container's cgroup) instead.
-const bomb = await Sandbox.create();
+const bomb = await Sandbox.create({ runtime });
 try {
   const r = await bomb.exec(`i=0; while [ $i -lt 700 ]; do sleep 60 > /dev/null 2>&1 & i=$((i+1)); done; echo started $i`, { timeoutMs: 60_000 });
   const pids = Number((await run('docker', ['stats', '--no-stream', '--format', '{{.PIDs}}', bomb.name])).stdout.trim());
@@ -64,7 +66,7 @@ check('fork-bomb container is gone too', await gone(bomb.name));
 const dir = await mkdtemp(path.join(os.tmpdir(), 'ring-hang-'));
 await writeFile(path.join(dir, 'index.html'), '<h1>never served</h1>');
 const t = Date.now();
-const hung = await runTask({ repo: dir, devCmd: 'sleep 999', timeoutSec: 25 });
+const hung = await runTask({ repo: dir, devCmd: 'sleep 999', timeoutSec: 25, runtime });
 const secs = Math.round((Date.now() - t) / 1000);
 check('a hanging task is stopped by the time limit', !hung.ok && /timed out/.test(hung.error ?? '') && secs <= 40, `${hung.error?.split('\n')[0]} after ${secs}s`);
 check('its container is destroyed too', hung.destroyed && await gone(hung.sandbox));

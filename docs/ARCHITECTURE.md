@@ -52,6 +52,12 @@ Browser ──► Vultr VM (Cloud Compute)
 | Time limit | A task whose dev server never answers is stopped and its container removed |
 | Cleanup | No container is left after a task |
 
+`node test/scenes.mjs` plays the containment scenes with two fixtures from `test/fixtures/` (test data, run only inside a fresh sandbox):
+- a hostile repository that hunts for secrets, calls hosts off the allowlist (the cloud metadata address included), runs `rm -rf` on the whole filesystem and spawns processes without end;
+- a dev server that never answers and ignores SIGTERM.
+
+Both suites take `RING_RUNTIME=runsc` to run the sandboxes in gVisor.
+
 ## Built before the event vs during it
 
 | Part | AI? | When |
