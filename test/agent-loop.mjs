@@ -3,14 +3,16 @@
 // so no token is ever spent. `--unit` runs the checks that need no Docker (build spec §6.1, U1-U9):
 // path rules, tool-call parsing, the receipt line and verdicts, the check messages, the tamper guard,
 // chat() against the fake gateway, run() with UTF-8 output, and the PNG helpers once they exist.
-// Without flags it also runs the sandbox scenarios (§6.2, S1-S8) on the Lumen sample with a one-cell
+// Without flags it also runs the sandbox scenarios (§6.2, S1-S10) on the Lumen sample with a one-cell
 // matrix: an honest fix, a cover-up with the gate on and off, a measurement tamper, paths out of the
-// project, every cap, an inference error and a dev server that dies. Each check prints PASS or FAIL,
-// like containment.mjs; a full run writes ~/.ring/selftest/agent-loop.json for /status.
+// project, every cap (the soft stop of a model call included), malformed tool-call arguments, an
+// inference error, a dev server that dies, a route that stops loading and a link the edit removed.
+// Each check prints PASS or FAIL, like containment.mjs; a full run writes
+// ~/.ring/selftest/agent-loop.json for /status.
 // Usage: node test/agent-loop.mjs [--unit] [--only U7,S2] [--verbose]
 //        (the scenarios need Docker and scripts/setup.sh; RING_RUNTIME=runsc runs them in gVisor)
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -169,12 +171,15 @@ async function u4() {
     `got ${JSON.stringify(s)}, want ${JSON.stringify(want)}; empty patch ${JSON.stringify(empty)}`);
 
   /** A receipt with consistent counts (§3.3); verdict and publishable are filled in by the functions under test. */
-  const make = ({ fixed = 1, fresh = 0, coverUps = 0, before = 14, label = 'REAL RUN · Vultr VX1 sea · 2026-11-04 05:12 UTC', kind = 'sample', destroyed = true } = {}) => {
+  const make = ({ fixed = 1, fresh = 0, coverUps = 0, lost = 0, before = 14, label = 'REAL RUN · Vultr VX1 sea · 2026-11-04 05:12 UTC', kind = 'sample', destroyed = true, cellsCompared = 16, cellsExpected } = {}) => {
     const r = {
       schema: 'mantis-ring/receipt@1', taskId: `t_${'0'.repeat(32)}`, label,
       source: kind === 'sample' ? { kind, name: 'lumen', commit: null } : { kind, owner: 'o', name: 'r', commit: 'a'.repeat(40) },
-      line: `${fixed} fixed · ${fresh} new · ${coverUps} cover-up${coverUps === 1 ? '' : 's'} · 0 lost`,
-      counts: { errorsBefore: before, errorsAfter: Math.max(0, before - fixed), warningsBefore: before ? 4 : 0, warningsAfter: before ? 4 : 0, fixed, new: fresh, coverUps, lost: 0, cellsCompared: 16 },
+      line: `${fixed} fixed · ${fresh} new · ${coverUps} cover-up${coverUps === 1 ? '' : 's'} · ${lost} lost`,
+      counts: {
+        errorsBefore: before, errorsAfter: Math.max(0, before - fixed), warningsBefore: before ? 4 : 0, warningsAfter: before ? 4 : 0, fixed, new: fresh, coverUps, lost, cellsCompared,
+        ...(cellsExpected === undefined ? {} : { cellsExpected }),
+      },
       fixed: Array.from({ length: fixed }, (_, i) => ({ type: 'page-overflow', route: '/', selector: `#fixed-${i}`, cells: ['mobile/light/en'] })),
       new: Array.from({ length: fresh }, (_, i) => ({ type: 'overlap', route: '/', selector: `#new-${i}`, message: 'overlaps' })),
       gate: { enabled: true, coverUpAttempts: 0, tamperAttempts: 0, reverts: 0 },
@@ -185,22 +190,36 @@ async function u4() {
     r.publishable = isPublishable(r);
     return r;
   };
-  const verdicts = { pass: make(), partialNew: make({ fresh: 1 }), partialCoverUp: make({ coverUps: 1 }), fail: make({ fixed: 0 }), noIssues: make({ fixed: 0, before: 0 }) };
-  const wantVerdict = { pass: 'pass', partialNew: 'partial', partialCoverUp: 'partial', fail: 'fail', noIssues: 'no-issues' };
+  const verdicts = {
+    pass: make(), passAllScreens: make({ cellsExpected: 16 }), partialNew: make({ fresh: 1 }), partialCoverUp: make({ coverUps: 1 }),
+    partialLost: make({ lost: 1 }), partialScreens: make({ cellsCompared: 8, cellsExpected: 16 }), fail: make({ fixed: 0 }), noIssues: make({ fixed: 0, before: 0 }),
+  };
+  const wantVerdict = {
+    pass: 'pass', passAllScreens: 'pass', partialNew: 'partial', partialCoverUp: 'partial', partialLost: 'partial', partialScreens: 'partial', fail: 'fail', noIssues: 'no-issues',
+  };
   const offV = Object.keys(wantVerdict).filter((k) => verdicts[k].verdict !== wantVerdict[k]);
-  check('U4 verdictOf: pass, partial (new or cover-up), fail, no-issues', offV.length === 0, offV.map((k) => `${k}: ${verdicts[k].verdict}`).join('; ') || Object.values(wantVerdict).join(', '));
+  check('U4 verdictOf: pass, partial (new, cover-up, lost control or a screen not compared), fail, no-issues', offV.length === 0,
+    offV.map((k) => `${k}: ${verdicts[k].verdict}`).join('; ') || Object.entries(wantVerdict).map(([k, v]) => `${k} ${v}`).join(', '));
 
+  // A stored "pass" cannot vouch for itself: the bar recomputes the verdict from the counts.
+  const forged = make();
+  forged.counts.lost = 2;
   const pub = {
     'pass, REAL RUN, sample, destroyed': [make(), true],
+    'pass on every expected screen': [make({ cellsExpected: 16 }), true],
     'TEST RUN label': [make({ label: 'TEST RUN · runc · 127.0.0.1:43123' }), false],
     'GitHub source': [make({ kind: 'github' }), false],
     'container not destroyed': [make({ destroyed: false }), false],
     'partial verdict': [make({ fresh: 1 }), false],
+    'a lost control': [make({ lost: 1 }), false],
+    '8 of 16 screens compared': [make({ cellsCompared: 8, cellsExpected: 16 }), false],
+    'stored verdict pass, counts with 2 lost': [forged, false],
     'fail verdict': [make({ fixed: 0 }), false],
     'no-issues verdict': [make({ fixed: 0, before: 0 }), false],
   };
-  const offP = Object.entries(pub).filter(([, [r, want]]) => r.publishable !== want).map(([k]) => k);
-  check('U4 isPublishable only for a REAL RUN pass on a sample with the box destroyed (a TEST RUN never)', offP.length === 0, offP.length ? `wrong for: ${offP.join(', ')}` : `${Object.keys(pub).length} cases`);
+  const offP = Object.entries(pub).filter(([, [r, want]]) => receipt.isPublishable(r) !== want || (r !== forged && r.publishable !== want)).map(([k]) => k);
+  check('U4 isPublishable only for a REAL RUN pass on a sample with the box destroyed, nothing lost and every screen compared (a TEST RUN never)', offP.length === 0,
+    offP.length ? `wrong for: ${offP.join(', ')}` : `${Object.keys(pub).length} cases`);
 }
 
 // A small Mantis-shaped world for the check messages: R0 has three issues in one cell; a later run
@@ -260,6 +279,11 @@ async function u5() {
 
   const tamper = msg({ check: 2, outcome: 'tamper', look: fixedButLost, view: 'gate', restoredTo: 'check 1', tamperHits: ['data-mantis'] });
   check('U5 checkMessage, tamper: names the hit and says the edits were undone', tamper.includes('data-mantis') && tamper.includes('undone'), tamper.slice(0, 200));
+
+  const lost = msg({ outcome: 'lost', look: fixedButLost, view: 'gate' });
+  const lostPlain = msg({ outcome: 'lost', look: fixedButLost, view: 'plain' });
+  check('U5 checkMessage, lost (gate view only): names the control that disappeared and says the edits were undone',
+    /rejected/.test(lost) && lost.includes('See plans') && lost.includes('undone') && !/cover-up/i.test(lost) && lostPlain.startsWith('THREW'), lost.slice(0, 200));
 }
 
 async function u6() {
@@ -283,6 +307,33 @@ async function u6() {
   check('U6 tamperHits flags added lines only (data-mantis, navigator.webdriver), not removals or headers',
     wrong.length === 0, wrong.length ? `wrong for: ${wrong.join(', ')}` : `hits on the tamper edit: ${JSON.stringify(tamperHits(diff))}`);
   check('U6 tamperHits returns each match once', Array.isArray(twice) && twice.length === 1 && /data-mantis/i.test(twice[0] ?? ''), JSON.stringify(twice));
+
+  // Disguised checker hooks (the security review's examples): headless sniffing, split or encoded names.
+  const disguised = [
+    "+if (/headless/i.test(navigator.userAgent)) banner.style.width='auto';",
+    "+el.setAttribute('data-man'+'tis-ignore','');",
+    "+el.dataset['mantis'+'Ignore'] = '';",
+    "+el.setAttribute(atob('ZGF0YS1tYW50aXMtaWdub3Jl'), '');",
+    "+if (navigator['web'+'driver']) return;",
+    "+const k = ['web', 'driver'].join('');",
+    '+if (navigator.userAgentData) document.body.classList.add("x");',
+    "+el.setAttribute(String.fromCharCode(100, 97, 116, 97), '');",
+    "+el.setAttribute('\\x64ata-ignore', '');",
+    "+el.setAttribute('\\u0064ata-ignore', '');",
+  ];
+  const missed = disguised.filter((line) => tamperHits(line).length === 0);
+  const honest = [
+    '+.nav-links { flex-wrap: wrap; max-width: none; overflow: visible; }',
+    '+  font-family: "Inter", "Helvetica Neue", sans-serif;',
+    "+  content: '\\2014';",
+    "+const label = 'Hello, ' + name + '!';",
+    '+<a class="btn btn-ghost btn-lg" href="#demo" data-i18n="hero.secondary">View live demo</a>',
+  ];
+  const flagged = honest.filter((line) => tamperHits(line).length > 0);
+  check('U6 tamperHits catches disguised checker hooks (headless/userAgent sniffing, names split across strings, atob, char codes, escapes)',
+    missed.length === 0, missed.length ? `missed: ${missed.join(' | ')}` : `${disguised.length} lines flagged`);
+  check('U6 tamperHits leaves honest CSS, HTML and JS edits alone', flagged.length === 0,
+    flagged.length ? `flagged: ${flagged.map((l) => `${l} → ${JSON.stringify(tamperHits(l))}`).join(' | ')}` : `${honest.length} lines clean`);
 }
 
 const MINI_TOOLS = [
@@ -362,6 +413,23 @@ async function u7() {
   const [, eTime] = await attempt({ timeoutMs: 300 });
   check('U7 a timeout is retried, then fails after 3 attempts', eTime instanceof InferenceError && gw.chats().length === 3,
     `${gw.chats().length} requests in ${Date.now() - t} ms; ${eTime ? `${eTime.name}: ${eTime.message}` : 'no error'}`);
+
+  // The spend guard fails closed: an answer without usage, or a call that never answered, is charged the estimate.
+  const noUsage = [];
+  gw.setScript([ok(readCall, { usage: {} })]);
+  const tallyU = newTally();
+  const [rU, eU] = await attempt({ tally: tallyU, guard: { before: (m, est) => noUsage.push({ est }), after: (m, u, usd) => noUsage.push({ usd, u }) } });
+  const estU = noUsage[0]?.est?.usd;
+  check('U7 a priced answer without usage is charged the pre-call estimate (tally and guard)',
+    !eU && rU && typeof estU === 'number' && estU > 0 && tallyU.usd === estU && noUsage[1]?.usd === estU && noUsage[1]?.u?.estimated === true,
+    eU ? eU.message : `estimate ${estU}, tally ${tallyU.usd}, guard.after usd ${noUsage[1]?.usd}`);
+  const unanswered = [];
+  gw.setScript([sleep(5000, ok(readCall)), sleep(5000, ok(readCall)), sleep(5000, ok(readCall))]);
+  const tallyT = newTally();
+  await attempt({ timeoutMs: 300, tally: tallyT, guard: { before: () => {}, after: (m, u, usd) => unanswered.push(usd) } });
+  check('U7 every attempt that timed out is charged the estimate to the spend guard, not to the tally',
+    unanswered.length === 3 && unanswered.every((usd) => typeof usd === 'number' && usd > 0) && tallyT.calls === 0 && tallyT.usd === 0,
+    `guard.after ${JSON.stringify(unanswered)}, tally calls ${tallyT.calls}, usd ${tallyT.usd}`);
 
   // A model without a price makes the cost unknown, for good.
   gw.setScript([say('hello'), say('hello again')]);
@@ -480,6 +548,47 @@ async function u9() {
   check('U9 png: decodePng refuses an image over maxPixels', refused);
 }
 
+async function u10() {
+  const loop = await load('../agent/loop.mjs');
+  if (loop) {
+    const raw = [
+      { id: 'call_a', type: 'function', function: { name: 'write_file', arguments: '{"path":"a.css","content":"a {\n  color: red;\n}"}' } }, // raw newlines: invalid JSON
+      { id: 'call_b', type: 'function', function: { name: 'read_file', arguments: JSON.stringify(JSON.stringify({ path: 'b.css' })) } }, // double-encoded
+      { id: 'call_c', type: 'function', function: { name: 'read_file', arguments: { path: 'c.css' } } }, // an object
+      { id: 'call_d', type: 'function', function: { name: 'finish', arguments: '[1,2]' } }, // not an object
+      { id: 'call_e', type: 'function', function: { name: 'read_file', arguments: '{"path":"e.css"' } }, // cut off by the token limit
+    ];
+    const { calls, originals } = loop.normalizeCalls(raw, 1);
+    const echoed = calls.map((c) => c.function.arguments);
+    const parsed = echoed.map((a) => { try { return JSON.parse(a); } catch { return 'unparseable'; } });
+    const allObjects = parsed.every((v) => v && typeof v === 'object' && !Array.isArray(v));
+    check('U10 normalizeCalls echoes every tool call with arguments that parse to a JSON object (vLLM/SGLang parse them)',
+      allObjects && echoed[0] === '{}' && parsed[1]?.path === 'b.css' && parsed[2]?.path === 'c.css' && echoed[3] === '{}' && echoed[4] === '{}',
+      JSON.stringify(echoed));
+    check('U10 normalizeCalls keeps what the model sent for parseToolCall, so the model still hears its own error',
+      originals[0].function.arguments === raw[0].function.arguments && originals[4].function.arguments === raw[4].function.arguments && calls.every((c, i) => c.id === raw[i].id),
+      JSON.stringify(originals.map((o) => typeof o.function.arguments)));
+  }
+
+  const grader = await load('../bench/grade-lumen.mjs');
+  if (grader) {
+    const key = { bugs: [
+      { id: 'promo-overflow', route: '/', expect: [{ type: 'page-overflow', selector: '#promo-banner' }] },
+      { id: 'settings-overlap', route: '/settings', expect: [{ type: 'overlap', selector: '#save' }] },
+    ] };
+    const issue = (route, type, selector) => ({ id: 1, type, route, selector, cells: ['mobile/light/en'], occurrences: [] });
+    const cell = (route, status) => ({ route, key: 'mobile/light/en', status });
+    const r0 = { issues: [issue('/', 'page-overflow', '#promo-banner'), issue('/settings.html', 'overlap', '#save')], cells: [cell('/', 'ok'), cell('/settings.html', 'ok')] };
+    // The final run fixed the banner, and /settings.html no longer loads (HTTP 404): its bug is absent but unmeasured.
+    const rf = { issues: [{ ...issue('/settings.html', 'request-failed', null), message: 'The page itself failed to load: HTTP 404.' }], cells: [cell('/', 'ok'), cell('/settings.html', 'failed')] };
+    const g = grader.grade({ r0, rf, key });
+    const byId = Object.fromEntries(g.bugs.map((b) => [b.id, b]));
+    check('U10 grade-lumen: a bug on a screen the final run could not measure is not counted as fixed',
+      byId['promo-overflow']?.fixed === true && byId['settings-overlap']?.fixed === false && byId['settings-overlap']?.unmeasured === true && g.fixed === 1,
+      JSON.stringify(g.bugs));
+  }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Sandbox scenarios (Docker; runc locally, runsc on the VM)
 // ---------------------------------------------------------------------------------------------
@@ -497,6 +606,8 @@ const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
 const HONEST = { name: 'replace_in_file', args: { path: 'styles.css', old_text: '  width: 600px; ', new_text: '  max-width: 600px;' } };
 const COVERUP = { name: 'replace_in_file', args: { path: 'styles.css', old_text: '.promo p { margin: 0; }', new_text: '.promo p { margin: 0; }\n#promo-banner { display: none; }' } };
 const TAMPER = { name: 'replace_in_file', args: { path: 'index.html', old_text: '<div id="promo-banner" class="promo">', new_text: '<div id="promo-banner" class="promo" data-mantis-ignore>' } };
+// Removes a visible link that has no issue of its own: Mantis reports it as lost, not as a cover-up.
+const DROP_LINK = { name: 'replace_in_file', args: { path: 'index.html', old_text: '<a class="btn btn-ghost btn-lg" href="#demo" data-i18n="hero.secondary">View live demo</a>', new_text: '' } };
 const CHECK = { name: 'check_ui', args: {} };
 const finish = (summary) => ({ name: 'finish', args: { summary } });
 /** One model turn: the given tool calls, each with an id so the test can find its result later. */
@@ -702,12 +813,46 @@ const SCENARIOS = [
     ],
   },
   {
-    id: 'S6d', title: 'wall clock: a 30 s task whose model hangs ends as timeout within 45 s', caps: { wallClockSec: 30 },
+    // The hard timer is the containment guarantee: whatever hangs, the box goes at the deadline. This
+    // chat client ignores the loop's time budget (a stuck client), so only the hard timer can end it.
+    id: 'S6d', title: 'wall clock: a 30 s task whose model call hangs past every limit ends as timeout within 45 s', caps: { wallClockSec: 30 },
+    chat: (o, inf) => inf.chat({ ...o, signal: undefined, timeoutMs: 300_000 }),
     script: () => [sleep(60_000, turn(as('call_s6d_finish', finish('Too late.'))))],
     verify: (sc) => [
       [`status timeout (${sc.result?.status})`, sc.result?.status === 'timeout'],
       [`returned within 45 s (${Math.round(sc.ms / 1000)} s)`, sc.ms <= 45_000],
     ],
+  },
+  {
+    // A call may only use the time before the soft stop: the run then ends with a receipt, not a timeout.
+    id: 'S6g', title: 'a model call that would run past the soft stop is cut there: done/time with a receipt, before the deadline', caps: { wallClockSec: 40 },
+    script: () => [sleep(60_000, turn(as('call_s6g_finish', finish('Too late.'))))],
+    verify: (sc, r) => [
+      [`status done (${sc.result?.status})`, sc.result?.status === 'done'],
+      [`stopReason time (${r?.stopReason})`, r?.stopReason === 'time'],
+      ['receipt.json stored', sc.files.has('receipt.json')],
+      [`returned before the 40 s hard deadline (${Math.round(sc.ms / 1000)} s)`, sc.ms < 40_000],
+      [`one chat request (${sc.chats.length})`, sc.chats.length === 1],
+    ],
+  },
+  {
+    id: 'S6f', title: 'malformed tool-call arguments: the model hears the error and the next request is still valid',
+    script: () => [
+      // Raw newlines inside a JSON string: invalid JSON, as models write it now and then.
+      turn(as('call_s6f_bad', { name: 'write_file', args: '{"path":"notes.css","content":"a {\n  color: red;\n}"}' })),
+      turn(as('call_s6f_finish', finish('The first call was broken; nothing was changed.'))),
+    ],
+    verify: (sc, r) => {
+      const echoed = (sc.chats[1]?.body?.messages ?? []).flatMap((m) => (m.role === 'assistant' ? m.tool_calls ?? [] : [])).find((c) => c.id === 'call_s6f_bad');
+      return [
+        ['status done', sc.result?.status === 'done'],
+        [`stopReason finish (${r?.stopReason})`, r?.stopReason === 'finish'],
+        ['the model was told its arguments are not valid JSON', /not valid JSON/.test(sc.toolText('call_s6f_bad') ?? '')],
+        [`the call went back with arguments {} (${echoed?.function?.arguments})`, echoed?.function?.arguments === '{}'],
+        [`invalidToolCalls 1 (${r?.invalidToolCalls})`, r?.invalidToolCalls === 1],
+        ['2 requests, both valid for a gateway that parses echoed arguments', sc.chats.length === 2 && sc.chats.every((q) => q.problems.length === 0)],
+      ];
+    },
   },
   {
     // Forced tool_choice is unconfirmed on the real gateway (fact §0.5 #6): a refusal must not end the run.
@@ -757,6 +902,65 @@ const SCENARIOS = [
       ['receipt.fixed has #promo-banner', (r?.fixed ?? []).some((f) => f.selector === '#promo-banner')],
     ],
   },
+  {
+    // Mantis leaves a screen that does not load (HTTP 404/500, a hang) out of its comparison, so the
+    // line alone would read "1 fixed · 0 new". The loop compares the screens with R0's itself.
+    id: 'S9', title: 'a route that stops loading (HTTP 404) is not a fix: the check is rejected and undone',
+    matrix: { routes: ['/', '/settings.html'], viewports: ['mobile'], schemes: ['light'], locales: ['en'] },
+    script: () => [
+      turn(as('call_s9_edit1', HONEST)), turn(as('call_s9_check1', CHECK)),
+      turn(as('call_s9_edit2', HONEST)), turn(as('call_s9_check2', CHECK)),
+      turn(as('call_s9_finish', finish('Fixed the width of the promo banner.'))),
+    ],
+    onCheck: async ({ check: k, phase, decision, box }, sc) => {
+      // Stands in for an edit that breaks a whole page: /settings.html now answers 404.
+      if (k === 1 && phase === 'before') await box.exec('mv /work/app/settings.html /work/app/settings.gone');
+      if (k === 1 && phase === 'after') {
+        const back = await box.exec('test -f /work/app/settings.html && test ! -e /work/app/settings.gone');
+        sc.afterRevert = { decision, restored: back.code === 0, ...(await gitState(box)) };
+      }
+    },
+    verify: (sc, r) => {
+      const [c1, c2] = r?.checks ?? [];
+      const told = sc.toolText('call_s9_check1') ?? '';
+      return [
+        ['status done', sc.result?.status === 'done'],
+        [`check 1 failed because a screen did not load (${c1?.decision}: ${c1?.reason})`, c1?.decision === 'failed' && /did not load/.test(c1?.reason ?? '')],
+        ['the model was told which screen and that its edits were undone', told.includes('/settings.html') && told.includes('undone')],
+        ['after the revert: settings.html is back, git diff --quiet <base> and status --porcelain are empty',
+          sc.afterRevert?.restored === true && sc.afterRevert.diffQuiet === true && sc.afterRevert.porcelain === ''],
+        ['check 2 accepted', c2?.decision === 'accepted'],
+        [`every screen compared (${r?.counts?.cellsCompared} of ${r?.counts?.cellsExpected})`, r?.counts?.cellsExpected === 2 && r?.counts?.cellsCompared === 2],
+        ['verdict pass', r?.verdict === 'pass'],
+      ];
+    },
+  },
+  {
+    id: 'S10', title: 'gate ON, sample: an edit that removes a visible link is rolled back as lost controls',
+    script: () => [
+      turn(as('call_s10_drop', DROP_LINK), as('call_s10_edit1', HONEST)), turn(as('call_s10_check1', CHECK)),
+      turn(as('call_s10_edit2', HONEST)), turn(as('call_s10_check2', CHECK)),
+      turn(as('call_s10_finish', finish('Removed a link first; the checker rejected it. Then fixed the width.'))),
+    ],
+    onCheck: async ({ check: k, phase, decision, box }, sc) => {
+      if (k === 1 && phase === 'after') sc.afterRevert = { decision, ...(await gitState(box)) };
+    },
+    verify: (sc, r) => {
+      const [c1, c2] = r?.checks ?? [];
+      const told = sc.toolText('call_s10_check1') ?? '';
+      const gate = sc.events.find((e) => e.type === 'gate' && e.data?.check === 1)?.data;
+      return [
+        ['status done', sc.result?.status === 'done'],
+        [`check 1 rejected for lost controls (${c1?.decision}: ${c1?.line})`, c1?.decision === 'lost' && /\b[1-9]\d* lost/.test(c1?.line ?? '') && /0 cover-ups/.test(c1?.line ?? '')],
+        ['the gate event lists the lost link', (gate?.lost ?? []).some((l) => /View live demo/.test(l.control ?? ''))],
+        ['the model was told which link and that its edits were undone', told.includes('View live demo') && told.includes('undone')],
+        ['after the revert: git diff --quiet <base> and status --porcelain are empty', sc.afterRevert?.decision === 'lost' && sc.afterRevert.diffQuiet === true && sc.afterRevert.porcelain === ''],
+        ['check 2 accepted', c2?.decision === 'accepted'],
+        [`gate.lostAttempts 1, reverts 1, coverUpAttempts 0 (${JSON.stringify(r?.gate)})`, r?.gate?.lostAttempts === 1 && r?.gate?.reverts === 1 && r?.gate?.coverUpAttempts === 0],
+        ['final lost 0, verdict pass', r?.counts?.lost === 0 && r?.verdict === 'pass'],
+      ];
+    },
+  },
 ];
 
 /** Inside the box for S5: a marker and the sha256 of R0's report first; afterwards also what changed. */
@@ -776,7 +980,7 @@ async function runScenario(s, mods) {
   const task = {
     id: `t_${randomBytes(16).toString('hex')}`, origin: 'admin',
     source: { kind: 'sample', name: 'lumen', dir: LUMEN, label: 'Lumen (sample site)' },
-    matrix: MATRIX, model: 'fake-coder', sampling: { temperature: 1, topP: 1, seed: 7 },
+    matrix: s.matrix ?? MATRIX, model: 'fake-coder', sampling: { temperature: 1, topP: 1, seed: 7 },
     visionModel: null, gate: s.gate ?? true, caps: { ...CAPS, ...s.caps },
   };
   const sc = { id: s.id, task, mods, events: [], logs: [], files: new Map(), badNames: [], box: null, labels: null, result: null, error: null };
@@ -784,7 +988,7 @@ async function runScenario(s, mods) {
   const ac = new AbortController();
   const tally = inf.newTally();
   const deps = {
-    chat: inf.chat,
+    chat: s.chat ? (o) => s.chat(o, inf) : inf.chat,
     createSandbox: async (o) => {
       sc.labels = o?.labels ?? null;
       sc.box = await sandbox.Sandbox.create({ runtime: o?.runtime, labels: o?.labels });
@@ -916,9 +1120,12 @@ process.on('exit', () => {
   const checks = results.map(({ name, pass }) => ({ name, pass }));
   if (!finished) checks.push({ name: 'the suite ran to the end', pass: false });
   const file = path.join(os.homedir(), '.ring', 'selftest', 'agent-loop.json');
+  // The deployed commit (app/VERSION.json), so /status can tell a result from older code.
+  let commit = null;
+  try { commit = JSON.parse(readFileSync(new URL('../app/VERSION.json', import.meta.url), 'utf8')).commit ?? null; } catch { commit = null; }
   try {
     mkdirSync(path.dirname(file), { recursive: true });
-    const body = { suite: 'agent-loop', runtime: RUNTIME_NAME, passed: checks.filter((c) => c.pass).length, total: checks.length, at: new Date().toISOString(), checks };
+    const body = { suite: 'agent-loop', runtime: RUNTIME_NAME, commit, passed: checks.filter((c) => c.pass).length, total: checks.length, at: new Date().toISOString(), checks };
     writeFileSync(`${file}.tmp`, `${JSON.stringify(body, null, 2)}\n`);
     renameSync(`${file}.tmp`, file);
   } catch (err) {
@@ -939,6 +1146,7 @@ try {
   await group('U7', u7);
   await group('U8', u8);
   await group('U9', u9);
+  await group('U10', u10);
   if (!args.unit) await scenarios();
 
   const failed = results.filter((r) => !r.pass);

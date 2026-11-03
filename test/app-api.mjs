@@ -6,8 +6,10 @@
 // queue limits, approve/patch with the owner token, and SSE replay. /status talks to
 // test/fake-gateway.mjs, never to the real inference service. Each check prints PASS or FAIL.
 // Usage: node test/app-api.mjs
+import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import http from 'node:http';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -26,6 +28,9 @@ const JSON_TYPE = { 'content-type': 'application/json' };
 const PATCH = 'diff --git a/styles.css b/styles.css\n--- a/styles.css\n+++ b/styles.css\n@@ -87 +87 @@\n-  width: 600px; \n+  max-width: 600px;\n';
 // The smallest valid PNG (1x1), stored as the task's proof.png.
 const TINY_PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64');
+// The owner's approval passphrase in these tests. The server only ever holds its SHA-256.
+const PASSPHRASE = 'ring test passphrase';
+const approvalCfg = { passphraseSha256: createHash('sha256').update(PASSPHRASE).digest('hex') };
 
 // Fake model service and a throwaway state folder, set before any app module is imported.
 const gw = await startFakeGateway([]);
@@ -205,7 +210,7 @@ try {
   const store = new tasksMod.TaskStore({ dir: path.join(config.STATE_DIR, 'tasks'), log });
   const queue = new tasksMod.Queue({ maxRunning: 2, heavySlots: 2, maxQueued: 8, log });
   const spend = new Spend({ dir: config.STATE_DIR, caps: config.get().spendCaps, log });
-  app = createApp({ config, store, queue, spend, runFix: fake.runFix, publish: fakePublish, status, now: Date.now, log });
+  app = createApp({ config, store, queue, spend, runFix: fake.runFix, publish: fakePublish, status, now: Date.now, log, approval: approvalCfg });
   await new Promise((resolve, reject) => {
     app.server.once('error', reject);
     app.server.listen(0, '127.0.0.1', () => { app.server.off('error', reject); resolve(); });
@@ -318,12 +323,24 @@ try {
     check('A5 Approve with a wrong token → 403', wrong.status === 403, `${wrong.status}`);
     const byAdmin = await admin('POST', `/api/tasks/${id}/approve`, { body: {} });
     check('A5 an admin call without the owner token cannot approve (403)', byAdmin.status === 403, `${byAdmin.status}`);
-    const ok = await visitor('203.0.113.9', 'POST', `/api/tasks/${id}/approve`, { body: {}, headers: owner });
+    // The operator who created the task holds its owner token. With a passphrase set, the token alone
+    // approves nothing: not through Caddy, and not over SSH to 127.0.0.1 with a made-up X-Forwarded-For.
+    const tokenOnly = await visitor('203.0.113.9', 'POST', `/api/tasks/${id}/approve`, { body: {}, headers: owner });
+    const spoofed = await admin('POST', `/api/tasks/${id}/approve`, { body: {}, headers: { ...owner, 'x-forwarded-for': '1.1.1.1' } });
+    const wrongPass = await visitor('203.0.113.9', 'POST', `/api/tasks/${id}/approve`, { body: { passphrase: 'not it' }, headers: owner });
+    const still = recordOf((await admin('GET', `/admin/tasks/${id}`)).json);
+    check('A5 with an approval passphrase set, the owner token alone cannot approve (via Caddy, or admin + token + spoofed XFF): 403',
+      tokenOnly.status === 403 && spoofed.status === 403 && wrongPass.status === 403 && !still?.approvedAt,
+      `token only ${tokenOnly.status}, admin+token+XFF ${spoofed.status}, wrong passphrase ${wrongPass.status}; approvedAt ${still?.approvedAt ?? 'none'}`);
+    const ok = await visitor('203.0.113.9', 'POST', `/api/tasks/${id}/approve`, { body: { passphrase: PASSPHRASE }, headers: owner });
     const patch = await visitor('203.0.113.9', 'GET', `/api/tasks/${id}/patch`, { headers: owner });
-    check('A5 the owner approves, then downloads the patch as text/x-diff',
+    check('A5 the owner approves (owner token + passphrase), then downloads the patch as text/x-diff',
       ok.status === 200 && patch.status === 200 && patch.text === PATCH && /^text\/x-diff/.test(patch.headers['content-type'] ?? '')
         && String(patch.headers['content-disposition'] ?? '').includes(`filename="${id}.patch"`),
       `approve ${ok.status}; patch ${patch.status} ${patch.headers['content-type']} ${patch.headers['content-disposition']}`);
+    const approvedRec = recordOf((await visitor('203.0.113.9', 'GET', `/api/tasks/${id}`)).json);
+    check('A5 the record says how the run was approved (passphrase), and the page knows a passphrase is asked',
+      approvedRec?.approvedWith === 'passphrase' && approvedRec?.approvalNeedsPassphrase === true, `approvedWith ${approvedRec?.approvedWith}, approvalNeedsPassphrase ${approvedRec?.approvalNeedsPassphrase}`);
     const stranger = await visitor('203.0.113.10', 'GET', `/api/tasks/${id}/patch`, { headers: { 'x-ring-owner': 'not-the-token' } });
     check('A5 after Approve the patch still needs the owner token (403 without it)', stranger.status === 403, `${stranger.status}`);
 
@@ -428,6 +445,78 @@ try {
 
   const pubTry = await admin('POST', `/admin/publish/${id ?? 'x'}`, { body: {} });
   check('POST /admin/publish/:id refuses a TEST RUN receipt (409) and publishes nothing', pubTry.status === 409 && published.length === 0, `${pubTry.status} ${oneLine(pubTry.json?.error ?? pubTry.text)}`);
+
+  // Without a passphrase on the server the owner link alone approves, and the record says only that.
+  approvalCfg.passphraseSha256 = null;
+  const linkTask = lastEntry.json?.ownerToken ? lastId : null;
+  if (!linkTask) {
+    skip('approval with the owner link only', 'the public task from the XFF check did not start');
+  } else {
+    const viaLink = await visitor('203.0.113.30', 'POST', `/api/tasks/${linkTask}/approve`, { body: {}, headers: { 'x-ring-owner': lastEntry.json.ownerToken } });
+    const linkRec = recordOf((await visitor('203.0.113.30', 'GET', `/api/tasks/${linkTask}`)).json);
+    check('without an approval passphrase the owner link approves, recorded as approvedWith owner-link',
+      viaLink.status === 200 && linkRec?.approvedWith === 'owner-link' && linkRec?.approvalNeedsPassphrase === false, `${viaLink.status}; approvedWith ${linkRec?.approvedWith}`);
+  }
+
+  // The publish bar and the published page (app/publish.mjs), on receipts the fake loop never writes.
+  const pub = await import('../app/publish.mjs');
+  const passing = { ...fakeReceipt({ id: `t_${'a'.repeat(32)}`, source: { kind: 'sample', name: 'lumen' }, matrix: {}, model: 'm' }), label: 'REAL RUN · Vultr VX1 sea · 2026-11-04 05:12 UTC', publishable: true };
+  const sampleTask = { id: passing.taskId, source: { kind: 'sample', label: 'Lumen (sample site)' } };
+  const lostOne = { ...passing, counts: { ...passing.counts, lost: 1 } };
+  const screens = { ...passing, counts: { ...passing.counts, cellsCompared: 8, cellsExpected: 16 } };
+  const noApply = { ...passing, diff: { ...passing.diff, applies: false } };
+  check('the publish bar refuses lost controls, unmeasured screens and a patch that does not apply',
+    pub.notPublishable(sampleTask, passing) === null && /lost control/.test(pub.notPublishable(sampleTask, lostOne) ?? '')
+      && /compared 8 of the 16 screens/.test(pub.notPublishable(sampleTask, screens) ?? '') && /does not apply/.test(pub.notPublishable(sampleTask, noApply) ?? ''),
+    [passing, lostOne, screens, noApply].map((r) => pub.notPublishable(sampleTask, r) ?? 'publishable').join(' | '));
+  const at = '2026-11-04T06:00:00.000Z';
+  const page = (task) => pub.runPageHtml({ task, receipt: passing, images: [], selftests: {} });
+  const byLink = page({ ...sampleTask, approvedAt: at, approvedWith: 'owner-link' });
+  const byPass = page({ ...sampleTask, approvedAt: at, approvedWith: 'passphrase' });
+  check('the published page claims "by a human" only for a passphrase approval, has its own CSP and links the run log',
+    byLink.includes('Approved with the owner link at 2026-11-04 06:00 UTC') && !byLink.includes('by a human')
+      && byPass.includes('Approved by a human at 2026-11-04 06:00 UTC') && /http-equiv="Content-Security-Policy" content="default-src 'none'/.test(byLink)
+      && byLink.includes(`href="/t/${passing.taskId}"`),
+    `${/Approved[^<]*/.exec(byLink)?.[0]} | ${/Approved[^<]*/.exec(byPass)?.[0]}`);
+
+  // Addresses a person may mistype, the browser 404 page, and /admin/* looking the same as an unknown path.
+  const slash = await visitor('203.0.113.60', 'GET', '/status/');
+  const taskSlash = id ? await visitor('203.0.113.60', 'GET', `/t/${id}/`) : { status: 0, headers: {} };
+  const html404 = await visitor('203.0.113.60', 'GET', '/no-such-page', { headers: { accept: 'text/html' } });
+  const adminHtml = await visitor('203.0.113.60', 'GET', '/admin/health', { headers: { accept: 'text/html' } });
+  check('/status/ and /t/<id>/ redirect (308) without the slash; a browser gets an HTML 404, the same for /admin/*',
+    slash.status === 308 && slash.headers.location === '/status' && taskSlash.status === 308 && taskSlash.headers.location === `/t/${id}`
+      && html404.status === 404 && /text\/html/.test(html404.headers['content-type'] ?? '') && /href="\/status"/.test(html404.text)
+      && adminHtml.status === 404 && adminHtml.text === html404.text,
+    `${slash.status} → ${slash.headers.location}; ${taskSlash.status} → ${taskSlash.headers.location}; 404 ${html404.headers['content-type']}; admin ${adminHtml.status}`);
+  check('responses carry COOP, CORP and a Permissions-Policy', ['cross-origin-opener-policy', 'cross-origin-resource-policy', 'permissions-policy'].every((h) => home.headers[h]),
+    `${home.headers['cross-origin-opener-policy']}, ${home.headers['cross-origin-resource-policy']}, ${home.headers['permissions-policy']}`);
+
+  // Bundles end up in git: task.json goes in without private.* (the client's network key, the owner token's hash).
+  if (id) {
+    const bundle = await admin('GET', `/admin/tasks/${id}/bundle`);
+    const inner = spawnSync('tar', ['-xOf', '-', './task.json'], { input: bundle.buf });
+    const names = spawnSync('tar', ['-tf', '-'], { input: bundle.buf }).stdout.toString().split('\n').filter(Boolean);
+    let taskJson = null;
+    try { taskJson = JSON.parse(inner.stdout.toString()); } catch { taskJson = null; }
+    check('the task bundle has task.json without private.* (no ownerTokenSha256, no ipKey)',
+      bundle.status === 200 && taskJson?.id === id && !('private' in taskJson) && !bundle.buf.includes('ownerTokenSha256') && names.includes('./task.json') && !names.includes('./bundle-task.json'),
+      `${bundle.status}; members ${names.join(' ')}`);
+  }
+
+  // The ETA counts only runs like the next public one; a smoke test on one screen does not.
+  const smoke = await admin('POST', '/admin/tasks', { body: { sample: 'lumen', routes: ['/'], viewports: ['mobile'], schemes: ['light'], locales: ['en'], label: 'smoke one screen' } });
+  if (smoke.json?.id) await settle(smoke.json.id);
+  let rows = [];
+  try { rows = JSON.parse(await readFile(path.join(config.STATE_DIR, 'stats.json'), 'utf8')); } catch { rows = []; }
+  const rowOf = (tid) => rows.find((r) => r.id === tid);
+  check('stats.json marks which finished runs may set the ETA (the full sample matrix: yes; one screen: no)',
+    rowOf(id)?.comparable === true && rowOf(smoke.json?.id)?.comparable === false, `default ${rowOf(id)?.comparable}, one screen ${rowOf(smoke.json?.id)?.comparable}`);
+  const zero = await admin('POST', '/admin/tasks', { body: { sample: 'lumen', caps: { maxUsd: 0 } } });
+  check('caps.maxUsd 0 is refused at creation (400), as the loop would refuse it', zero.status === 400 && /maxUsd/.test(zero.json?.error ?? ''), `${zero.status} ${oneLine(zero.json?.error)}`);
+  const busy = await admin('GET', '/admin/busy');
+  check('/admin/busy answers running, queued and the self-test in progress', busy.status === 200 && busy.json?.running === 0 && busy.json?.queued === 0 && busy.json?.selftest === null,
+    oneLine(busy.text));
   check('no request reached the model service', gw.chats().length === 0, `${gw.chats().length} chat requests`);
 } catch (err) {
   check('app-api tests ran to the end', false, `stopped: ${err.stack?.split('\n').slice(0, 3).join(' ') ?? err}`);

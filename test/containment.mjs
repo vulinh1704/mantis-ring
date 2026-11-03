@@ -3,7 +3,7 @@
 // PASS or FAIL. These are the "blast radius" claims made in the README, measured.
 // Usage: node test/containment.mjs   (after scripts/setup.sh; RING_RUNTIME=runsc runs the sandboxes in gVisor)
 // At exit it writes ~/.ring/selftest/containment.json, the result the app shows on /status.
-import { mkdirSync, renameSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -17,16 +17,20 @@ const runtime = process.env.RING_RUNTIME || undefined;
 console.log(`runtime: ${runtime ?? 'docker default'}`);
 
 // The result file for /status, written at exit. A suite that crashes part-way gets one failed check
-// more, so a partial run never reads as a full pass. `runtime` is what Docker reports for the sandbox.
+// more, so a partial run never reads as a full pass. `runtime` is what Docker reports for the sandbox;
+// `commit` is the deployed commit (app/VERSION.json), so /status can tell a result from older code.
 let sandboxRuntime = null;
 let finished = false;
+const deployedCommit = () => {
+  try { return JSON.parse(readFileSync(new URL('../app/VERSION.json', import.meta.url), 'utf8')).commit ?? null; } catch { return null; }
+};
 process.on('exit', () => {
   const checks = results.map(({ name, pass }) => ({ name, pass }));
   if (!finished) checks.push({ name: 'the suite ran to the end', pass: false });
   const file = path.join(os.homedir(), '.ring', 'selftest', 'containment.json');
   try {
     mkdirSync(path.dirname(file), { recursive: true });
-    const data = { suite: 'containment', runtime: sandboxRuntime ?? runtime ?? null, passed: checks.filter((c) => c.pass).length, total: checks.length, at: new Date().toISOString(), checks };
+    const data = { suite: 'containment', runtime: sandboxRuntime ?? runtime ?? null, commit: deployedCommit(), passed: checks.filter((c) => c.pass).length, total: checks.length, at: new Date().toISOString(), checks };
     writeFileSync(`${file}.tmp`, `${JSON.stringify(data, null, 2)}\n`);
     renameSync(`${file}.tmp`, file);
   } catch (err) {

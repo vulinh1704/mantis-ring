@@ -6,7 +6,7 @@
 // At exit it writes ~/.ring/selftest/scenes.json, the result the app shows on /status.
 import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -30,16 +30,20 @@ const field = (out, key) => out.split('\n').find((l) => l.startsWith(`${key} `))
 console.log(`runtime: ${runtime ?? 'docker default'}`);
 
 // The result file for /status, written at exit. A suite that crashes part-way gets one failed check
-// more, so a partial run never reads as a full pass. `runtime` is what Docker reports for the sandbox.
+// more, so a partial run never reads as a full pass. `runtime` is what Docker reports for the sandbox;
+// `commit` is the deployed commit (app/VERSION.json), so /status can tell a result from older code.
 let sandboxRuntime = null;
 let finished = false;
+const deployedCommit = () => {
+  try { return JSON.parse(readFileSync(new URL('../app/VERSION.json', import.meta.url), 'utf8')).commit ?? null; } catch { return null; }
+};
 process.on('exit', () => {
   const checks = results.map(({ name, pass }) => ({ name, pass }));
   if (!finished) checks.push({ name: 'the suite ran to the end', pass: false });
   const file = path.join(os.homedir(), '.ring', 'selftest', 'scenes.json');
   try {
     mkdirSync(path.dirname(file), { recursive: true });
-    const data = { suite: 'scenes', runtime: sandboxRuntime ?? runtime ?? null, passed: checks.filter((c) => c.pass).length, total: checks.length, at: new Date().toISOString(), checks };
+    const data = { suite: 'scenes', runtime: sandboxRuntime ?? runtime ?? null, commit: deployedCommit(), passed: checks.filter((c) => c.pass).length, total: checks.length, at: new Date().toISOString(), checks };
     writeFileSync(`${file}.tmp`, `${JSON.stringify(data, null, 2)}\n`);
     renameSync(`${file}.tmp`, file);
   } catch (err) {

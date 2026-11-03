@@ -90,7 +90,8 @@ export function toolResults(body) {
 /**
  * Protocol problems the real gateway would refuse with a 400, or that break the loop's contract:
  * every assistant tool call answered by exactly one tool message before the next turn, string tool
- * results, and a history that ends with a user or tool message.
+ * results, echoed tool-call arguments that parse to a JSON object (vLLM and SGLang json.loads every
+ * one of them before they apply the chat template), and a history that ends with a user or tool message.
  * @returns {string[]} empty when the body is fine
  */
 export function chatProblems(body) {
@@ -113,6 +114,13 @@ export function chatProblems(body) {
     }
     if (open?.size) problems.push(`message ${i}: ${open.size} tool call(s) before it got no result`);
     open = m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length ? new Set(m.tool_calls.map((c) => c?.id)) : null;
+    if (m.role === 'assistant' && Array.isArray(m.tool_calls)) {
+      for (const c of m.tool_calls) {
+        let args;
+        try { args = JSON.parse(c?.function?.arguments); } catch { args = undefined; }
+        if (!args || typeof args !== 'object' || Array.isArray(args)) problems.push(`message ${i}: the arguments of tool call ${JSON.stringify(c?.id)} are not the text of a JSON object`);
+      }
+    }
   });
   if (open?.size) problems.push(`the last ${open.size} tool call(s) got no result`);
   const last = messages.at(-1)?.role;
