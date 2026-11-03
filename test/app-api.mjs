@@ -393,6 +393,17 @@ try {
   check('bad repo URL and bad routes → 400 with the §4.5 sentences',
     badRepo.status === 400 && /github\.com/.test(badRepo.json?.error ?? '') && badRoute.status === 400 && /Routes must be paths/.test(badRoute.json?.error ?? ''),
     `${badRepo.status} ${oneLine(badRepo.json?.error)}; ${badRoute.status} ${oneLine(badRoute.json?.error)}`);
+
+  // Repository addresses as people paste them: the owner and name come out, everything else is dropped.
+  const parts = (s) => { try { const r = tasksMod.repoFromInput(s); return `${r.owner}/${r.name}`; } catch (err) { return err.message; } };
+  const pasted = ['  https://github.com/vitejs/vite  ', 'github.com/vitejs/vite', 'http://www.github.com/vitejs/vite.git/', 'https://github.com/vitejs/vite#readme', 'https://GitHub.com/vitejs/vite?tab=readme-ov-file'].map(parts);
+  const pages = ['https://github.com/vitejs/vite/tree/main/packages', 'https://github.com/vitejs/vite/blob/main/README.md', 'https://github.com/vitejs/vite/pull/1'].map(parts);
+  const refused = ['https://gitlab.com/o/r', 'https://github.com.evil.example/o/r', 'https://user@github.com/o/r', 'git@github.com:o/r.git', 'https://gist.github.com/o/r', 'https://github.com/o', 'https://github.com/o/..'].map(parts);
+  const pagedTask = await visitor('203.0.113.25', 'POST', '/api/tasks', { body: { repo: 'https://github.com/vitejs/vite/tree/main' } });
+  check('repo addresses: spaces, http://, www., no scheme, .git, #readme and ?tab= are accepted; a link to a branch, file or pull request gets its own sentence; other hosts are refused',
+    pasted.every((p) => p === 'vitejs/vite') && pages.every((p) => p === tasksMod.SAY_REPO_PAGE) && refused.every((p) => p === tasksMod.SAY_BAD_REPO)
+      && pagedTask.status === 400 && pagedTask.json?.error === tasksMod.SAY_REPO_PAGE,
+    `${pasted.join(', ')} | ${pages.map(oneLine).join(' / ')} | ${refused.filter((p) => p !== tasksMod.SAY_BAD_REPO).join(', ') || 'all refused'} | ${pagedTask.status}`);
   const privateIp = await visitor('10.1.2.3', 'POST', '/api/tasks', { body: { sample: 'lumen' } });
   const loopIp = await visitor('127.0.0.1', 'POST', '/api/tasks', { body: { sample: 'lumen' } });
   check('task creation from a private or loopback client address → 403', privateIp.status === 403 && loopIp.status === 403, `10.1.2.3 → ${privateIp.status}; 127.0.0.1 → ${loopIp.status}`);
