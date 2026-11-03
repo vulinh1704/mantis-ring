@@ -97,6 +97,7 @@ export const SAY = Object.freeze({
   nothingToServe: 'The repository has no dev or start script and no index.html to serve.',
   installTime: `The project's dependencies could not be installed within ${INSTALL_SEC} s.`,
   installMemory: "The install was stopped at the sandbox's memory limit.",
+  installOutput: 'The install printed more output than the sandbox passes on, so it was stopped.',
   installSpace: 'The install ran out of space in the sandbox.',
   installPrivate: 'A dependency could not be found on the public npm registry.',
   installNode: "The project's dependencies need a different Node.js version than the sandbox's Node 22.",
@@ -416,6 +417,20 @@ const INSTALL_ENV = `PATH=${PM_PREFIX}/bin:$PATH PUPPETEER_SKIP_DOWNLOAD=1 PUPPE
 // Yarn 2+ in the sandbox: node_modules (so dev servers find their binaries), no global or in-repo cache, the proxy.
 const YARN_BERRY_ENV = 'YARN_NODE_LINKER=node-modules YARN_ENABLE_IMMUTABLE_INSTALLS=false YARN_ENABLE_GLOBAL_CACHE=false '
   + 'YARN_CACHE_FOLDER=/work/.yarn-cache YARN_ENABLE_TELEMETRY=0 YARN_ENABLE_PROGRESS_BARS=false YARN_HTTP_PROXY=$HTTP_PROXY YARN_HTTPS_PROXY=$HTTPS_PROXY';
+// An install's output goes to a file inside the sandbox, and only its last INSTALL_TAIL bytes come
+// out. So an install that prints a flood (npm with loglevel=silly, or a hostile script) is neither cut
+// off nor scanned on the app's event loop, and a process it leaves behind cannot hold the stream open.
+// Output that bypasses the file (written straight to docker exec's own stream) is cut at
+// INSTALL_MAX_OUTPUT and fails the install. The failure checks read at most INSTALL_TAIL characters.
+const INSTALL_LOG = '/tmp/ring-install.log';
+export const INSTALL_TAIL = 64 * 1024;
+const INSTALL_MAX_OUTPUT = 2 ** 20;
+
+/** The end of an install's output, at most INSTALL_TAIL characters: all that the failure checks read. */
+function installTail(output) {
+  const t = String(output ?? '');
+  return t.length > INSTALL_TAIL ? t.slice(-INSTALL_TAIL) : t;
+}
 
 function devEnv(port, host, binFirst) {
   return `export PATH=${binFirst ? `${APP_DIR}/node_modules/.bin:` : ''}${PM_PREFIX}/bin:$PATH BROWSER=none PORT=${port} HOST=${host} ${QUIET}`;
@@ -553,7 +568,7 @@ function installCommand(info) {
  * file errors get `--no-frozen-lockfile`. Each happens at most once.
  */
 export function installRetry(info, cmd, output) {
-  const t = String(output ?? '');
+  const t = installTail(output);
   if (info?.pm === 'npm' || !info?.pm) {
     if (cmd.startsWith('npm ci') && /can only install packages when your package\.json and package-lock\.json|are in sync|Missing: \S+ from lock file|Invalid: lock file|\bEUSAGE\b/i.test(t)) return 'npm install --no-audit --no-fund';
     if (/\bERESOLVE\b/.test(t) && !cmd.includes('--legacy-peer-deps')) return 'npm install --no-audit --no-fund --legacy-peer-deps';
@@ -570,21 +585,26 @@ export function installRetry(info, cmd, output) {
  * that the output does not name, or null when the failure was not about the network outside.
  */
 export function offAllowlistHost(output) {
-  const t = String(output ?? '');
+  const t = installTail(output);
+  const network = /ENOTFOUND|EAI_AGAIN|getaddrinfo|tunneling socket|statusCode=403|403 Forbidden|Bad response: 403|Received HTTP code 403|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH/i.test(t);
+  if (!network) return null;
   const hosts = [];
   for (const m of t.matchAll(/(?:ENOTFOUND|EAI_AGAIN)\s+([a-z0-9-]+(?:\.[a-z0-9-]+)+)/gi)) hosts.push(m[1]);
   for (const m of t.matchAll(/https?:\/\/([a-z0-9-]+(?:\.[a-z0-9-]+)+)(?::\d+)?/gi)) hosts.push(m[1]);
-  const network = /ENOTFOUND|EAI_AGAIN|getaddrinfo|tunneling socket|statusCode=403|403 Forbidden|Bad response: 403|Received HTTP code 403|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH/i.test(t);
-  if (!network) return null;
   const off = hosts.map((h) => h.toLowerCase()).filter((h) => !ALLOWLIST.includes(h) && h.length <= 100);
   if (off.length) return off.at(-1);
   return /tunneling socket|statusCode=403|403 Forbidden|Bad response: 403|Received HTTP code 403|ENOTFOUND|EAI_AGAIN/i.test(t) ? '' : null;
 }
 
-/** The sentence for an install that failed, from its output, exit code and whether its time ran out. */
-export function installFailure(output, { code = 1, timedOut = false, pm = 'npm' } = {}) {
-  const t = String(output ?? '');
+/**
+ * The sentence for an install that failed, from the end of its output, its exit code, whether its
+ * time ran out and whether its output was cut off (`truncated`: the host stopped reading, which is
+ * not the memory limit).
+ */
+export function installFailure(output, { code = 1, timedOut = false, truncated = false, pm = 'npm' } = {}) {
+  const t = installTail(output);
   if (timedOut || code === 124) return SAY.installTime;
+  if (truncated) return SAY.installOutput;
   if (/\bENOSPC\b|no space left on device/i.test(t)) return SAY.installSpace;
   const host = offAllowlistHost(t);
   if (host !== null) return sayOffAllowlist(host);
@@ -613,15 +633,18 @@ export async function installDeps(box, kind) {
     const left = Math.floor((until - Date.now()) / 1000);
     if (left < 5) throw new SetupError(SAY.installTime, `no time was left for: ${cmd}`);
     ran.push(cmd);
-    const r = await box.exec(`cd ${APP_DIR} && export ${env} && timeout -k 5 ${left} ${cmd}`, { timeoutMs: (left + 20) * 1000 });
-    last = { cmd, r, outOfTime: Date.now() >= until - 1000 };
-    return r.code === 0 && !r.timedOut;
+    // stdout and stderr go to INSTALL_LOG, in the order they were written (pnpm prints its errors on
+    // stdout); only its end comes out, and the exit code is the install's own.
+    const script = `rm -f ${INSTALL_LOG}; cd ${APP_DIR} && export ${env} && timeout -k 5 ${left} ${cmd} > ${INSTALL_LOG} 2>&1; s=$?; `
+      + `tail -c ${INSTALL_TAIL} ${INSTALL_LOG} 2> /dev/null; rm -f ${INSTALL_LOG}; exit $s`;
+    const r = await box.exec(script, { timeoutMs: (left + 20) * 1000, maxBytes: INSTALL_MAX_OUTPUT });
+    last = { cmd, r, text: installTail(`${r.stderr}\n${r.stdout}`), outOfTime: Date.now() >= until - 1000 };
+    return r.code === 0 && !r.timedOut && !r.truncated;
   };
   const fail = () => {
-    const { cmd, r, outOfTime } = last;
-    const text = `${r.stderr}\n${r.stdout}`; // pnpm prints its errors on stdout
-    throw new SetupError(installFailure(text, { code: r.code, timedOut: r.timedOut || outOfTime, pm: info.pm }),
-      `${cmd} failed (exit ${r.code}): ${tailLine(text)}`);
+    const { cmd, r, text, outOfTime } = last;
+    throw new SetupError(installFailure(text, { code: r.code, timedOut: r.timedOut || outOfTime, truncated: r.truncated, pm: info.pm }),
+      `${cmd} failed (exit ${r.code}${r.truncated ? `, output cut off at ${INSTALL_MAX_OUTPUT} bytes` : ''}): ${tailLine(text)}`);
   };
 
   if (info.pm === 'yarn' && info.yarnPath) {
@@ -635,13 +658,14 @@ export async function installDeps(box, kind) {
     if (!(await attempt(get(version)))) {
       // A version npm does not have: its major release line, once.
       const major = /^(\d+)\./.exec(version)?.[1];
-      if (!major || !/\bETARGET\b|No matching version|\bE404\b/i.test(`${last.r.stderr}\n${last.r.stdout}`) || !(await attempt(get(major)))) fail();
+      if (!major || last.r.truncated || !/\bETARGET\b|No matching version|\bE404\b/i.test(last.text) || !(await attempt(get(major)))) fail();
     }
   }
   let cmd = installCommand(info);
   for (let tries = 0; tries < 3; tries++) {
     if (await attempt(cmd)) return { pm: pmText(info), ran };
-    const next = installRetry(info, cmd, `${last.r.stderr}\n${last.r.stdout}`);
+    // After output that was cut off, the install may still run in the sandbox: no second one beside it.
+    const next = last.r.truncated ? null : installRetry(info, cmd, last.text);
     if (!next || last.outOfTime) break;
     cmd = next;
   }
