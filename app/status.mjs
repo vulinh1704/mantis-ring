@@ -97,7 +97,10 @@ export function readSelftests(home = os.homedir()) {
     try {
       const j = JSON.parse(readFileSync(path.join(home, '.ring', 'selftest', `${suite}.json`), 'utf8'));
       out[key] = Number.isInteger(j?.passed) && Number.isInteger(j?.total)
-        ? { passed: j.passed, total: j.total, at: typeof j.at === 'string' ? j.at : null, runtime: typeof j.runtime === 'string' ? j.runtime : null }
+        ? {
+          passed: j.passed, total: j.total, at: typeof j.at === 'string' ? j.at : null, runtime: typeof j.runtime === 'string' ? j.runtime : null,
+          commit: typeof j.commit === 'string' && /^[0-9a-f]{4,40}$/.test(j.commit) ? j.commit : null,
+        }
         : null;
     } catch {
       out[key] = null;
@@ -213,12 +216,15 @@ export const runtimeName = (r) => (r === 'runsc' ? 'gVisor' : String(r ?? ''));
 /** "3 GB" from Docker's "3g". */
 export const sizeText = (s) => String(s).replace(/^(\d+)g$/i, '$1 GB').replace(/^(\d+)m$/i, '$1 MB');
 
-function selftestText(s) {
+/** One self-test result, with the commit it ran on; a result from another commit than the one deployed says so. */
+function selftestText(s, deployed) {
   if (!s) return '<span class="muted">no self-test result on record</span>';
   const ok = s.total > 0 && s.passed === s.total;
   const where = s.runtime ? ` under ${esc(runtimeName(s.runtime))}` : '';
   const when = s.at ? ` · ${esc(utcText(s.at))}` : '';
-  return `${pill(ok, `${s.passed}/${s.total} passed`, `${s.passed}/${s.total} passed`)}<span class="muted">${where}${when}</span>`;
+  const current = !s.commit || !deployed || deployed.startsWith(s.commit) || s.commit.startsWith(deployed);
+  const which = s.commit ? ` · on <code>${esc(s.commit)}</code>${current ? '' : ' (an earlier version than the one deployed)'}` : ' · commit not recorded';
+  return `${pill(ok, `${s.passed}/${s.total} passed`, `${s.passed}/${s.total} passed`)}<span class="muted">${where}${when}${which}</span>`;
 }
 
 function etaText(sec) {
@@ -258,9 +264,9 @@ export function statusHtml(d) {
   ].join('');
 
   const tests = [
-    row('Containment', selftestText(st.containment)),
-    row('Hostile-repo scenes', selftestText(st.scenes)),
-    row('Agent loop', selftestText(st.agentLoop)),
+    row('Containment', selftestText(st.containment, v.commit)),
+    row('Hostile-repo scenes', selftestText(st.scenes, v.commit)),
+    row('Agent loop', selftestText(st.agentLoop, v.commit)),
   ].join('');
 
   const spend = !sp
@@ -278,12 +284,15 @@ export function statusHtml(d) {
   const queue = [
     row('Running', esc(`${d.queue.running} of ${d.queue.maxRunning} at once`)),
     row('Waiting', esc(d.queue.queued)),
-    row('A new run would finish in', esc(etaText(d.queue.etaSec))),
+    // Only a visitor who can start a run needs an ETA; it comes from comparable runs (app/tasks.mjs).
+    ...(d.publicRuns ? [row('A new run would finish in', esc(etaText(d.queue.etaSec)))] : []),
     row('Public runs', d.publicRuns ? pill(true, 'open', '') : '<span class="muted">not open yet</span>'),
   ].join('');
 
+  const runLink = /^t_[0-9a-f]{32}$/.test(String(d.latest?.taskId ?? '')) ? `<a href="/t/${esc(d.latest.taskId)}">the run's step-by-step log</a>` : '';
   const latest = d.latest
-    ? [row('Result', `<code>${esc(d.latest.line ?? '')}</code>`), row('Published', esc(utcText(d.latest.at))), row('Page', '<a href="/latest/">/latest/</a>')].join('')
+    ? [row('Result', `<code>${esc(d.latest.line ?? '')}</code>`), row('Published', esc(utcText(d.latest.at))),
+      row('Pages', `<a href="/latest/">/latest/</a>${runLink ? ` · ${runLink}` : ''}`)].join('')
     : row('Result', '<span class="muted">nothing published yet</span>');
 
   const version = [
@@ -309,7 +318,7 @@ export function statusHtml(d) {
 </div></header>
 <main class="wrap page">
 <div class="page-head"><h1>Status</h1>${problems.length ? pill(false, '', 'Needs attention') : pill(true, 'Ready', '')}</div>
-<p class="muted">${problems.length ? `${esc(problems.join('; '))}. ` : ''}Every value on this page is read live, or comes from the last real self-test run. Raw data: <a href="/status.json">/status.json</a>.</p>
+<p class="muted">${problems.length ? `${esc(problems.join('; '))}. ` : ''}Checked live (Docker every 5 min, the proxy every 30 s, the model service every minute) or read from the last real self-test; the limits are the configured values. Raw data: <a href="/status.json">/status.json</a>.</p>
 <div class="grid">
 ${card('Sandbox', sandbox)}
 ${card('Model service', model)}

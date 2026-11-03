@@ -421,7 +421,12 @@ export class Queue extends EventEmitter {
   }
 }
 
-/** Durations of the last finished tasks (<STATE_DIR>/stats.json), for the ETA and the "about N min" text. */
+/**
+ * Durations of the last finished tasks (<STATE_DIR>/stats.json), for the ETA and the "about N min"
+ * text. Only rows marked `comparable` count (a run like the next public one: the sample's own
+ * matrix, the default caps and a normal end), so a one-screen smoke test or a run stopped by its
+ * budget never makes a new run look shorter than it is. Rows from before this flag do not count.
+ */
 export class RunStats {
   constructor(file, { keep = 20 } = {}) {
     this.file = file;
@@ -429,7 +434,7 @@ export class RunStats {
     this.rows = null;
   }
 
-  /** Record one finished task: {id, kind: 'sample'|'github', sec, at}. A failed write only loses the ETA. */
+  /** Record one finished task: {id, kind: 'sample'|'github', origin, comparable, sec, at}. A failed write only loses the ETA. */
   add(row) {
     this.rows = [...this.#load(), row].slice(-this.keep);
     try {
@@ -441,14 +446,19 @@ export class RunStats {
     }
   }
 
-  count(kind) { return this.#load().filter((r) => !kind || r.kind === kind).length; }
+  /** Comparable finished runs on record (of one kind, when given). */
+  count(kind) { return this.#usable(kind).length; }
 
-  /** Median seconds, or null with no history. */
+  /** Median seconds of the comparable runs, or null with no history. */
   median(kind) {
-    const xs = this.#load().filter((r) => !kind || r.kind === kind).map((r) => r.sec).sort((a, b) => a - b);
+    const xs = this.#usable(kind).map((r) => r.sec).sort((a, b) => a - b);
     if (xs.length === 0) return null;
     const mid = xs.length >> 1;
     return xs.length % 2 ? xs[mid] : (xs[mid - 1] + xs[mid]) / 2;
+  }
+
+  #usable(kind) {
+    return this.#load().filter((r) => r.comparable === true && (!kind || r.kind === kind));
   }
 
   #load() {

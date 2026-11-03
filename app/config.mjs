@@ -38,10 +38,13 @@ export const DEFAULT_CAPS = Object.freeze({
   reasoning: Object.freeze({ effort: 'low', max_tokens: 2048 }),
   maxPromptTokens: 1_200_000, maxUsd: 0.60, wallClockSec: 900, lookTimeoutSec: 300,
 });
-/** The range each cap may take, admin tasks included: [lowest, highest, integer?]. */
+/**
+ * The range each cap may take, admin tasks included: [lowest, highest, integer?]. maxUsd must be
+ * above 0 (the loop refuses 0), so its lowest value is one millionth of a dollar.
+ */
 export const CAP_RANGES = Object.freeze({
   maxChecks: [1, 3, true], maxTurns: [1, 60, true], maxTurnsPerCheck: [1, 20, true], maxCallsPerTurn: [1, 12, true],
-  maxCompletionTokens: [256, 16384, true], maxPromptTokens: [1000, 3_000_000, true], maxUsd: [0, 2, false],
+  maxCompletionTokens: [256, 16384, true], maxPromptTokens: [1000, 3_000_000, true], maxUsd: [0.000001, 2, false],
   wallClockSec: [10, 2400, true], lookTimeoutSec: [30, 600, true],
 });
 /** A GitHub repository has to be cloned and installed, so it gets 20 minutes instead of 15. */

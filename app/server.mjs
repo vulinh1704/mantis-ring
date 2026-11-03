@@ -19,10 +19,10 @@ import { chat, newTally } from '../agent/inference.mjs';
 import { APP_LABEL, Sandbox, childEnv } from '../runner/sandbox.mjs';
 import * as configModule from './config.mjs';
 import { ConfigError, HEAVY_SLOTS, MAX_QUEUED, PROVIDER, PUBLIC_DIR, PUBLIC_URL, RUNTIME, SAMPLES, STATE_DIR, samplingFor } from './config.mjs';
-import { PublishError, notPublishable, publishLatest } from './publish.mjs';
+import { PublishError, notPublishable, publishLatest, refreshPlaceholder } from './publish.mjs';
 import { Spend } from './spend.mjs';
 import * as statusModule from './status.mjs';
-import { oneLine } from './status.mjs';
+import { oneLine, readLatest } from './status.mjs';
 import { INTERRUPTED, Queue, QueueFullError, RunStats, TaskInputError, TaskStore, taskFromBody } from './tasks.mjs';
 
 const PUBLIC_ROOT = fileURLToPath(new URL('./public/', import.meta.url));
@@ -44,7 +44,10 @@ const PROBE_CAPS = { maxUsd: 0.25, maxPromptTokens: 400_000 };   // the whole pr
 const PROBE_TIMEOUT_MS = 15 * 60_000;
 const DIFF_SHOWN_BYTES = 200 * 1024;
 const PUBLIC_KEYS = ['id', 'createdAt', 'updatedAt', 'startedAt', 'finishedAt', 'origin', 'state', 'source', 'matrix', 'model',
-  'visionModel', 'gate', 'position', 'step', 'stepTimes', 'sandbox', 'result', 'approvedAt', 'publishedAt'];
+  'visionModel', 'gate', 'position', 'step', 'stepTimes', 'sandbox', 'result', 'approvedAt', 'approvedWith', 'publishedAt'];
+const MIN_ETA_RUNS = 3;              // an ETA needs this many comparable finished runs (as /api/config's etaText)
+const MAX_PASSPHRASE_TRIES = 5;      // wrong approval passphrases per task before approving it is refused
+const NORMAL_ENDS = ['finish', 'checks', 'turns', 'time', 'no-tools'];
 
 // Public answers are one plain sentence each (§4.5).
 const SAY = {
@@ -63,6 +66,21 @@ const SAY = {
   owner: 'Only the person who started this run can do that.',
   internal: 'Something went wrong on our side. The latest verified run shows a complete result.',
 };
+// The same answers while no run is published yet: they must not send anyone to an empty page.
+const SAY_UNPUBLISHED = {
+  closed: 'Live runs open soon. Status shows the server live meanwhile.',
+  hour: `You have started ${PER_IP.hour} runs in the last hour from this network. Please try again later.`,
+  day: `You have started ${PER_IP.day} runs today from this network. Please try again tomorrow.`,
+  budgetDay: "Today's demo budget is used up; it resets at 00:00 UTC.",
+  budgetTotal: 'The demo budget is used up.',
+  paused: 'Live runs are paused right now.',
+  internal: 'Something went wrong on our side.',
+};
+
+/** A public sentence; the variants that point to the latest verified run are used only once one exists. */
+function sentence(key) {
+  return !readLatest() && Object.hasOwn(SAY_UNPUBLISHED, key) ? SAY_UNPUBLISHED[key] : SAY[key];
+}
 
 /** An answer other than 200: an HTTP status and one plain sentence (plus optional headers). */
 class HttpError extends Error {
@@ -137,7 +155,12 @@ export function ipKey(ip) {
 // Responses and request bodies
 // ---------------------------------------------------------------------------------------------
 function headers(extra) {
-  return { 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer', ...extra };
+  return {
+    'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer',
+    'cross-origin-opener-policy': 'same-origin', 'cross-origin-resource-policy': 'same-origin',
+    'permissions-policy': 'camera=(), microphone=(), geolocation=()',
+    ...extra,
+  };
 }
 
 function sendJson(res, status, body, extra = {}) {
@@ -152,9 +175,48 @@ function sendError(res, status, sentence, extra = {}) {
   sendJson(res, status, { error: sentence, more: '/latest/' }, extra);
 }
 
-function sendHtml(res, html) {
-  res.writeHead(200, headers({ 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'content-security-policy': CSP, 'x-frame-options': 'DENY', 'content-length': Buffer.byteLength(html) }));
+function sendHtml(res, html, status = 200) {
+  res.writeHead(status, headers({ 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'content-security-policy': CSP, 'x-frame-options': 'DENY', 'content-length': Buffer.byteLength(html) }));
   res.end(html);
+}
+
+const NOT_FOUND_HTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Not found · Mantis Ring</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<main class="wrap page">
+<h1>Nothing here</h1>
+<p class="muted">There is nothing at this address.</p>
+<p><a href="/">Mantis Ring</a> · <a href="/status">Status</a></p>
+</main>
+</body>
+</html>
+`;
+
+/**
+ * 404. A browser (a GET that accepts text/html, outside /api/) gets a small page with links to the
+ * home page and /status; everything else gets the JSON error. /admin/* answers exactly the same way.
+ */
+function sendNotFound(c) {
+  if (c.method === 'GET' && !c.path.startsWith('/api/') && /text\/html/i.test(String(c.req.headers.accept ?? ''))) {
+    sendHtml(c.res, NOT_FOUND_HTML, 404);
+    return;
+  }
+  sendError(c.res, 404, SAY.notFound);
+}
+
+/** The owner's approval passphrase matches the stored SHA-256 (hex), compared in constant time. */
+function passphraseOk(given, wantHex) {
+  if (typeof given !== 'string' || given.length === 0 || given.length > 200) return false;
+  const want = Buffer.from(wantHex, 'hex');
+  const got = createHash('sha256').update(given, 'utf8').digest();
+  return want.length === got.length && timingSafeEqual(want, got);
 }
 
 const staticFiles = new Map();
@@ -235,9 +297,13 @@ function sseFrame(type, data, seq) {
  * what it fakes (usually runFix, spend and a temporary RING_STATE_DIR). `probe` is agent/probe.mjs
  * (probeAll); `vision` is visionCheck from agent/vision.mjs, to which each task adds its own chat,
  * tally and guard. Without them, /admin/probe answers 503 and runs skip the vision check.
+ * `approval.passphraseSha256` (hex; read at call time, so a test may change it): when set, Approve
+ * also needs the owner's approval passphrase, which the operator of the admin channel never holds.
+ * Without it, the owner link alone approves, and the published page says exactly that.
  * @param {{config?:{get():object, set(patch:object):object}, store?:TaskStore, queue?:Queue, spend?:object|null,
  *   runFix?:Function|null, publish?:typeof publishLatest, status?:{statusData:Function, statusHtml:Function},
- *   now?:() => number, probe?:{probeAll:Function}|null, vision?:Function|null, stats?:RunStats, log?:(line:string) => void}} deps
+ *   now?:() => number, probe?:{probeAll:Function}|null, vision?:Function|null, stats?:RunStats, log?:(line:string) => void,
+ *   approval?:{passphraseSha256?:string|null}}} deps
  * @returns {{server: import('node:http').Server, close(): Promise<void>, store: TaskStore, queue: Queue}}
  */
 export function createApp(deps = {}) {
@@ -253,11 +319,20 @@ export function createApp(deps = {}) {
   const probe = deps.probe ?? null;
   const vision = deps.vision ?? null;
   const stats = deps.stats ?? new RunStats(path.join(STATE_DIR, 'stats.json'));
+  const approval = deps.approval ?? { passphraseSha256: null };
   const startedAt = now();
   const streams = new Set();       // open SSE responses
   const streamsByKey = new Map();  // client key -> number of open SSE responses
   const announced = new Map();     // queued task -> position last sent
+  const passphraseTries = new Map(); // task id -> wrong approval passphrases in this process
+  let selftestNow = null;          // the suite of a self-test that waits or runs (/admin/busy)
   let closing = null;
+
+  /** The approval passphrase's SHA-256 (lowercase hex), or null when the owner link alone approves. */
+  const approvalHash = () => {
+    const h = approval?.passphraseSha256;
+    return typeof h === 'string' && /^[0-9a-f]{64}$/i.test(h) ? h.toLowerCase() : null;
+  };
 
   const journal = (id, text) => log(`task=${id} ${oneLine(text, 400)}`);
   const emit = (id, type, data) => store.appendEvent(id, type, data);
@@ -292,9 +367,11 @@ export function createApp(deps = {}) {
     if (running.length < queue.maxRunning) return 0;
     return Math.min(...running.map((id) => Math.max(0, median - elapsedSec(id))));
   };
-  /** §4.4: ceil(position / maxRunning) × median + time until a slot frees. null without history. */
+  /** The median length of a comparable run, once MIN_ETA_RUNS of them exist; null before ("a few minutes"). */
+  const medianRun = () => (stats.count() >= MIN_ETA_RUNS ? stats.median() : null);
+  /** §4.4: ceil(position / maxRunning) × median + time until a slot frees. null without enough history. */
   function etaFor(id) {
-    const median = stats.median();
+    const median = medianRun();
     const pos = queue.position(id);
     if (median === null || pos === null) return null;
     if (pos === 0) return Math.max(0, Math.round(median - elapsedSec(id)));
@@ -302,11 +379,26 @@ export function createApp(deps = {}) {
   }
   /** ETA for a run submitted now (shown on /status). */
   function etaForNew() {
-    const median = stats.median();
+    const median = medianRun();
     if (median === null) return null;
     const pos = queue.queued().length + 1;
     if (queue.queued().length === 0 && queue.running().length < queue.maxRunning) return Math.round(median);
     return Math.round(Math.ceil(pos / Math.max(1, queue.maxRunning)) * median + slotFreeIn(median));
+  }
+
+  /**
+   * Whether a finished run predicts the next public one: the sample with its own matrix, the default
+   * limits that set its length (checks, turns, wall clock) and a normal end. Smoke tests on one
+   * screen, runs stopped by their budget or by an inference error, and GitHub runs do not count.
+   */
+  function comparableRun(rec, receipt) {
+    const s = rec.source?.kind === 'sample' && Object.hasOwn(SAMPLES, rec.source.name) ? SAMPLES[rec.source.name] : null;
+    if (!s) return false;
+    const same = (a, b) => Array.isArray(a) && a.length === b.length && a.every((x, i) => x === b[i]);
+    if (!['routes', 'viewports', 'schemes', 'locales'].every((k) => same(rec.matrix?.[k], s[k]))) return false;
+    const def = config.get().caps ?? {};
+    if (!['maxChecks', 'maxTurns', 'maxTurnsPerCheck', 'wallClockSec'].every((k) => rec.caps?.[k] === def[k])) return false;
+    return NORMAL_ENDS.includes(receipt?.stopReason);
   }
 
   function createTask(origin, spec, key) {
@@ -375,7 +467,10 @@ export function createApp(deps = {}) {
       chat,
       createSandbox: async (o) => {
         const box = await Sandbox.create(o);
-        store.update(id, { sandbox: { name: box.name, runtime: o?.runtime ?? 'runc' } });
+        // What Docker really runs it under (HostConfig.Runtime), not what was asked for (§7 #13).
+        let runtime = o?.runtime ?? null;
+        try { runtime = await box.runtimeName(); } catch (err) { journal(id, `runtime of ${box.name} not read: ${oneLine(err, 160)}`); }
+        store.update(id, { sandbox: { name: box.name, runtime } });
         return box;
       },
       emit: (type, data) => loopEvent(id, type, data),
@@ -411,7 +506,9 @@ export function createApp(deps = {}) {
     }
     let state = ['done', 'failed', 'timeout', 'cancelled'].includes(result?.status) ? result.status : 'failed';
     if (state === 'cancelled' && signal.reason === 'shutdown') state = 'interrupted';
-    if (state === 'done') stats.add({ id, kind: rec.source.kind, sec: Math.round((now() - t0) / 100) / 10, at: iso(now()) });
+    if (state === 'done') {
+      stats.add({ id, kind: rec.source.kind, origin: rec.origin, comparable: comparableRun(rec, result?.receipt), sec: Math.round((now() - t0) / 100) / 10, at: iso(now()) });
+    }
     endTask(id, { state, receipt: result?.receipt ?? null, error: errorText(state, result?.error) });
   }
 
@@ -478,6 +575,7 @@ export function createApp(deps = {}) {
       out.etaSec = etaFor(rec.id);
     }
     out.hasPatch = rec.state === 'done' && store.size(rec.id, 'patch.diff') > 0;
+    out.approvalNeedsPassphrase = approvalHash() !== null;
     out.files = store.names(rec.id, TASK_IMAGE);
     if (full && FINISHED.has(rec.state)) {
       out.receipt = readReceipt(rec.id);
@@ -498,7 +596,7 @@ export function createApp(deps = {}) {
 
   // --- public routes (§4.2) --------------------------------------------------------------------
   async function createPublicTask(c) {
-    if (!config.get().publicRuns) return sendError(c.res, 503, SAY.closed);   // D-5
+    if (!config.get().publicRuns) return sendError(c.res, 503, sentence('closed'));   // D-5
     const body = await readJson(c.req);
     if (closing) throw new HttpError(503, SAY.restarting);
     const ip = clientIp(c.req);
@@ -514,11 +612,11 @@ export function createApp(deps = {}) {
     }
     checkIpLimits(key);
     if (queue.full()) throw new HttpError(503, SAY.busy);
-    if (!spend) throw new HttpError(503, SAY.paused);
+    if (!spend) throw new HttpError(503, sentence('paused'));
     const can = spend.canStart('public', { maxUsd: spec.caps.maxUsd });
     if (!can.ok) {
       log(`public run refused by the budget: ${can.reason}`);
-      throw new HttpError(503, can.scope === 'total' ? SAY.budgetTotal : SAY.budgetDay);
+      throw new HttpError(503, sentence(can.scope === 'total' ? 'budgetTotal' : 'budgetDay'));
     }
     const t = createTask('public', spec, key);
     sendJson(c.res, 202, { id: t.id, ownerToken: t.ownerToken, position: t.position, etaSec: etaFor(t.id) });
@@ -532,12 +630,12 @@ export function createApp(deps = {}) {
     const hour = mine.map((r) => Date.parse(r.createdAt)).filter((ms) => t - ms < 3_600_000).sort((a, b) => a - b);
     if (hour.length >= PER_IP.hour) {
       const wait = Math.ceil((hour[hour.length - PER_IP.hour] + 3_600_000 - t) / 1000);
-      throw new HttpError(429, SAY.hour, { 'retry-after': String(Math.max(1, wait)) });
+      throw new HttpError(429, sentence('hour'), { 'retry-after': String(Math.max(1, wait)) });
     }
     const day = iso(t).slice(0, 10);
     if (mine.filter((r) => String(r.createdAt).slice(0, 10) === day).length >= PER_IP.day) {
       const wait = Math.ceil((Date.parse(`${day}T00:00:00Z`) + 86_400_000 - t) / 1000);
-      throw new HttpError(429, SAY.day, { 'retry-after': String(Math.max(1, wait)) });
+      throw new HttpError(429, sentence('day'), { 'retry-after': String(Math.max(1, wait)) });
     }
   }
 
@@ -593,20 +691,37 @@ export function createApp(deps = {}) {
     createReadStream(store.file(id, name)).on('error', () => c.res.destroy()).pipe(c.res);
   }
 
+  /**
+   * Approve (§4.2). The owner token alone cannot prove a person: the admin channel that created the
+   * task holds it too, and could send it through Caddy. So the admin channel is refused outright, and
+   * when the owner has set an approval passphrase on the server (RING_APPROVE_PASSPHRASE_SHA256 in the
+   * service's environment, which the operator cannot read), Approve also needs that passphrase. The
+   * record keeps which of the two approved the run, and the published page says no more than that.
+   */
   async function approveTask(c) {
-    await readJson(c.req);
+    const body = await readJson(c.req);
     const rec = taskOr404(c.m[1]);
-    // The admin channel holds every owner token it created, so approval must come through Caddy:
-    // admin calls can never approve (§0.4).
     if (c.admin) throw new HttpError(403, "Approval must come from the owner's browser, not from the admin channel.");
     if (!ownerOk(rec, c.req)) throw new HttpError(403, SAY.owner);
     if (rec.state !== 'done' || store.size(rec.id, 'patch.diff') <= 0) throw new HttpError(403, 'Only a finished run with a patch can be approved.');
     let approvedAt = rec.approvedAt;
     if (!approvedAt) {
+      const want = approvalHash();
+      if (want) {
+        const tries = passphraseTries.get(rec.id) ?? 0;
+        if (tries >= MAX_PASSPHRASE_TRIES) throw new HttpError(403, 'Too many wrong passphrases for this run. It can be approved again after the demo restarts.');
+        if (!passphraseOk(body.passphrase, want)) {
+          passphraseTries.set(rec.id, tries + 1);
+          journal(rec.id, `approval refused: wrong or missing passphrase (${tries + 1} of ${MAX_PASSPHRASE_TRIES})`);
+          throw new HttpError(403, 'The approval passphrase is not right.');
+        }
+      }
       approvedAt = iso(now());
-      store.update(rec.id, { approvedAt });
-      emit(rec.id, 'step', { step: 'approve', status: 'done', note: 'approved by the owner' });
-      journal(rec.id, 'approved by the owner');
+      const approvedWith = want ? 'passphrase' : 'owner-link';
+      store.update(rec.id, { approvedAt, approvedWith });
+      emit(rec.id, 'step', { step: 'approve', status: 'done', note: want ? 'approved by the owner with the approval passphrase' : 'approved with the owner link' });
+      journal(rec.id, `approved (${approvedWith})`);
+      await republishIfLatest(rec.id);
     }
     sendJson(c.res, 200, { id: rec.id, approvedAt });
   }
@@ -668,11 +783,20 @@ export function createApp(deps = {}) {
     sendTaskFile(c, rec.id, 'transcript.jsonl', 'application/x-ndjson; charset=utf-8', { 'cache-control': 'no-store' });
   }
 
-  /** Every file of a task as a tar stream: the host's own tar over files the app wrote itself. */
+  /**
+   * Every file of a task as a tar stream: the host's own tar over files the app wrote itself. Bundles
+   * end up in git (bench/), so task.json goes in without its private part (the client's network key
+   * and the owner token's hash): a copy without it is written next to it and renamed in the archive.
+   */
   function adminBundle(c) {
     const rec = taskOr404(c.m[1]);
     const res = c.res;
-    const tar = spawn('tar', ['-C', store.dir(rec.id), '-cf', '-', '.'], { env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
+    const { private: _private, ...shareable } = rec;
+    const copy = path.join(store.dir(rec.id), 'bundle-task.json');
+    writeFileSync(`${copy}.tmp`, `${JSON.stringify(shareable, null, 2)}\n`, { mode: 0o640 });
+    renameSync(`${copy}.tmp`, copy);
+    const tar = spawn('tar', ['-C', store.dir(rec.id), '--exclude=./task.json', '--exclude=./task.json.tmp', '--exclude=./bundle-task.json.tmp',
+      '--transform=s,^\\./bundle-task\\.json$,./task.json,', '-cf', '-', '.'], { env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
     let stderr = '';
     tar.stderr.setEncoding('utf8').on('data', (d) => { stderr = (stderr + d).slice(-500); });
     tar.on('error', (err) => { log(`bundle ${rec.id}: tar did not start: ${oneLine(err)}`); res.destroy(); });
@@ -690,9 +814,8 @@ export function createApp(deps = {}) {
     sendJson(c.res, 200, cancelTask(taskOr404(c.m[1]), 'by the admin'));
   }
 
-  async function adminPublish(c) {
-    await readJson(c.req);
-    const rec = taskOr404(c.m[1]);
+  /** Publish one run to /latest/ (§4.8) and record it in latest.json. Throws HttpError 409 when the bar refuses it. */
+  async function publishTask(rec) {
     const receipt = readReceipt(rec.id);
     const why = notPublishable(rec, receipt);
     if (why) throw new HttpError(409, `Not published: ${why}.`);
@@ -712,7 +835,24 @@ export function createApp(deps = {}) {
     const latest = path.join(STATE_DIR, 'latest.json');
     writeFileSync(`${latest}.tmp`, `${JSON.stringify({ taskId: rec.id, at, line: receipt.line ?? null })}\n`, { mode: 0o640 });
     renameSync(`${latest}.tmp`, latest);
-    journal(rec.id, `published to ${out.url}${rec.approvedAt ? '' : ' (not approved)'}`);
+    journal(rec.id, `published to ${out.url}${rec.approvedAt ? ` (approved with ${rec.approvedWith ?? 'the owner link'})` : ' (not approved)'}`);
+    return { out, at };
+  }
+
+  /** After an approval: when this run is the one on /latest/, render it again so the page shows the approval. */
+  async function republishIfLatest(id) {
+    if (readLatest()?.taskId !== id) return;
+    try {
+      await publishTask(store.get(id));
+    } catch (err) {
+      journal(id, `the approved run could not be published again: ${oneLine(err, 200)}`);
+    }
+  }
+
+  async function adminPublish(c) {
+    await readJson(c.req);
+    const rec = taskOr404(c.m[1]);
+    const { out, at } = await publishTask(rec);
     sendJson(c.res, 200, { id: rec.id, url: out.url, dir: out.dir, publishedAt: at, approvedAt: rec.approvedAt });
   }
 
@@ -778,9 +918,11 @@ export function createApp(deps = {}) {
     res.on('error', () => {});
     const say = (text) => { if (!res.writableEnded && !res.destroyed) res.write(text); };
     say(`selftest ${suite}: waiting until no task is running (new tasks wait too)\n`);
+    selftestNow = suite;
     const release = await queue.pauseForExclusive();
     if (res.destroyed) {
       release();
+      selftestNow = null;
       log(`selftest ${suite}: the caller left before it started; not run`);
       return;
     }
@@ -799,6 +941,7 @@ export function createApp(deps = {}) {
       clearTimeout(timer);
       clearTimeout(killTimer);
       release();
+      selftestNow = null;
       log(`selftest ${suite}: ${how}`);
       say(`\nselftest ${suite}: ${how}\n`);
       if (!res.writableEnded && !res.destroyed) res.end();
@@ -818,10 +961,11 @@ export function createApp(deps = {}) {
     ['GET', /^\/status\.json$/, async (c) => sendJson(c.res, 200, await statusNow())],
     ['GET', /^\/api\/config$/, (c) => {
       const cfg = config.get();
-      const etaText = stats.count('sample') >= 3 ? `about ${Math.max(1, Math.round(stats.median('sample') / 60))} min` : 'a few minutes';
+      const etaText = stats.count('sample') >= MIN_ETA_RUNS ? `about ${Math.max(1, Math.round(stats.median('sample') / 60))} min` : 'a few minutes';
       sendJson(c.res, 200, {
         publicRuns: cfg.publicRuns, provider: PROVIDER, fixModel: cfg.fixModel, visionModel: cfg.visionModel,
         samples: Object.entries(SAMPLES).map(([id, s]) => ({ id, label: s.label, etaText })),
+        latest: readLatest(),   // null until a run is published
       });
     }],
     ['POST', /^\/api\/tasks$/, createPublicTask],
@@ -838,6 +982,8 @@ export function createApp(deps = {}) {
   ];
   const ADMIN = [
     ['GET', /^\/admin\/health$/, adminHealth],
+    // For deploy.sh: no Docker calls, so it answers at once even while looks keep the CPUs busy.
+    ['GET', /^\/admin\/busy$/, (c) => sendJson(c.res, 200, { running: queue.running().length, queued: queue.queued().length, selftest: selftestNow })],
     ['GET', /^\/admin\/tasks$/, adminList],
     ['POST', /^\/admin\/tasks$/, adminCreate],
     ['GET', new RegExp(`^/admin/tasks/(${ID})$`), adminGet],
@@ -861,8 +1007,11 @@ export function createApp(deps = {}) {
       allow = allow ? `${allow}, ${method}` : method;
     }
     if (allow) return sendError(c.res, 405, 'That method is not allowed here.', { allow });
-    return sendError(c.res, 404, SAY.notFound);
+    return sendNotFound(c);
   }
+
+  // Pages a person may type with a trailing slash: /status/ and /t/<id>/ redirect to the page.
+  const SLASHED_PAGE = new RegExp(`^/(?:status|t/${ID})/+$`);
 
   async function handle(req, res) {
     const raw = req.url ?? '';
@@ -872,8 +1021,13 @@ export function createApp(deps = {}) {
     if (!url) return sendError(res, 400, 'That address is not valid.');
     const c = { req, res, url, path: url.pathname, method: req.method === 'HEAD' ? 'GET' : req.method, admin: isAdmin(req), m: null };
     if (c.path === '/admin' || c.path.startsWith('/admin/')) {
-      if (!c.admin) return sendError(res, 404, SAY.notFound);   // exactly what an unknown path gets
+      if (!c.admin) return sendNotFound(c);   // exactly what an unknown path gets
       return dispatch(ADMIN, c);
+    }
+    if (c.method === 'GET' && SLASHED_PAGE.test(c.path)) {
+      res.writeHead(308, headers({ location: `${c.path.replace(/\/+$/, '')}${url.search}`, 'cache-control': 'no-store', 'content-length': 0 }));
+      res.end();
+      return undefined;
     }
     return dispatch(PUBLIC, c);
   }
@@ -886,7 +1040,7 @@ export function createApp(deps = {}) {
     }
     log(`request ${req.method} ${oneLine(req.url, 120)} failed: ${oneLine(err?.stack ?? err, 400)}`);
     if (res.headersSent) { res.destroy(); return; }
-    sendError(res, 500, SAY.internal);
+    sendError(res, 500, sentence('internal'));
   }
 
   const server = http.createServer((req, res) => {
@@ -965,9 +1119,20 @@ async function main() {
   const visionModule = await optional('../agent/vision.mjs', log);
   // 4. Can the service user drive Docker?
   log(await statusModule.dockerVersionLine());
+  // /latest/ before the first publish: a page that says so and links on, instead of a bare line.
+  try {
+    log(`startup: /latest/ placeholder ${refreshPlaceholder(PUBLIC_DIR)}`);
+  } catch (err) {
+    log(`startup: the /latest/ placeholder was not updated: ${oneLine(err, 200)}`);
+  }
+  // The owner's approval passphrase (its SHA-256, from the service's environment). Never logged.
+  const approveHash = String(process.env.RING_APPROVE_PASSPHRASE_SHA256 ?? '').trim();
+  const approval = { passphraseSha256: /^[0-9a-f]{64}$/i.test(approveHash) ? approveHash : null };
+  if (approveHash && !approval.passphraseSha256) log('startup: RING_APPROVE_PASSPHRASE_SHA256 is not 64 hex digits, so it is ignored');
+  log(`startup: approval ${approval.passphraseSha256 ? 'needs the owner link and the approval passphrase' : 'needs the owner link only (no approval passphrase is set)'}`);
 
   const app = createApp({
-    config: configModule, store, spend, log,
+    config: configModule, store, spend, log, approval,
     queue: new Queue({ maxRunning: cfg.maxRunning, heavySlots: HEAVY_SLOTS, maxQueued: MAX_QUEUED, log }),
     runFix: typeof loop?.runFix === 'function' ? loop.runFix : null,
     publish: publishLatest, status: statusModule, now: Date.now,

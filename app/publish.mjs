@@ -1,9 +1,11 @@
 // Publishes one finished run as the static "Latest verified run" page that Caddy serves at /latest/
 // (BUILD-SPEC §4.8). The run is built in a staging folder on the same filesystem (never /tmp: the unit
 // has PrivateTmp), renamed into runs/<id>, and then the `latest` symlink is replaced with a rename, so
-// /latest/ never shows a half-written run. Every string on the page is HTML-escaped and the page has
-// no script. Only a receipt that passes the bar is published: verdict pass, a sample project, a REAL
-// RUN label and a sandbox confirmed destroyed. Nothing is ever published automatically (D-9).
+// /latest/ never shows a half-written run. Every string on the page is HTML-escaped, and the page has
+// no script and a CSP of its own. Only a receipt that passes the bar is published: verdict pass, no
+// lost control, every screen compared, a patch that applies, a sample project, a REAL RUN label and a
+// sandbox confirmed destroyed. Nothing is ever published automatically (D-9); an approval of the
+// published run only renders the same run again with its approval.
 import { chmodSync, constants, copyFileSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { NETWORK, esc, readSelftests, runtimeName, sizeText, usdText, utcText } from './status.mjs';
@@ -19,9 +21,11 @@ const MAX_IMAGE_BYTES = 20 * 2 ** 20;
 const MAX_PATCH_BYTES = 1024 * 1024;
 const KEEP_RUNS = 5;
 const DECISIONS = {
-  accepted: 'accepted', kept: 'kept (gate off)', reverted: 'COVER-UP · rolled back',
+  accepted: 'accepted', kept: 'kept (gate off)', reverted: 'COVER-UP · rolled back', lost: 'LOST CONTROLS · rolled back',
   tamper: 'tamper · rolled back', failed: 'not measurable · rolled back',
 };
+// The page has no script, takes images and styles only from itself, and posts nowhere.
+const PAGE_CSP = "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'";
 
 /** A run that cannot be published; the message says why (the server answers 409 with it). */
 export class PublishError extends Error {}
@@ -30,12 +34,30 @@ export class PublishError extends Error {}
 export function notPublishable(task, receipt) {
   if (!receipt || typeof receipt !== 'object') return 'the run has no receipt';
   const why = [];
+  const c = receipt.counts ?? {};
   if (receipt.verdict !== 'pass') why.push(`its verdict is ${receipt.verdict ?? 'missing'} (it must be pass)`);
+  if (Number(c.lost) > 0) why.push(`Mantis reports ${c.lost} lost control${Number(c.lost) === 1 ? '' : 's'}`);
+  if (Number.isFinite(c.cellsExpected) && !(Number(c.cellsCompared) >= c.cellsExpected)) {
+    why.push(`Mantis compared ${Number(c.cellsCompared) || 0} of the ${c.cellsExpected} screens it measured at the start`);
+  }
+  if (receipt.diff?.applies === false) why.push('its patch does not apply to the original files');
+  if (receipt.diff?.truncated) why.push('its patch was cut at 1 MB');
   if (!String(receipt.label ?? '').startsWith('REAL RUN')) why.push(`its label is "${String(receipt.label ?? '').slice(0, 80)}" (only a REAL RUN is published)`);
   if (task?.source?.kind !== 'sample' || (receipt.source && receipt.source.kind !== 'sample')) why.push('only sample-project runs are published');
   if (receipt.containment?.destroyed !== true) why.push('its sandbox was not confirmed destroyed');
   if (receipt.publishable !== true && why.length === 0) why.push('the receipt says it is not publishable');
   return why.length ? why.join('; ') : null;
+}
+
+/**
+ * What the published page may say about the approval, and nothing more than the server enforced:
+ * with the owner's approval passphrase (set on the server, never seen by the operator), a person
+ * approved; with the owner link alone, only whoever held the link did.
+ */
+export function approvalText(task) {
+  if (!task?.approvedAt) return 'Not approved (patch shown for review only; nothing was applied anywhere).';
+  if (task.approvedWith === 'passphrase') return `Approved by a human at ${utcText(task.approvedAt)}, with the owner's approval passphrase.`;
+  return `Approved with the owner link at ${utcText(task.approvedAt)}.`;
 }
 
 /**
@@ -152,7 +174,7 @@ const secText = (s) => (Number.isFinite(s) ? (s >= 60 ? `${Math.floor(s / 60)} m
 
 function selftestLine(name, s) {
   if (!s) return `${name}: no self-test result on record`;
-  return `${name}: ${s.passed}/${s.total} passed${s.runtime ? ` under ${s.runtime}` : ''}${s.at ? ` at ${utcText(s.at)}` : ''}`;
+  return `${name}: ${s.passed}/${s.total} passed${s.runtime ? ` under ${s.runtime}` : ''}${s.at ? ` at ${utcText(s.at)}` : ''}${s.commit ? ` on commit ${s.commit}` : ''}`;
 }
 
 /** containment.txt: what held the run, and the last self-test results on this server. */
@@ -188,16 +210,15 @@ export function runPageHtml({ task, receipt: r, images = [], selftests = {} }) {
   const k = r.counts ?? {};
   const g = r.gate ?? {};
   const c = r.containment ?? {};
-  const approval = task?.approvedAt
-    ? `Approved by a human at ${utcText(task.approvedAt)}.`
-    : 'Not approved (patch shown for review only; nothing was applied anywhere).';
+  const approval = approvalText(task);
+  const taskId = TASK_ID.test(String(r.taskId ?? task?.id ?? '')) ? String(r.taskId ?? task?.id) : null;
   const countRows = [
     ['Errors', `${int(k.errorsBefore)} → ${int(k.errorsAfter)}`],
     ['Warnings', `${int(k.warningsBefore)} → ${int(k.warningsAfter)}`],
     ['Fixed', int(k.fixed)], ['New', int(k.new)], ['Cover-ups (final)', int(k.coverUps)], ['Lost controls', int(k.lost)],
-    ['Screens compared', int(k.cellsCompared ?? r.matrix?.cells)],
+    ['Screens compared', Number.isFinite(k.cellsExpected) ? `${int(k.cellsCompared)} of ${int(k.cellsExpected)}` : int(k.cellsCompared ?? r.matrix?.cells)],
   ].map(([a, b]) => `<tr><th scope="row">${esc(a)}</th><td>${esc(b)}</td></tr>`).join('');
-  const checkRows = (r.checks ?? []).map((ch) => `<tr class="${ch.decision === 'reverted' || ch.decision === 'tamper' ? 'warn' : ''}"><td>${esc(ch.check)}</td><td>${esc(DECISIONS[ch.decision] ?? ch.decision)}${ch.forced ? ' (forced)' : ''}</td><td><code>${esc(ch.line ?? '')}</code></td><td>${esc(secText((ch.ms ?? NaN) / 1000))}</td></tr>`).join('')
+  const checkRows = (r.checks ?? []).map((ch) => `<tr class="${['reverted', 'lost', 'tamper', 'failed'].includes(ch.decision) ? 'warn' : ''}"><td>${esc(ch.check)}</td><td>${esc(DECISIONS[ch.decision] ?? ch.decision)}${ch.forced ? ' (forced)' : ''}${ch.reason ? `<br><span class="muted">${esc(ch.reason)}</span>` : ''}</td><td><code>${esc(ch.line ?? '')}</code></td><td>${esc(secText((ch.ms ?? NaN) / 1000))}</td></tr>`).join('')
     || '<tr><td colspan="4">No check was needed.</td></tr>';
   const modelRows = (r.models ?? []).map((m) => `<tr><td>${esc(m.role)}</td><td><code>${esc(m.id)}</code></td><td>${esc(m.provider ?? 'Vultr Serverless Inference')}</td><td>${esc(int(m.calls))}</td><td>${esc(`${int(m.promptTokens)} / ${int(m.completionTokens)} / ${int(m.reasoningTokens)}`)}</td><td>${esc(m.usd === null || m.usd === undefined ? 'cost n/a' : usdText(m.usd))}</td></tr>`).join('');
   const phases = Object.entries(r.time?.phases ?? {}).filter(([, s]) => Number.isFinite(s) && s > 0)
@@ -209,6 +230,7 @@ export function runPageHtml({ task, receipt: r, images = [], selftests = {} }) {
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="${PAGE_CSP}">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Latest verified run · Mantis Ring</title>
 <style>
@@ -234,8 +256,10 @@ footer{margin-top:40px;color:var(--muted);font-size:.9rem}
 <p class="label">${esc(r.label)}</p>
 <h1>${esc(task?.source?.label ?? r.source?.name ?? 'Sample project')}</h1>
 <p class="line">${esc(r.line)}</p>
-<p class="note">verified = re-measured by Mantis (no LLM) against the original baseline</p>
+<p class="note">${esc(r.trust === 'repo-sandbox' ? r.trustNote : 'verified = re-measured by Mantis (no LLM) against the original baseline')}</p>
+<p class="note">fixed = issues of the starting point that are gone · new = issues that were not there before · cover-ups = issues that only went away because their element was hidden, removed, shrunk or cut · lost = controls or headings that were visible at the start and are gone</p>
 <p class="approval">${esc(approval)}</p>
+${taskId ? `<p class="muted">The full step-by-step log of this run, every model call, tool call and check: <a href="/t/${esc(taskId)}">/t/${esc(taskId)}</a></p>` : ''}
 
 <h2>Counts (final run against the starting point)</h2>
 <div class="card"><table>${countRows}</table></div>
@@ -278,4 +302,63 @@ ${imgs ? `<h2>Before and after</h2><div class="figs">${imgs}</div>` : ''}
 </body>
 </html>
 `;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The page /latest/ shows before any run is published
+// ---------------------------------------------------------------------------------------------
+
+/** A styled stand-in for /latest/ while nothing is published: it says so and links to the demo and /status. */
+export function placeholderHtml() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="${PAGE_CSP}">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Latest verified run · Mantis Ring</title>
+<style>
+:root{color-scheme:light dark;--bg:#f7f7f4;--card:#fff;--line:#e2e3dd;--text:#1b1f1d;--muted:#5b625e;--accent:#17734a}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1211;--card:#161a18;--line:#2a302d;--text:#e6e9e7;--muted:#a2aaa5;--accent:#3ccf8e}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif}
+main{max-width:720px;margin:0 auto;padding:40px 16px 56px}a{color:var(--accent)}h1{margin:8px 0 12px;font-size:1.7rem;line-height:1.25}
+.eyebrow{margin:0;color:var(--muted);font-size:.92rem}.card{margin-top:20px;padding:16px 18px;background:var(--card);border:1px solid var(--line);border-radius:12px}
+p{margin:0 0 10px}
+</style>
+</head>
+<body>
+<main>
+<p class="eyebrow"><a href="/">Mantis Ring</a> · Latest verified run</p>
+<h1>No verified run is published yet</h1>
+<p>A run is published here only when Mantis measured it as a pass on the sample project, in a gVisor sandbox on Vultr, with the real model service, and the sandbox was confirmed destroyed afterwards.</p>
+<div class="card">
+<p><a href="/status">Status</a> shows the server live: the sandbox runtime, the model service, the last self-test results and today&#39;s spend.</p>
+<p><a href="/">The home page</a> explains how a run works.</p>
+</div>
+</main>
+</body>
+</html>
+`;
+}
+
+/**
+ * At startup: while <publicDir>/latest is still the placeholder folder (not yet the symlink to a
+ * published run), replace its bare page with placeholderHtml(). A published run is never touched.
+ * @returns {'written'|'unchanged'|'published'|'missing'}
+ */
+export function refreshPlaceholder(publicDir) {
+  const latest = path.join(publicDir, 'latest');
+  const st = lstatOrNull(latest);
+  if (!st) return 'missing';
+  if (st.isSymbolicLink() || !st.isDirectory()) return 'published';
+  const file = path.join(latest, 'index.html');
+  const cur = lstatOrNull(file);
+  if (cur && !cur.isFile()) return 'unchanged';
+  const html = placeholderHtml();
+  if (cur && cur.size === Buffer.byteLength(html) && readFileSync(file, 'utf8') === html) return 'unchanged';
+  const tmp = path.join(latest, `.index.html.tmp-${process.pid}`);
+  writeFileSync(tmp, html, { mode: 0o644 });
+  chmodSync(tmp, 0o644);
+  renameSync(tmp, file);
+  return 'written';
 }
