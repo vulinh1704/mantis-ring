@@ -19,9 +19,19 @@ const HOST_TIMEOUT_MS = 75_000; // longer than the in-sandbox timeout, so `timeo
 const SHA = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 const HUNK = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/;
 // Words that only appear when an edit targets the measurement instead of the page (§2.6). The
-// spec's list, plus `mantis-ignore`/`mantisIgnore` (the attribute set through `dataset`) and
-// `webdriver` on its own (`navigator['webdriver']`).
-const TAMPER = /data-mantis|mantis-?(?:ignore|overlay)|navigator\.webdriver|webdriver|headlesschrome|playwright|puppeteer|__nightmare|cypress/gi;
+// spec's list, plus `mantis-ignore`/`mantisIgnore` (the attribute set through `dataset`), `mantis`
+// on its own, `webdriver` on its own (`navigator['webdriver']`), headless and user-agent sniffing,
+// and the usual ways to hide a word in a string (atob, character codes, \x and \u escapes). A UI fix
+// never needs any of them. This is a denylist, so it raises the bar rather than closing the door:
+// the README's Known limits says so.
+const TAMPER = new RegExp([
+  'data-mantis', 'mantis-?(?:ignore|overlay)', 'mantis', 'navigator\\.webdriver', 'webdriver', 'headlesschrome', 'headless',
+  'useragent', 'playwright', 'puppeteer', '__nightmare', 'cypress', 'atob\\s*\\(', 'fromcharcode', 'fromcodepoint',
+  '\\\\x[0-9a-f]{2}', '\\\\u00[0-9a-f]{2}', '\\\\u\\{[0-9a-f]+\\}',
+].join('|'), 'gi');
+// A word split across string literals ('data-man' + 'tis-ignore', ['web', 'driver'].join('')) is
+// joined back before the scan: the quotes and the + or , between two literals are dropped.
+const JOINS = /(['"`])\s*[+,]\s*(['"`])/g;
 
 const lastLine = (s) => String(s ?? '').trim().split('\n').pop().slice(0, 200);
 
@@ -161,7 +171,9 @@ export async function changedSince(box, sha, paths) {
   checkSha(sha);
   const list = relPaths(paths);
   if (!list.length) return '';
-  return (await git(box, ['diff', '--cached', '--no-color', '--no-ext-diff', '--no-textconv', '-U0', sha, '--', ...list])).stdout;
+  // --text: a repo's .gitattributes (`*.js -diff`, `*.html binary`) would otherwise turn the added
+  // lines into "Binary files differ" and blind the scan. The tools only ever write UTF-8 text.
+  return (await git(box, ['diff', '--cached', '--text', '--no-color', '--no-ext-diff', '--no-textconv', '-U0', sha, '--', ...list])).stdout;
 }
 
 /**
@@ -251,7 +263,10 @@ export function tamperHits(diffText) {
   const seen = new Map();
   for (const { sign, text } of diffLines(diffText)) {
     if (sign !== '+') continue;
-    for (const m of text.matchAll(TAMPER)) if (!seen.has(m[0].toLowerCase())) seen.set(m[0].toLowerCase(), m[0]);
+    const joined = text.replace(JOINS, '');
+    for (const line of joined === text ? [text] : [text, joined]) {
+      for (const m of line.matchAll(TAMPER)) if (!seen.has(m[0].toLowerCase())) seen.set(m[0].toLowerCase(), m[0]);
+    }
   }
   return [...seen.values()];
 }
