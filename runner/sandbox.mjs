@@ -315,8 +315,9 @@ export class Sandbox {
   }
 
   /**
-   * Remove the container and everything in it. Every call shares one removal and resolves only
-   * once the container is really gone (a second `docker rm -f` returns while the first is still busy).
+   * Remove the container and everything in it. Calls made while a removal runs share it, and it
+   * resolves only once the container is really gone (a second `docker rm -f` returns while the first
+   * is still busy). A removal that failed is forgotten, so the next call really tries again.
    */
   destroy() {
     this.destroying ??= (async () => {
@@ -326,7 +327,10 @@ export class Sandbox {
         await sleep(200);
       }
       throw new Error(`container ${this.name} was not removed`);
-    })();
+    })().catch((err) => {
+      this.destroying = null;
+      throw err;
+    });
     return this.destroying;
   }
 

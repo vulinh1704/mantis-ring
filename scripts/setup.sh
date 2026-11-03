@@ -13,8 +13,9 @@ docker network inspect ring-internal > /dev/null 2>&1 || docker network create -
 docker network inspect ring-egress > /dev/null 2>&1 || docker network create ring-egress > /dev/null
 
 docker rm -f ring-proxy > /dev/null 2>&1 || true
+# Bounded logs: tinyproxy logs every refused request, and a hostile install loop must not fill the disk.
 docker run -d --name ring-proxy --restart unless-stopped \
   --network ring-egress --read-only --cap-drop ALL --security-opt no-new-privileges \
-  --memory 128m --pids-limit 64 mantis-ring/proxy > /dev/null
+  --memory 128m --pids-limit 64 --log-opt max-size=10m --log-opt max-file=3 mantis-ring/proxy > /dev/null
 docker network connect ring-internal ring-proxy
 echo "ready: images mantis-ring/sandbox and mantis-ring/proxy, network ring-internal, proxy ring-proxy:8888"
