@@ -556,7 +556,15 @@ class FixRun {
     this.step('clone', 'start');
     this.phase = 'sandbox';
     // Not raced with the abort: the sandbox must be known to be destroyed, so wait for it.
-    this.box = await deps.createSandbox({ runtime: deps.runtime, labels: { 'mantis-ring.owner': 'app', 'mantis-ring.task': task.id } });
+    try {
+      this.box = await deps.createSandbox({ runtime: deps.runtime, labels: { 'mantis-ring.owner': 'app', 'mantis-ring.task': task.id } });
+    } catch (err) {
+      // create() removes what it made, but a `docker run` that gave up can leave a container the
+      // daemon finished later, and its network with it. This task never got the box, so nothing else
+      // would remove them before the app restarts: they go here, by this task's own label only.
+      await this.removeByLabel();
+      throw err;
+    }
     if (this.ac.signal.aborted) throw new Stopped();
     try {
       this.rt = String((await this.box.runtimeName()) ?? '').trim() || 'unknown';
@@ -1335,6 +1343,19 @@ class FixRun {
   }
 
   /**
+   * Remove every container and sandbox network that carries this task's own label (never another
+   * task's or a self-test's). Never throws.
+   */
+  async removeByLabel() {
+    try {
+      const n = await Sandbox.removeAll(`mantis-ring.task=${this.task.id}`);
+      if (n.containers || n.networks) this.journal(`removed by this task's label: ${n.containers} container(s), ${n.networks} network(s)`);
+    } catch (err) {
+      this.journal(`removal by label failed: ${firstLine(err?.message)}`);
+    }
+  }
+
+  /**
    * §2.7.3 and §2.8: destroy (the container, then its own network), then confirm with `docker ps -a`.
    * Never throws.
    */
@@ -1351,7 +1372,7 @@ class FixRun {
       // One more try, by name and then by this task's own label (never another task's or a self-test's
       // container or network), so neither the sandbox nor its network stays until the app restarts.
       try { await this.box.destroy(); } catch (err) { this.journal(`destroy retry failed: ${firstLine(err?.message)}`); }
-      try { await Sandbox.removeAll(`mantis-ring.task=${this.task.id}`); } catch (err) { this.journal(`removal by label failed: ${firstLine(err?.message)}`); }
+      await this.removeByLabel();
       gone = await isGone();
     }
     this.phases.destroy += Date.now() - t;

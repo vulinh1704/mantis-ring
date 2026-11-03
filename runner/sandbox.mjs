@@ -39,6 +39,11 @@ const sleep = (ms) => new Promise((ok) => setTimeout(ok, ms));
 const tail = (text, n = 3) => String(text).trim().split('\n').slice(-n).join(' | ');
 /** Sandboxes of this process that are not destroyed yet (Sandbox.destroyLive()). */
 const LIVE = new Set();
+/** create() calls of this process that have not finished yet (Sandbox.destroyLive() waits for them). */
+const CREATING = new Set();
+/** True while destroyLive() runs: a create() refuses to start, and one that is running removes what it made. */
+let closing = false;
+const CLOSING = 'sandbox start stopped: this process is removing its sandboxes (destroyLive)';
 
 /** How a sandbox's network reads on its receipt and in the live log. */
 export function networkText(network) {
@@ -233,60 +238,18 @@ export class Sandbox {
    *    user-defined network cannot be reached, so the name would not resolve otherwise; see "DNS
    *    doesn't work on a Docker user defined bridge network" in https://gvisor.dev/docs/user_guide/faq/.
    * 3. `docker run` on that network only.
-   * A failure at any step removes whatever was made (destroy()) before it throws.
+   * A failure at any step removes whatever was made (destroy()) before it throws. So does a start
+   * that finishes while destroyLive() runs, and none begins then.
    * @param {{image?: string, runtime?: string, limits?: typeof LIMITS, labels?: Record<string, string>}} [o]
    * @returns {Promise<Sandbox>}
    */
-  static async create({ image = 'mantis-ring/sandbox', runtime, limits = LIMITS, labels = {} } = {}) {
-    const labelArgs = [];
-    for (const [k, v] of Object.entries(labels ?? {})) {
-      if (k === 'mantis-ring') throw new Error('the sandbox label mantis-ring is reserved (always mantis-ring=task)');
-      if (k === 'mantis-ring.sandbox') throw new Error('the sandbox label mantis-ring.sandbox is reserved (the network names its sandbox with it)');
-      if (typeof v !== 'string') throw new Error(`the value of sandbox label ${k} must be a string`);
-      labelArgs.push('--label', checkLabel(`${k}=${v}`));
-    }
-    const id = randomBytes(4).toString('hex');
-    const box = new Sandbox(`ring-${id}`, `${NETWORK_PREFIX}${id}`);
-
-    const made = await run('docker', ['network', 'create', '--internal', '--label', TASK_LABEL, '--label', `mantis-ring.sandbox=${box.name}`, ...labelArgs, box.network], { timeoutMs: 30_000 });
-    if (made.code !== 0) {
-      // A create that timed out may have made the network all the same.
-      const left = await removeNetwork(box.network).then(() => '', (err) => `; ${err.message}`);
-      throw new Error(`could not create the sandbox network ${box.network}: ${made.timedOut ? 'no answer within 30 s' : tail(made.stderr) || `exit ${made.code}`}${left}`);
-    }
-    LIVE.add(box);
-    try {
-      const join = await run('docker', ['network', 'connect', box.network, PROXY_NAME], { timeoutMs: 30_000 });
-      if (join.code !== 0) throw new Error(`${PROXY_NAME} could not join ${box.network}: ${join.timedOut ? 'no answer within 30 s' : tail(join.stderr) || `exit ${join.code}`} (scripts/setup.sh starts it)`);
-      const ip = await run('docker', ['inspect', '-f', `{{(index .NetworkSettings.Networks "${box.network}").IPAddress}}`, PROXY_NAME], { timeoutMs: 30_000 });
-      const proxyIp = ip.stdout.trim();
-      if (ip.code !== 0 || !IPV4.test(proxyIp)) throw new Error(`${PROXY_NAME} has no address on ${box.network}: is it running? (scripts/setup.sh starts it)`);
-      const args = [
-        'run', '-d', '--name', box.name, '--label', TASK_LABEL, ...labelArgs,
-        '--network', box.network, '--add-host', `${PROXY_NAME}:${proxyIp}`,
-        '--read-only',
-        // Writable scratch space, owned by the sandbox user (uid 10001); everything else is read-only.
-        '--tmpfs', `/work:rw,exec,size=${limits.work},uid=10001,gid=10001,mode=0755`,
-        '--tmpfs', `/tmp:rw,exec,size=${limits.tmp},mode=1777`,
-        '--tmpfs', `/home/ring:rw,exec,size=${limits.home},uid=10001,gid=10001,mode=0755`,
-        '--shm-size', limits.shm,
-        '--memory', limits.memory, '--memory-swap', limits.memory,
-        '--cpus', limits.cpus, '--pids-limit', String(limits.pids),
-        '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
-        '-e', `HTTP_PROXY=${PROXY}`, '-e', `HTTPS_PROXY=${PROXY}`, '-e', `http_proxy=${PROXY}`, '-e', `https_proxy=${PROXY}`,
-        '-e', 'NO_PROXY=localhost,127.0.0.1', '-e', 'no_proxy=localhost,127.0.0.1',
-        ...(runtime ? ['--runtime', runtime] : []),
-        image,
-      ];
-      const r = await run('docker', args, { timeoutMs: 120_000 });
-      if (r.code !== 0) throw new Error(`docker run failed: ${r.timedOut ? 'no answer within 120 s' : tail(r.stderr, 5)}`);
-      return box;
-    } catch (err) {
-      // The container can exist although `docker run` failed (created, then the runtime would not
-      // start it). destroy() removes it, takes the proxy off the network and removes the network.
-      await box.destroy().catch((e) => { err.message += `; clean-up: ${e.message}`; });
-      throw err;
-    }
+  static create(o = {}) {
+    if (closing) return Promise.reject(new Error(CLOSING));
+    const started = startSandbox(o);
+    CREATING.add(started);
+    const forget = () => { CREATING.delete(started); };
+    started.then(forget, forget);
+    return started;
   }
 
   /** Run a shell command inside the sandbox: docker exec [-i] <name> sh -c <script>. */
@@ -472,26 +435,119 @@ export class Sandbox {
   }
 
   /**
-   * Destroy every sandbox this process made and has not destroyed yet, waiting at most `timeoutMs`.
-   * For a test suite stopped by a signal, so that it leaves no container and no network behind.
+   * Remove every sandbox container, the app's and a self-test's alike, that Docker created more than
+   * `minAgeMs` ago, then every sandbox network that no sandbox runs on and that is older than
+   * STALE_NETWORK_MS. The caller passes an age that no task and no self-test reaches, so what this
+   * removes is an orphan: a container that the daemon finished after `docker run` had given up (its
+   * create() had already failed, so no task owns it), or one of a self-test killed with SIGKILL.
+   * @param {number} minAgeMs  at least STALE_NETWORK_MS
+   * @returns {Promise<{containers: number, networks: number}>} how many were removed
+   */
+  static async removeStale(minAgeMs) {
+    if (!(Number.isFinite(minAgeMs) && minAgeMs >= STALE_NETWORK_MS)) throw new TypeError(`removeStale: minAgeMs must be at least ${STALE_NETWORK_MS}`);
+    let failure = null;
+    const containers = await removeContainers(TASK_LABEL, { minAgeMs }).catch((err) => { failure = err; return 0; });
+    const networks = await Sandbox.removeNetworks(TASK_LABEL, { minAgeMs: STALE_NETWORK_MS }).catch((err) => { failure ??= err; return 0; });
+    if (failure) throw failure;
+    return { containers, networks };
+  }
+
+  /**
+   * Destroy every sandbox this process made and has not destroyed yet, waiting at most `timeoutMs`
+   * in all. For a test suite stopped by a signal, so that it leaves no container and no network
+   * behind. A create() that is still running is waited for first: it finishes the docker command it
+   * is in, then removes what it made. No create() starts while this runs.
    * @param {number} [timeoutMs]
    */
   static async destroyLive(timeoutMs = 8000) {
-    let timer;
-    const all = Promise.allSettled([...LIVE].map((box) => box.destroy()));
-    await Promise.race([all, new Promise((ok) => { timer = setTimeout(ok, timeoutMs); })]);
-    clearTimeout(timer);
+    closing = true;
+    const until = Date.now() + timeoutMs;
+    const within = async (p) => {
+      let timer;
+      await Promise.race([p, new Promise((ok) => { timer = setTimeout(ok, Math.max(0, until - Date.now())); })]);
+      clearTimeout(timer);
+    };
+    try {
+      await within(Promise.allSettled([...CREATING]));
+      await within(Promise.allSettled([...LIVE].map((box) => box.destroy())));
+    } finally {
+      closing = false;
+    }
   }
 }
 
-/** Remove every container that carries `label` and wait until they are gone; how many there were. */
-async function removeContainers(label) {
+/**
+ * Sandbox.create(): the network, the proxy on it, then the container (see there). Everything it made
+ * is removed again when a step fails, or when destroyLive() began meanwhile.
+ */
+async function startSandbox({ image = 'mantis-ring/sandbox', runtime, limits = LIMITS, labels = {} } = {}) {
+  const labelArgs = [];
+  for (const [k, v] of Object.entries(labels ?? {})) {
+    if (k === 'mantis-ring') throw new Error('the sandbox label mantis-ring is reserved (always mantis-ring=task)');
+    if (k === 'mantis-ring.sandbox') throw new Error('the sandbox label mantis-ring.sandbox is reserved (the network names its sandbox with it)');
+    if (typeof v !== 'string') throw new Error(`the value of sandbox label ${k} must be a string`);
+    labelArgs.push('--label', checkLabel(`${k}=${v}`));
+  }
+  const id = randomBytes(4).toString('hex');
+  const box = new Sandbox(`ring-${id}`, `${NETWORK_PREFIX}${id}`);
+
+  const made = await run('docker', ['network', 'create', '--internal', '--label', TASK_LABEL, '--label', `mantis-ring.sandbox=${box.name}`, ...labelArgs, box.network], { timeoutMs: 30_000 });
+  if (made.code !== 0) {
+    // A create that timed out may have made the network all the same.
+    const left = await removeNetwork(box.network).then(() => '', (err) => `; ${err.message}`);
+    throw new Error(`could not create the sandbox network ${box.network}: ${made.timedOut ? 'no answer within 30 s' : tail(made.stderr) || `exit ${made.code}`}${left}`);
+  }
+  LIVE.add(box);
+  try {
+    if (closing) throw new Error(CLOSING);
+    const join = await run('docker', ['network', 'connect', box.network, PROXY_NAME], { timeoutMs: 30_000 });
+    if (join.code !== 0) throw new Error(`${PROXY_NAME} could not join ${box.network}: ${join.timedOut ? 'no answer within 30 s' : tail(join.stderr) || `exit ${join.code}`} (scripts/setup.sh starts it)`);
+    const ip = await run('docker', ['inspect', '-f', `{{(index .NetworkSettings.Networks "${box.network}").IPAddress}}`, PROXY_NAME], { timeoutMs: 30_000 });
+    const proxyIp = ip.stdout.trim();
+    if (ip.code !== 0 || !IPV4.test(proxyIp)) throw new Error(`${PROXY_NAME} has no address on ${box.network}: is it running? (scripts/setup.sh starts it)`);
+    if (closing) throw new Error(CLOSING);
+    const args = [
+      'run', '-d', '--name', box.name, '--label', TASK_LABEL, ...labelArgs,
+      '--network', box.network, '--add-host', `${PROXY_NAME}:${proxyIp}`,
+      '--read-only',
+      // Writable scratch space, owned by the sandbox user (uid 10001); everything else is read-only.
+      '--tmpfs', `/work:rw,exec,size=${limits.work},uid=10001,gid=10001,mode=0755`,
+      '--tmpfs', `/tmp:rw,exec,size=${limits.tmp},mode=1777`,
+      '--tmpfs', `/home/ring:rw,exec,size=${limits.home},uid=10001,gid=10001,mode=0755`,
+      '--shm-size', limits.shm,
+      '--memory', limits.memory, '--memory-swap', limits.memory,
+      '--cpus', limits.cpus, '--pids-limit', String(limits.pids),
+      '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
+      '-e', `HTTP_PROXY=${PROXY}`, '-e', `HTTPS_PROXY=${PROXY}`, '-e', `http_proxy=${PROXY}`, '-e', `https_proxy=${PROXY}`,
+      '-e', 'NO_PROXY=localhost,127.0.0.1', '-e', 'no_proxy=localhost,127.0.0.1',
+      ...(runtime ? ['--runtime', runtime] : []),
+      image,
+    ];
+    const r = await run('docker', args, { timeoutMs: 120_000 });
+    if (r.code !== 0) throw new Error(`docker run failed: ${r.timedOut ? 'no answer within 120 s' : tail(r.stderr, 5)}`);
+    // destroyLive() began while the container started: it waits for this call, so the box goes here.
+    if (closing) throw new Error(CLOSING);
+    return box;
+  } catch (err) {
+    // The container can exist although `docker run` failed (created, then the runtime would not
+    // start it). destroy() removes it, takes the proxy off the network and removes the network.
+    await box.destroy().catch((e) => { err.message += `; clean-up: ${e.message}`; });
+    throw err;
+  }
+}
+
+/**
+ * Remove every container that carries `label` (with `minAgeMs`, only those Docker created at least
+ * that long ago) and wait until they are gone; how many there were.
+ */
+async function removeContainers(label, { minAgeMs = 0 } = {}) {
   const list = async () => {
-    const r = await run('docker', ['ps', '-aq', '--filter', `label=${label}`], { timeoutMs: 30_000 });
+    const r = await run('docker', ['ps', '-aq', '--no-trunc', '--filter', `label=${label}`], { timeoutMs: 30_000 });
     if (r.code !== 0) throw new Error(`docker ps failed: ${tail(r.stderr) || `exit ${r.code}`}`);
-    return r.stdout.split('\n').map((s) => s.trim()).filter(Boolean);
+    return [...new Set(r.stdout.split('\n').map((s) => s.trim()).filter(Boolean))];
   };
-  const ids = await list();
+  let ids = await list();
+  if (ids.length && minAgeMs > 0) ids = await createdBefore(ids, Date.now() - minAgeMs);
   if (ids.length === 0) return 0;
   const r = await run('docker', ['rm', '-f', ...ids], { timeoutMs: 120_000 });
   // `docker rm -f` also fails for a container that a task's own destroy() removed meanwhile, so
@@ -504,4 +560,16 @@ async function removeContainers(label) {
   }
   if (left.length) throw new Error(`${left.length} of ${ids.length} containers labelled ${label} are still there: ${tail(r.stderr) || 'docker rm -f gave no reason'}`);
   return ids.length;
+}
+
+/** Those of the containers `ids` (full ids) that Docker created before `cutoff` (ms); one whose age is unknown is left out. */
+async function createdBefore(ids, cutoff) {
+  // One inspect for all of them. It fails as a whole when one went meanwhile, so every line it printed is read.
+  const r = await run('docker', ['inspect', '--type', 'container', '-f', '{{.Id}} {{.Created}}', ...ids], { timeoutMs: 30_000 });
+  const old = [];
+  for (const line of r.stdout.split('\n')) {
+    const [id, created] = line.trim().split(/\s+/);
+    if (ids.includes(id) && Date.parse(created) <= cutoff) old.push(id);
+  }
+  return old;
 }

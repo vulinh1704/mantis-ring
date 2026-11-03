@@ -16,9 +16,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { chat, newTally } from '../agent/inference.mjs';
-import { APP_LABEL, STALE_NETWORK_MS, Sandbox, TASK_LABEL, childEnv } from '../runner/sandbox.mjs';
+import { APP_LABEL, Sandbox, childEnv } from '../runner/sandbox.mjs';
 import * as configModule from './config.mjs';
-import { ConfigError, HEAVY_SLOTS, MAX_QUEUED, PROVIDER, PUBLIC_DIR, PUBLIC_URL, RUNTIME, SAMPLES, STATE_DIR, samplingFor } from './config.mjs';
+import { CAP_RANGES, ConfigError, HEAVY_SLOTS, MAX_QUEUED, PROVIDER, PUBLIC_DIR, PUBLIC_URL, RUNTIME, SAMPLES, STATE_DIR, samplingFor } from './config.mjs';
 import { PublishError, notPublishable, publishLatest, refreshPlaceholder } from './publish.mjs';
 import { Spend } from './spend.mjs';
 import * as statusModule from './status.mjs';
@@ -40,6 +40,9 @@ const PER_IP = { hour: 3, day: 8 };                   // plus one queued or runn
 const SSE = { perIp: 6, total: 200, heartbeatMs: 20_000, maxBuffer: 1024 * 1024 };
 const SELFTEST_SUITES = ['agent-loop', 'containment', 'scenes'];
 const SELFTEST_TIMEOUT_MS = 20 * 60_000;
+// A sandbox older than this is an orphan: twice the longest wall clock a task may have (80 minutes),
+// four times the self-test limit.
+const STALE_SANDBOX_MS = 2 * CAP_RANGES.wallClockSec[1] * 1000;
 const PROBE_CAPS = { maxUsd: 0.25, maxPromptTokens: 400_000 };   // the whole probe costs < $0.02 (§5.3)
 const PROBE_TIMEOUT_MS = 15 * 60_000;
 const DIFF_SHOWN_BYTES = 200 * 1024;
@@ -149,6 +152,34 @@ export function ipKey(ip) {
   const t = tail ? tail.split(':') : [];
   const groups = tail === undefined ? h : [...h, ...Array(Math.max(0, 8 - h.length - t.length)).fill('0'), ...t];
   return `${groups.slice(0, 4).map((g) => g.toLowerCase().replace(/^0+(?=.)/, '')).join(':')}::/64`;
+}
+
+// ---------------------------------------------------------------------------------------------
+// A task's sandbox
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The loop's createSandbox for task `id`: Sandbox.create(), the runtime Docker really runs the box
+ * under (HostConfig.Runtime, not what was asked for, §7 #13), then the task record. When a step after
+ * create() fails, the box is destroyed here, because the loop never gets it then.
+ * @param {string} id
+ * @param {{store: {update: Function}, journal: (id: string, line: string) => void, create?: (o: object) => Promise<object>}} o
+ *   `create` stands in for Sandbox.create() in tests
+ * @returns {(o: {runtime?: string, labels?: Record<string, string>}) => Promise<object>}
+ */
+export function sandboxStarter(id, { store, journal, create = (o) => Sandbox.create(o) }) {
+  return async (o) => {
+    const box = await create(o);
+    try {
+      let runtime = o?.runtime ?? null;
+      try { runtime = await box.runtimeName(); } catch (err) { journal(id, `runtime of ${box.name} not read: ${oneLine(err, 160)}`); }
+      store.update(id, { sandbox: { name: box.name, runtime } });
+      return box;
+    } catch (err) {
+      try { await box.destroy(); } catch (e) { journal(id, `sandbox ${box.name} not removed after a failed start: ${oneLine(e, 160)}`); }
+      throw err;
+    }
+  };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -465,14 +496,7 @@ export function createApp(deps = {}) {
     const visionSampling = rec.visionModel ? samplingFor(rec.visionModel, config.get(), { bench: rec.origin === 'admin' }) : {};
     return runFix(task, {
       chat,
-      createSandbox: async (o) => {
-        const box = await Sandbox.create(o);
-        // What Docker really runs it under (HostConfig.Runtime), not what was asked for (§7 #13).
-        let runtime = o?.runtime ?? null;
-        try { runtime = await box.runtimeName(); } catch (err) { journal(id, `runtime of ${box.name} not read: ${oneLine(err, 160)}`); }
-        store.update(id, { sandbox: { name: box.name, runtime } });
-        return box;
-      },
+      createSandbox: sandboxStarter(id, { store, journal }),
       emit: (type, data) => loopEvent(id, type, data),
       store: {
         put: async (name, data) => store.put(id, name, data),
@@ -1090,16 +1114,18 @@ async function removeAppSandboxes(when, log) {
 }
 
 /**
- * Sandbox networks that no sandbox runs on any more, the app's or a stopped self-test's: Mantis Ring's
- * own only (by label), and only older than STALE_NETWORK_MS, so a sandbox that is starting keeps its
- * network. Each one would otherwise hold one of Docker's address pools.
+ * Orphans, the app's or a stopped self-test's, Mantis Ring's own only (by label): sandbox containers
+ * older than STALE_SANDBOX_MS, which no task and no self-test lives to (a `docker run` that gave up
+ * while the daemon still made the container, a self-test killed with SIGKILL), then sandbox networks
+ * that no sandbox runs on and that are older than STALE_NETWORK_MS, so a sandbox that is starting
+ * keeps its network. Each network would otherwise hold one of Docker's address pools.
  */
-async function removeStaleNetworks(when, log) {
+async function removeStaleSandboxes(when, log) {
   try {
-    const n = await Sandbox.removeNetworks(TASK_LABEL, { minAgeMs: STALE_NETWORK_MS });
-    if (n) log(`${when}: removed ${n} sandbox network(s) that no sandbox runs on`);
+    const n = await Sandbox.removeStale(STALE_SANDBOX_MS);
+    if (n.containers || n.networks) log(`${when}: removed ${n.containers} sandbox container(s) older than ${STALE_SANDBOX_MS / 60_000} minutes and ${n.networks} sandbox network(s) that no sandbox runs on`);
   } catch (err) {
-    log(`${when}: could not remove stale sandbox networks: ${oneLine(err, 300)}`);
+    log(`${when}: could not remove stale sandboxes: ${oneLine(err, 300)}`);
   }
 }
 
@@ -1113,9 +1139,10 @@ async function main() {
   process.on('unhandledRejection', fatal('unhandled rejection'));
 
   // 1. Sandboxes and their networks left by a crash or a restart: the app's label only, never a
-  // self-test's container (§0.5 #9); then any sandbox network that no sandbox runs on.
+  // running self-test's container (§0.5 #9); then orphans, sandboxes too old to belong to any task or
+  // self-test, and any sandbox network that no sandbox runs on.
   await removeAppSandboxes('startup', log);
-  await removeStaleNetworks('startup', log);
+  await removeStaleSandboxes('startup', log);
   // 2. Tasks that a previous process left queued or running.
   const store = new TaskStore({ dir: path.join(STATE_DIR, 'tasks'), log });
   const interrupted = store.load();
@@ -1166,7 +1193,7 @@ async function main() {
   setInterval(() => {
     const n = store.prune();
     if (n) log(`retention: removed ${n} task(s)`);
-    removeStaleNetworks('retention', log);
+    removeStaleSandboxes('retention', log);
   }, 3_600_000).unref();
 
   let stopping = false;
