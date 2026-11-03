@@ -17,7 +17,7 @@ Visitor ──HTTPS──► Vultr VM (VX1, Seattle)
                    ├─ Docker + gVisor (runsc): one sandbox per task, destroyed when the task ends
                    │    Node 22, git, Chromium headless shell, Mantis CLI 0.7.1
                    │    no host environment · read-only root · 3 GB RAM, 2 CPUs, 512 processes · uid 10001
-                   │    network ring-internal (no route out) ─► ring-proxy (allowlist) ─► npm, GitHub
+                   │    its own network ring-task-<id> (no route out) ─► ring-proxy (allowlist) ─► npm, GitHub
                    └─ files: task records, receipts, spend ledger (private) · published runs (/latest/)
 Operator (WSL) ──SSH as deploy──► curl http://127.0.0.1:8080/admin/…   (scripts/ring.sh)
 ```
@@ -29,7 +29,7 @@ Operator (WSL) ──SSH as deploy──► curl http://127.0.0.1:8080/admin/…
    - `--read-only`, with tmpfs for `/work` (2 GB), `/tmp` (512 MB) and the home directory (1 GB);
    - `--memory 3g` with no swap, `--cpus 2`, `--pids-limit 512`, `--cap-drop ALL`, `no-new-privileges`;
    - an unprivileged user (uid 10001);
-   - on the `ring-internal` network only. Its single exit is `ring-proxy`, which lets through `registry.npmjs.org`, `github.com`, `codeload.github.com` and `objects.githubusercontent.com` on port 443 and refuses every other host. The proxy's address is written into the sandbox's `/etc/hosts` (`--add-host`), because under gVisor Docker's embedded DNS cannot be reached and the name would not resolve;
+   - on an internal network of its own, `ring-task-<id>`, made for it and removed with it (see [The sandbox's network](#the-sandboxs-network)). No other sandbox is on it, so two tasks that run at once cannot reach each other. Its single exit is `ring-proxy`, which lets through `registry.npmjs.org`, `github.com`, `codeload.github.com` and `objects.githubusercontent.com` on port 443 and refuses every other host. The proxy's address on that network is written into the sandbox's `/etc/hosts` (`--add-host`), because under gVisor Docker's embedded DNS cannot be reached and the name would not resolve;
    - no environment from the host. The inference key stays in the app's process;
    - `--runtime runsc` on the VM. The loop reads the runtime back from Docker, logs it and puts it on the receipt.
 3. **Bring in, install, serve** (`runner/run-task.mjs`). The sample is copied in as a tar stream of our own files. A GitHub repository is cloned inside the sandbox through the proxy (`git clone --depth 1`), from a URL rebuilt out of the checked owner and name, so the host never fetches a URL a user typed. Then `npm ci` or `npm install` (at most 5 minutes) and the project's dev server on port 3000. Lumen is static, so it gets a small static server.
@@ -38,11 +38,24 @@ Operator (WSL) ──SSH as deploy──► curl http://127.0.0.1:8080/admin/…
 6. **Checks.** When the model calls `check_ui`, the orchestrator measures again, compares with R0 and decides what stays (see [Each check, against R0](#each-check-against-r0)).
 7. **The final state.** Edits that were never measured get one last check if a check and the time are left; otherwise they are rolled back. No unmeasured edit reaches the patch. The final run (RF) is the last accepted check, or a fresh verify look when a rollback came after it (a verify look does not count as a check).
 8. **The patch.** `git diff --binary` from the starting snapshot, limited to the files the model wrote, so files that the install or the dev server changed never pollute it. `git apply --check` then tests it on the original files, in a throwaway worktree, and the receipt records the answer. A patch over 1 MB is stored cut and flagged.
-9. **Wrap-up, still inside the sandbox:** a proof sheet (`mantis proof`, R0 against RF), then the files are copied out one by one (see [Copying files out](#copying-files-out)). Then `destroy()`, and `docker ps -a` must no longer list the container.
+9. **Wrap-up, still inside the sandbox:** a proof sheet (`mantis proof`, R0 against RF), then the files are copied out one by one (see [Copying files out](#copying-files-out)). Then `destroy()`: `docker ps -a` must no longer list the container, and its network goes after it.
 10. **Vision** runs after the sandbox is gone, on bytes already copied out (see [The vision second opinion](#the-vision-second-opinion)).
 11. **The receipt** is written (see [The receipt](#the-receipt)). The owner may approve the run and then download the patch. The demo never applies a patch anywhere.
 
-Every task has a wall clock: 15 minutes for the sample, 20 for a GitHub repository. A hard timer destroys the sandbox at the deadline, and no model call runs into the last 150 s. Every exit path, failures included, destroys the sandbox. By default the app runs at most 2 tasks at a time, with 2 slots for the heavy steps (install, look, proof) and at most 8 tasks waiting.
+Every task has a wall clock: 15 minutes for the sample, 20 for a GitHub repository. A hard timer destroys the sandbox at the deadline, and no model call runs into the last 150 s. Every exit path, failures included, destroys the sandbox and its network. By default the app runs at most 2 tasks at a time, with 2 slots for the heavy steps (install, look, proof) and at most 8 tasks waiting.
+
+## The sandbox's network
+
+Before commit `08030d6`, every sandbox joined one shared network, `ring-internal`, so two tasks running at once could reach each other's dev servers. Now each sandbox has a network of its own (`runner/sandbox.mjs`):
+
+1. `Sandbox.create()` makes `ring-task-<id>` with `--internal` (no route out), labelled `mantis-ring=task`, with the container's own labels and `mantis-ring.sandbox=<name>`.
+2. The running `ring-proxy` joins it (`docker network connect`). The proxy's address on that network goes into the sandbox's `/etc/hosts`.
+3. The container starts on that network only. A failure at any step removes whatever was made before the error is raised.
+4. `destroy()` removes the container, then takes the proxy off the network, then removes the network, and resolves only when `docker network ls` no longer lists it. If the container will not go, the proxy still leaves, which cuts the container's only way out. The agent loop tries the clean-up once more, by name and by the task's label, whenever `destroy()` failed.
+
+On the VM the proxy has an address on `ring-egress` (its way out) and one on each running task's network. It relays only to the four allowlisted hosts on port 443, so a request through it to another sandbox, by address or by name, gets 403.
+
+**Nothing piles up.** Each network takes one of Docker's address pools (about 30 on a stock daemon), so none may leak. The app removes its own containers and networks at startup and shutdown. At startup and every hour it also removes any sandbox network, by label and name, that no sandbox runs on and that is older than 10 minutes; younger ones are left alone, because a sandbox may be starting on one. `containment.mjs` and the agent-loop scenarios sweep the same way before they start, and a self-test stopped by a signal destroys its sandboxes and their networks before it exits. `/admin/health` counts the app's networks. `scripts/setup.sh` no longer creates `ring-internal`; when it restarts the proxy, it removes `ring-internal` and every unused sandbox network. On the VM, `ring-internal` stays, with only the proxy on it, until `ring-setup` runs again.
 
 ## The tools
 
@@ -157,12 +170,12 @@ Each finished task gets `receipt.json` (schema `mantis-ring/receipt@1`, built by
 - **`diff`:** files, lines added and removed, bytes, SHA-256, and whether it applies to the original.
 - **`vision`:** the second opinion, pair by pair.
 - **`summary`:** the model's own words, marked as not measured.
-- **`containment`:** the runtime, the sandbox's name, its limits, its network, and whether `docker ps -a` confirmed it gone, with the time.
+- **`containment`:** the runtime, the sandbox's name, its limits, its own network (`ring-task-<id>`), and whether `docker ps -a` confirmed it gone, with the time.
 - **`mantis`** and **`promptVersion`:** the Mantis version, the run ids of R0 and RF, and the prompt version (`ring-2`).
 
 ## Containment, measured
 
-`node test/containment.mjs` checks each claim against a fresh sandbox (13 checks):
+`node test/containment.mjs` checks each claim against a fresh sandbox (16 checks):
 
 | Claim | How it is checked |
 |---|---|
@@ -172,18 +185,21 @@ Each finished task gets `receipt.json` (schema `mantis-ring/receipt@1`, built by
 | No direct internet | A TCP connect to 1.1.1.1:443 fails |
 | Allowlisted egress only | `git ls-remote` works for github.com and is refused for gitlab.com |
 | No exfiltration | `fetch('https://example.com')` fails |
+| Tasks cannot reach each other | Two sandboxes start at once, each with a server on port 3000 on all its addresses. Each is alone on its own network. Neither reaches the other by address with a TCP connect, an HTTP request or an ICMP echo, and through the proxy a request by address, a CONNECT and a request by name all get 403. Each still reaches the proxy, and the proxy answers its ICMP echo, which shows that ping works in the sandbox |
 | Process cap | Trying to start 700 processes ends at or below 512. Under gVisor the cap also counts the sandbox kernel's own threads, so the bomb stops the whole sandbox before 700 processes start |
 | Memory cap | An allocation loop is stopped at the 3 GB cap. runc kills it with exit 137; under gVisor the sandbox kernel stops it, and the check reads how much it held when it stopped |
 | Time limit | A task whose dev server never answers is stopped and its container removed |
-| Cleanup | No container is left after a task |
+| Cleanup | No container is left after a task, and none of the suite's five sandbox networks is left or still has the proxy on it |
+
+The two-sandbox check also prints a note that is not part of any check: whether a sandbox can open a connection to the VM itself through its network's gateway address. On the VM it can (README, Known limits).
 
 `node test/scenes.mjs` plays the containment scenes with two fixtures from `test/fixtures/` (test data, run only inside a fresh sandbox; 17 checks):
 - a hostile repository that hunts for secrets, calls hosts off the allowlist (the cloud metadata address included), runs `rm -rf` on the whole filesystem and spawns processes without end;
 - a dev server that never answers and ignores SIGTERM.
 
-`node test/agent-loop.mjs` drives the loop with a fake model in real sandboxes (scenarios S1–S10): an honest fix, a cover-up with the gate on and off, a measurement tamper, paths out of the project, every cap, malformed tool calls, an inference error, a dev server that dies, a route that stops loading and a link the edit removed. After every scenario, the sandbox must be gone.
+`node test/agent-loop.mjs` drives the loop with a fake model in real sandboxes (scenarios S1–S10): an honest fix, a cover-up with the gate on and off, a measurement tamper, paths out of the project, every cap, malformed tool calls, an inference error, a dev server that dies, a route that stops loading and a link the edit removed. After every scenario, the sandbox and its network must be gone. Its unit part (`--unit`, no Docker) includes U11, which drives the network's life cycle against `test/fake-docker.mjs`, a stand-in for the docker CLI, so that every failure path runs: a `docker run` that fails, a proxy that cannot join, a network that will not go at once or at all, the sweeps and a test stopped by a signal.
 
-All three take `RING_RUNTIME=runsc` to run the sandboxes in gVisor, and a full run of each writes the result file that `/status` shows. On the VM, on commit `0c2e46d` under gVisor, they passed 13/13, 17/17 and 83/83 (3 Nov, 20:35–20:39 UTC).
+All three take `RING_RUNTIME=runsc` to run the sandboxes in gVisor, and a full run of each writes the result file that `/status` shows. On the VM, on commit `2e01f41` under gVisor, they passed 16/16, 17/17 and 91/91 (3 Nov, 21:53–21:59 UTC). The first scenes run that night gave 16/17: in the endless-spawn scene, gVisor stopped the whole sandbox at the process cap after 9 s, instead of holding it there until the 20 s limit. The same commit then passed 17/17. The containment fork bomb already accepts that outcome under gVisor; the scene does not yet. Before the per-sandbox networks, on `0c2e46d`, the suites passed 13/13, 17/17 and 83/83.
 
 ## Built before the event vs during it
 
