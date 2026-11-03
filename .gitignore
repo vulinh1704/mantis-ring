@@ -1,3 +1,6 @@
 out/
 node_modules/
 .mantis/
+state/
+.ring-public/
+app/VERSION.json
