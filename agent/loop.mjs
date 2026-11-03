@@ -23,7 +23,7 @@ import {
 import { buildReceipt, diffStats, receiptLine, receiptMarkdown } from './receipt.mjs';
 import { FILE_TOOL_NAMES, TOOL_SCHEMAS, ToolError, WRITE_TOOL_NAMES, fileTools, parseToolCall } from './tools.mjs';
 import { changedSince, initWorkspace, isClean, patchApplies, patchSince, revertTo, snapshot, stageAll, tamperHits } from './workspace.mjs';
-import { LIMITS, Sandbox } from '../runner/sandbox.mjs';
+import { LIMITS, Sandbox, networkText } from '../runner/sandbox.mjs';
 import { bringIn, devServerUp, inspectProject, installDeps, look, startCommand, startDevServer } from '../runner/run-task.mjs';
 
 /** Caps of a public task (§2.4). Admin tasks may raise them up to ADMIN_MAX. */
@@ -46,7 +46,6 @@ const TRANSCRIPT_LINE_MAX = 16_384;
 const MIN_LOOK_SEC = 10; // below this, a look is not started (it could not finish)
 const MIN_CALL_MS = 20_000; // below this much time before the soft stop, no model call is started
 const VISION_TIMEOUT_MS = 180_000;
-const NETWORK = 'ring-internal → ring-proxy (allowlist)';
 const COMPACTABLE = new Set(['read_file', 'search_code', 'list_files']);
 const SHOT = /^shots\/[A-Za-z0-9_.-]+\.png$/;
 const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
@@ -565,7 +564,7 @@ class FixRun {
       this.journal(`runtime check failed: ${firstLine(err?.message)}`);
     }
     this.phases.sandbox += Date.now() - tc;
-    this.say(`sandbox ${this.box.name} created · runtime ${this.rt} · ${limitsText()} · network ring-internal → allowlist proxy`, { sandbox: { name: this.box.name, runtime: this.rt } });
+    this.say(`sandbox ${this.box.name} created · runtime ${this.rt} · ${limitsText()} · network ${this.box.network ?? 'unknown'} (this task only) → allowlist proxy`, { sandbox: { name: this.box.name, runtime: this.rt } });
 
     this.phase = 'clone';
     try {
@@ -1314,18 +1313,22 @@ class FixRun {
     }
   }
 
-  /** §2.7.3 and §2.8: destroy, then confirm with `docker ps -a`. Never throws. */
+  /**
+   * §2.7.3 and §2.8: destroy (the container, then its own network), then confirm with `docker ps -a`.
+   * Never throws.
+   */
   async destroyAndConfirm() {
     const t = Date.now();
     let gone = false;
+    let failed = false;
     const isGone = async () => {
       try { return (await this.box.gone()) === true; } catch (err) { this.journal(`gone check failed: ${firstLine(err?.message)}`); return false; }
     };
-    try { await this.box.destroy(); } catch (err) { this.journal(`destroy failed: ${firstLine(err?.message)}`); }
+    try { await this.box.destroy(); } catch (err) { failed = true; this.journal(`destroy failed: ${firstLine(err?.message)}`); }
     gone = await isGone();
-    if (!gone) {
+    if (!gone || failed) {
       // One more try, by name and then by this task's own label (never another task's or a self-test's
-      // container), so a sandbox does not stay up until the app restarts.
+      // container or network), so neither the sandbox nor its network stays until the app restarts.
       try { await this.box.destroy(); } catch (err) { this.journal(`destroy retry failed: ${firstLine(err?.message)}`); }
       try { await Sandbox.removeAll(`mantis-ring.task=${this.task.id}`); } catch (err) { this.journal(`removal by label failed: ${firstLine(err?.message)}`); }
       gone = await isGone();
@@ -1333,7 +1336,7 @@ class FixRun {
     this.phases.destroy += Date.now() - t;
     this.cleanedUp = true;
     this.containment = {
-      runtime: this.rt, sandbox: this.box.name, limits: { ...LIMITS }, network: NETWORK, destroyed: gone,
+      runtime: this.rt, sandbox: this.box.name, limits: { ...LIMITS }, network: networkText(this.box.network), destroyed: gone,
       goneCheck: gone ? 'docker ps -a: gone' : 'docker ps -a: still listed', goneAt: gone ? new Date().toISOString() : null,
     };
     this.say(gone ? `container ${this.box.name} destroyed · docker ps -a: gone` : `container ${this.box.name} could not be confirmed gone (docker ps -a still lists it)`);

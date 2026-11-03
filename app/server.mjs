@@ -16,7 +16,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { chat, newTally } from '../agent/inference.mjs';
-import { APP_LABEL, Sandbox, childEnv } from '../runner/sandbox.mjs';
+import { APP_LABEL, STALE_NETWORK_MS, Sandbox, TASK_LABEL, childEnv } from '../runner/sandbox.mjs';
 import * as configModule from './config.mjs';
 import { ConfigError, HEAVY_SLOTS, MAX_QUEUED, PROVIDER, PUBLIC_DIR, PUBLIC_URL, RUNTIME, SAMPLES, STATE_DIR, samplingFor } from './config.mjs';
 import { PublishError, notPublishable, publishLatest, refreshPlaceholder } from './publish.mjs';
@@ -744,7 +744,7 @@ export function createApp(deps = {}) {
     const h = await statusModule.healthData({ runtime: RUNTIME });
     sendJson(c.res, 200, {
       running: queue.running().length, queued: queue.queued().length, docker: h.docker, proxy: h.proxy,
-      runtime: RUNTIME ?? 'runc', runtimeAvailable: h.runtimeAvailable, sandboxes: h.sandboxes,
+      runtime: RUNTIME ?? 'runc', runtimeAvailable: h.runtimeAvailable, sandboxes: h.sandboxes, networks: h.networks,
       loop: typeof runFix === 'function', spend: !!spend, probe: !!probe, vision: !!vision,
     });
   }
@@ -1082,9 +1082,24 @@ async function optional(spec, log) {
 
 async function removeAppSandboxes(when, log) {
   try {
-    log(`${when}: removed ${await Sandbox.removeAll(APP_LABEL)} sandbox container(s) labelled ${APP_LABEL}`);
+    const n = await Sandbox.removeAll(APP_LABEL);
+    log(`${when}: removed ${n.containers} sandbox container(s) and ${n.networks} sandbox network(s) labelled ${APP_LABEL}`);
   } catch (err) {
     log(`${when}: could not remove the app's sandboxes: ${oneLine(err, 300)}`);
+  }
+}
+
+/**
+ * Sandbox networks that no sandbox runs on any more, the app's or a stopped self-test's: Mantis Ring's
+ * own only (by label), and only older than STALE_NETWORK_MS, so a sandbox that is starting keeps its
+ * network. Each one would otherwise hold one of Docker's address pools.
+ */
+async function removeStaleNetworks(when, log) {
+  try {
+    const n = await Sandbox.removeNetworks(TASK_LABEL, { minAgeMs: STALE_NETWORK_MS });
+    if (n) log(`${when}: removed ${n} sandbox network(s) that no sandbox runs on`);
+  } catch (err) {
+    log(`${when}: could not remove stale sandbox networks: ${oneLine(err, 300)}`);
   }
 }
 
@@ -1097,8 +1112,10 @@ async function main() {
   process.on('uncaughtException', fatal('uncaught exception'));
   process.on('unhandledRejection', fatal('unhandled rejection'));
 
-  // 1. Sandboxes left by a crash or a restart: the app's label only, never a self-test's (§0.5 #9).
+  // 1. Sandboxes and their networks left by a crash or a restart: the app's label only, never a
+  // self-test's container (§0.5 #9); then any sandbox network that no sandbox runs on.
   await removeAppSandboxes('startup', log);
+  await removeStaleNetworks('startup', log);
   // 2. Tasks that a previous process left queued or running.
   const store = new TaskStore({ dir: path.join(STATE_DIR, 'tasks'), log });
   const interrupted = store.load();
@@ -1149,6 +1166,7 @@ async function main() {
   setInterval(() => {
     const n = store.prune();
     if (n) log(`retention: removed ${n} task(s)`);
+    removeStaleNetworks('retention', log);
   }, 3_600_000).unref();
 
   let stopping = false;

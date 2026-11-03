@@ -229,7 +229,8 @@ export async function look(box, { port, routes = '/', locales, viewports, scheme
  *   timeoutSec?: number, outDir?: string, runtime?: string}} opts
  * @param {(line: string) => void} [log]
  * @returns {Promise<{ok: boolean, repo: string, steps: {name: string, ms: number}[], sandbox?: string,
- *   reportDir?: string, summary?: object, error?: string, destroyed?: boolean, seconds: number}>}
+ *   network?: string, reportDir?: string, summary?: object, error?: string, destroyed?: boolean, seconds: number}>}
+ *   `destroyed`: the container is gone and so is its own network
  */
 export async function runTask(opts, log = () => {}) {
   const { repo, routes = '/', locales, port = 3000, devCmd, timeoutSec = 600, outDir = 'out', runtime } = opts;
@@ -250,6 +251,7 @@ export async function runTask(opts, log = () => {}) {
     return result;
   }
   result.sandbox = box.name;
+  result.network = box.network;
   // Wall-clock cap for the whole task: when it fires, the container is destroyed mid-step.
   let expired = false;
   const deadline = setTimeout(() => {

@@ -7,10 +7,10 @@ import { readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { ping } from '../agent/inference.mjs';
-import { APP_LABEL, LIMITS, run } from '../runner/sandbox.mjs';
+import { APP_LABEL, LIMITS, TASK_LABEL, run } from '../runner/sandbox.mjs';
 import { PROVIDER, STATE_DIR } from './config.mjs';
 
-export const NETWORK = 'ring-internal → ring-proxy (allowlist)';
+export const NETWORK = 'one internal network per sandbox (ring-task-…) → ring-proxy (allowlist)';
 const SUITES = [['containment', 'containment'], ['scenes', 'scenes'], ['agentLoop', 'agent-loop']];
 const VERSION_FILE = new URL('./VERSION.json', import.meta.url);
 
@@ -172,19 +172,25 @@ export async function statusData(ctx) {
   };
 }
 
-/** Live checks for GET /admin/health, never cached: Docker, the runtime, the proxy and the app's own sandboxes. */
+/**
+ * Live checks for GET /admin/health, never cached: Docker, the runtime, the proxy, and the app's own
+ * sandboxes and sandbox networks (a running task has one of each).
+ */
 export async function healthData({ runtime } = {}) {
   const configured = runtime || 'runc';
-  const [info, proxy, boxes] = await Promise.all([
+  const count = (r) => (r.code === 0 ? r.stdout.split('\n').filter((s) => s.trim()).length : null);
+  const [info, proxy, boxes, nets] = await Promise.all([
     run('docker', ['info', '--format', '{{json .Runtimes}}'], { timeoutMs: 4000 }),
     proxyState(),
     run('docker', ['ps', '-aq', '--filter', `label=${APP_LABEL}`], { timeoutMs: 4000 }),
+    run('docker', ['network', 'ls', '-q', '--filter', `label=${TASK_LABEL}`, '--filter', `label=${APP_LABEL}`], { timeoutMs: 4000 }),
   ]);
   return {
     docker: info.code === 0,
     runtimeAvailable: info.code === 0 && (configured === 'runc' || info.stdout.includes(`"${configured}"`)),
     proxy: proxy === 'running',
-    sandboxes: boxes.code === 0 ? boxes.stdout.split('\n').filter((s) => s.trim()).length : null,
+    sandboxes: count(boxes),
+    networks: count(nets),
   };
 }
 
