@@ -186,6 +186,10 @@ p { margin: 0 0 12px; }
 .actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 20px; }
 .actions:empty { display: none; }
 .actions .hint { color: var(--muted); font-size: 0.92rem; flex-basis: 100%; }
+.passphrase {
+  min-height: 40px; padding: 8px 12px; border-radius: 9px; border: 1px solid var(--border);
+  background: var(--surface); color: var(--text); font: 0.95rem/1.2 var(--sans); min-width: 0; flex: 1 1 14em; max-width: 22em;
+}
 
 /* Wide tables scroll inside their card instead of squeezing their columns or the page. */
 .table-wrap { overflow-x: auto; }
@@ -267,8 +271,11 @@ tbody tr:last-child td, tbody tr:last-child th { border-bottom: 0; }
   .stepbar { grid-template-columns: repeat(4, minmax(0, 1fr)); row-gap: 12px; }
   .check { grid-template-columns: 5.5em minmax(0, 1fr); }
   .check-line { grid-column: 2; }
-  .tries li { flex-wrap: wrap; }
-  .tries li .button { margin-left: 46px; }
+  /* The number, then the text at full width, then the button on its own row under the text. (With
+     flex-wrap the text's flex-basis of 0 never wrapped, so it was squeezed to a sliver beside the button.) */
+  .tries li { display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 12px 16px; align-items: start; }
+  .tries li::before { margin-top: 2px; }
+  .tries li .button { grid-column: 2; justify-self: start; }
   .page { padding-top: 24px; }
 }
 @media (max-width: 420px) {

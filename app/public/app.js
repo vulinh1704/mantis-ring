@@ -15,12 +15,13 @@
   const STATE_TEXT = { queued: 'Queued', running: 'Running', done: 'Done', failed: 'Failed', timeout: 'Timed out', cancelled: 'Cancelled', interrupted: 'Interrupted' };
   const STATE_CLASS = { queued: 'is-info', running: 'is-info is-live', done: 'is-ok', failed: 'is-bad', timeout: 'is-warn', cancelled: '', interrupted: 'is-warn' };
   const DECISIONS = {
-    accepted: 'Accepted', kept: 'Kept (gate off)', reverted: 'COVER-UP · rolled back',
+    accepted: 'Accepted', kept: 'Kept (gate off)', reverted: 'COVER-UP · rolled back', lost: 'LOST CONTROLS · rolled back',
     tamper: 'Tamper · rolled back', failed: 'Not measurable · rolled back',
   };
+  const ROLLED_BACK = new Set(['reverted', 'lost', 'tamper', 'failed']);
   const VERDICTS = {
-    pass: ['Pass', 'is-ok', 'Fixed, with nothing new and no cover-ups.'],
-    partial: ['Partial', 'is-warn', 'Something was fixed, but something new broke or a cover-up remains.'],
+    pass: ['Pass', 'is-ok', 'Fixed, with nothing new, no cover-ups and no lost controls, on every screen measured at the start.'],
+    partial: ['Partial', 'is-warn', 'Something was fixed, but something new broke, a control went missing, a cover-up remains or a screen was not compared.'],
     fail: ['No fix', 'is-bad', 'Nothing was fixed in the end.'],
     'no-issues': ['No issues', 'is-ok', 'Mantis found nothing to fix at the starting point.'],
   };
@@ -89,6 +90,7 @@
     }
     const models = [cfg.fixModel, cfg.visionModel].filter((m) => typeof m === 'string' && m);
     $('chip-models').textContent = models.length ? `${cfg.provider || PROVIDER} (${models.join(', ')})` : cfg.provider || PROVIDER;
+    showLatest(cfg.latest);
     const sample = Array.isArray(cfg.samples) ? cfg.samples[0] : null;
     const button = $('run-sample');
     if (!cfg.publicRuns || !sample) {
@@ -100,6 +102,23 @@
     button.classList.add('primary');
     $('run-note').textContent = `${sample.label}. A run takes ${sample.etaText}, and you can follow every step live.`;
     button.addEventListener('click', () => startSample(sample.id, button));
+  }
+
+  /** Step 1 of the judges' box: the published run's own line, or, before the first publish, where to look instead. */
+  function showLatest(latest) {
+    const note = $('latest-note');
+    const go = $('latest-link');
+    if (latest && typeof latest.line === 'string' && latest.line) {
+      note.replaceChildren(el('span', null, 'Mantis measured: '), el('code', null, latest.line),
+        document.createTextNode(`${latest.at ? ` · published ${utc(latest.at)}` : ''}. Its receipt, before-and-after screenshots, the models and their cost, and the patch.`));
+      if (/^t_[0-9a-f]{32}$/.test(String(latest.taskId || ''))) note.append(document.createTextNode(' '), link(`/t/${latest.taskId}`, 'Step-by-step log.'));
+      return;
+    }
+    note.textContent = 'No run is published yet: one appears here once Mantis measures a real run as a pass. Meanwhile, Status shows the server live.';
+    go.textContent = 'Not published yet';
+    go.removeAttribute('href');
+    go.setAttribute('aria-disabled', 'true');
+    go.classList.remove('primary');
   }
 
   async function startSample(sampleId, button) {
@@ -273,7 +292,18 @@
       }
     } else if (S.owner) {
       const a = button('Approve', true);
-      a.addEventListener('click', () => approve(S, a));
+      let pass = null;
+      if (t.approvalNeedsPassphrase) {
+        // The owner link alone cannot prove a person approved: the server also asks for the owner's passphrase.
+        pass = el('input', 'passphrase');
+        pass.type = 'password';
+        pass.autocomplete = 'off';
+        pass.placeholder = 'Approval passphrase';
+        pass.setAttribute('aria-label', 'Approval passphrase');
+        pass.addEventListener('keydown', (e) => { if (e.key === 'Enter') a.click(); });
+        box.append(pass);
+      }
+      a.addEventListener('click', () => approve(S, a, pass));
       box.append(a, el('span', 'hint', 'Approving hands you the patch as a file. The demo never applies it anywhere.'));
     } else {
       box.append(el('span', 'hint', 'Waiting for the person who started this run to review and approve the patch.'));
@@ -284,14 +314,16 @@
     $('t-actions').append(el('p', 'notice is-bad hint', text));
   }
 
-  async function approve(S, b) {
+  async function approve(S, b, pass) {
     b.disabled = true;
     b.textContent = 'Approving…';
     try {
       const r = await getJson(`/api/tasks/${S.id}/approve`, {
-        method: 'POST', headers: { 'content-type': 'application/json', 'x-ring-owner': S.owner }, body: '{}',
+        method: 'POST', headers: { 'content-type': 'application/json', 'x-ring-owner': S.owner },
+        body: JSON.stringify(pass ? { passphrase: pass.value } : {}),
       });
       S.task.approvedAt = r.approvedAt;
+      S.task.approvedWith = pass ? 'passphrase' : 'owner-link';
       setStep('approve', 'done');
       renderActions(S);
       renderNow(S);
@@ -516,8 +548,9 @@
 
   function gateText(d) {
     const covers = Array.isArray(d.coverUps) && d.coverUps.length ? ` · ${d.coverUps.map((c) => `${c.type} on ${c.selector}`).join('; ')}` : '';
+    const lost = Array.isArray(d.lost) && d.lost.length ? ` · gone: ${d.lost.map((l) => l.control || l.selector || 'a control').join('; ')}` : '';
     const hits = Array.isArray(d.tamperHits) && d.tamperHits.length ? ` · ${d.tamperHits.join(', ')}` : '';
-    return `Check ${d.check}: ${DECISIONS[d.decision] || d.decision}${d.restoredTo ? `; files back to ${d.restoredTo}` : ''}${d.reason ? ` (${d.reason})` : ''}${covers}${hits}`;
+    return `Check ${d.check}: ${DECISIONS[d.decision] || d.decision}${d.restoredTo ? `; files back to ${d.restoredTo}` : ''}${d.reason ? ` (${d.reason})` : ''}${covers}${lost}${hits}`;
   }
 
   function visionText(v) {
@@ -530,11 +563,11 @@
 
   /** One check row: its number, the gate's decision (a rollback stands out) and Mantis's line. */
   function checkItem(d, line) {
-    const li = el('li', d.decision === 'reverted' || d.decision === 'tamper' ? 'check is-coverup' : 'check');
+    const li = el('li', ROLLED_BACK.has(d.decision) ? 'check is-coverup' : 'check');
     li.append(
       el('span', 'check-n', `Check ${d.check}`),
       el('span', 'decision', `${DECISIONS[d.decision] || d.decision}${d.forced ? ' (forced)' : ''}`),
-      el('code', 'check-line', line || ''),
+      el('code', 'check-line', line || d.reason || ''),
     );
     return li;
   }
@@ -595,7 +628,10 @@
       p.append(el('span', `pill ${v[1]}`, v[0]), document.createTextNode(` ${v[2]}`));
       box.append(p);
     }
-    box.append(el('p', 'verified', 'Verified = re-measured by Mantis (no LLM) against the original baseline.'));
+    // A GitHub repo's own code ran next to the checker, so its receipt says so instead of "verified" (§7 #8).
+    box.append(r.trust === 'repo-sandbox'
+      ? el('p', 'notice is-warn', r.trustNote || "Measured inside the repo's own sandbox: the repo's code ran next to the checker, so this result is not independently verified.")
+      : el('p', 'verified', 'Verified = re-measured by Mantis (no LLM) against the original baseline.'));
     const k = r.counts || {};
     if (r.stopReason === 'inference') {
       box.append(el('p', 'notice is-warn', k.fixed > 0
@@ -608,7 +644,7 @@
     for (const [name, value] of [
       ['Errors', `${num(k.errorsBefore)} → ${num(k.errorsAfter)}`],
       ['Warnings', `${num(k.warningsBefore)} → ${num(k.warningsAfter)}`],
-      ['Screens compared', num(k.cellsCompared ?? (r.matrix && r.matrix.cells))],
+      ['Screens compared', Number.isFinite(k.cellsExpected) ? `${num(k.cellsCompared)} of ${num(k.cellsExpected)}` : num(k.cellsCompared ?? (r.matrix && r.matrix.cells))],
       ['Time', secs(r.time && r.time.totalSec)],
       ['Tokens', num(tokens)],
       ['Model cost', usd(r.usd)],
@@ -626,7 +662,7 @@
       for (const ch of r.checks) list.append(checkItem(ch, ch.line));
       box.append(list);
     }
-    box.append(el('p', 'muted', `Cover-up gate ${g.enabled === false ? 'off (control run)' : 'on'} · ${plural(g.coverUpAttempts || 0, 'cover-up attempt')} · ${plural(g.tamperAttempts || 0, 'tamper attempt')} · ${plural(g.reverts || 0, 'rollback')}.`));
+    box.append(el('p', 'muted', `Cover-up gate ${g.enabled === false ? 'off (control run)' : 'on'} · ${plural(g.coverUpAttempts || 0, 'cover-up attempt')}${g.lostAttempts ? ` · ${plural(g.lostAttempts, 'check')} with lost controls` : ''} · ${plural(g.tamperAttempts || 0, 'tamper attempt')} · ${plural(g.reverts || 0, 'rollback')}.`));
     $('t-checks').hidden = true;
 
     if (Array.isArray(r.models) && r.models.length) {
@@ -667,7 +703,7 @@
     if (t.diff && typeof t.diff.text === 'string') {
       box.append(el('h3', null, 'The patch'));
       box.append(el('p', 'muted', t.approvedAt
-        ? 'Approved by the owner. Nothing was applied anywhere by the demo.'
+        ? `${t.approvedWith === 'passphrase' ? "Approved by the owner, with the owner's approval passphrase." : 'Approved with the owner link.'} Nothing was applied anywhere by the demo.`
         : 'Shown for review. The owner gets it as a file only after approving; nothing is applied anywhere.'));
       const pre = el('pre', 'diff');
       for (const line of t.diff.text.replace(/\n$/, '').split('\n')) pre.append(el('span', diffClass(line), line || ' '));

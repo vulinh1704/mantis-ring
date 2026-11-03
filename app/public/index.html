@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Mantis Ring</title>
-<meta name="description" content="A UI-fixing agent that cannot cheat, sandboxed on Vultr. Every fix is measured by Mantis, cover-ups are rolled back, and a person approves the patch.">
+<meta name="description" content="A UI-fixing agent whose fixes are re-measured, not trusted, sandboxed on Vultr. Mantis measures every fix, cover-ups are rolled back, and a person approves before the patch is handed out.">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/app.css">
 <script src="/app.js" defer></script>
@@ -23,7 +23,7 @@
 <main id="home" class="wrap page">
   <section class="hero">
     <h1>Mantis Ring</h1>
-    <p class="tagline">A UI-fixing agent that can't cheat, sandboxed on Vultr.</p>
+    <p class="tagline">A UI-fixing agent whose fixes are re-measured, not trusted. Sandboxed on Vultr.</p>
     <ul class="chips" aria-label="Where it runs">
       <li class="chip">Vultr VX1 · Seattle</li>
       <li class="chip" id="chip-models">Vultr Serverless Inference</li>
@@ -37,9 +37,9 @@
       <li>
         <div class="try-text">
           <strong>See a finished run</strong>
-          <span>The latest verified run: its receipt, before-and-after screenshots, the models and their cost, and the patch.</span>
+          <span id="latest-note">The latest verified run: its receipt, before-and-after screenshots, the models and their cost, and the patch.</span>
         </div>
-        <a class="button primary" href="/latest/">Latest verified run</a>
+        <a id="latest-link" class="button primary" href="/latest/">Latest verified run</a>
       </li>
       <li>
         <div class="try-text">
@@ -51,7 +51,7 @@
       <li>
         <div class="try-text">
           <strong>Check what is running</strong>
-          <span>Sandbox runtime, model service, self-test results and today's spend, all read live.</span>
+          <span>Sandbox runtime, model service, self-test results and today's spend, checked live or read from the last real self-test.</span>
         </div>
         <a class="button" href="/status">Status</a>
       </li>
@@ -64,7 +64,7 @@
     <ol class="flow" aria-label="Steps of a run">
       <li>Clone</li><li>Install (proxy)</li><li>Look</li><li>Fix</li><li>Gate</li><li>Vision check</li><li>Approve</li>
     </ol>
-    <p>Ring is a coding agent that fixes UI bugs in a web project: text that overflows on a phone, layouts that break in another language, colours that disappear in dark mode. It works on a copy of the project inside a throwaway gVisor sandbox on Vultr, with no secrets and no way out except a proxy that allows only npm and GitHub. After each batch of edits, Mantis, an open-source checker that uses no AI, measures every page, screen size, colour scheme and language again and compares them with the starting point. A change that only hides a problem is reported as a cover-up and rolled back. Each run ends with a receipt that shows what was fixed, what is new, which models worked on it and what they cost, and a person approves the patch before it leaves the ring.</p>
+    <p>Ring is a coding agent that fixes UI bugs in a web project: text that overflows on a phone, layouts that break in another language, colours that disappear in dark mode. It works on a copy of the project inside a throwaway gVisor sandbox on Vultr, with no secrets and no way out except a proxy that allows only npm and GitHub. After each batch of edits, Mantis, an open-source checker that uses no AI, measures every route, screen size, colour scheme and language in the task again and compares them with the starting point. A change that only hides a problem is reported as a cover-up and rolled back, and so is one that makes a page stop loading. Each run ends with a receipt that shows what was fixed, what is new, which models worked on it and what they cost. A person approves before the patch is handed out as a file; the demo never applies it anywhere.</p>
   </section>
 </main>
 
