@@ -1,0 +1,1012 @@
+#!/usr/bin/env node
+// The Mantis Ring web app and orchestrator: one HTTP listener on 127.0.0.1, behind Caddy (BUILD-SPEC §4).
+// Public routes serve the UI, /status, task progress over Server-Sent Events, receipts, the owner's
+// Approve and the patch download. Local-admin routes (/admin/*) start and inspect tasks, run probes and
+// self-tests, change settings and publish runs. They answer only requests from loopback that did not come
+// through Caddy and name a loopback Host (D-4), and look like any unknown path (404) to everyone else.
+// Tasks wait in the queue, then run in their own sandbox through runFix (agent/loop.mjs).
+//
+// Usage: node app/server.mjs   (env: PORT=8080 HOST=127.0.0.1 RING_STATE_DIR RING_PUBLIC_DIR RING_RUNTIME)
+import { spawn } from 'node:child_process';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import { closeSync, createReadStream, existsSync, openSync, readFileSync, readSync, renameSync, writeFileSync } from 'node:fs';
+import http from 'node:http';
+import net from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { chat, newTally } from '../agent/inference.mjs';
+import { APP_LABEL, Sandbox, childEnv } from '../runner/sandbox.mjs';
+import * as configModule from './config.mjs';
+import { ConfigError, HEAVY_SLOTS, MAX_QUEUED, PROVIDER, PUBLIC_DIR, PUBLIC_URL, RUNTIME, SAMPLES, STATE_DIR, samplingFor } from './config.mjs';
+import { PublishError, notPublishable, publishLatest } from './publish.mjs';
+import { Spend } from './spend.mjs';
+import * as statusModule from './status.mjs';
+import { oneLine } from './status.mjs';
+import { INTERRUPTED, Queue, QueueFullError, RunStats, TaskInputError, TaskStore, taskFromBody } from './tasks.mjs';
+
+const PUBLIC_ROOT = fileURLToPath(new URL('./public/', import.meta.url));
+const REPO_ROOT = fileURLToPath(new URL('../', import.meta.url));
+const PUBLIC_FILES = {
+  'index.html': 'text/html; charset=utf-8', 'app.js': 'text/javascript; charset=utf-8',
+  'app.css': 'text/css; charset=utf-8', 'favicon.svg': 'image/svg+xml',
+};
+const CSP = "default-src 'self'; img-src 'self' data: blob:; style-src 'self'; script-src 'self'; connect-src 'self'; "
+  + "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
+const BODY_LIMIT = 16 * 1024;
+const TASK_IMAGE = /^(proof|contact-before|contact-after|crop-before-\d|crop-after-\d)\.png$/;
+const FINISHED = new Set(['done', 'failed', 'timeout', 'cancelled', 'interrupted']);
+const PER_IP = { hour: 3, day: 8 };                   // plus one queued or running task at a time (§4.4)
+const SSE = { perIp: 6, total: 200, heartbeatMs: 20_000, maxBuffer: 1024 * 1024 };
+const SELFTEST_SUITES = ['agent-loop', 'containment', 'scenes'];
+const SELFTEST_TIMEOUT_MS = 20 * 60_000;
+const PROBE_CAPS = { maxUsd: 0.25, maxPromptTokens: 400_000 };   // the whole probe costs < $0.02 (§5.3)
+const PROBE_TIMEOUT_MS = 15 * 60_000;
+const DIFF_SHOWN_BYTES = 200 * 1024;
+const PUBLIC_KEYS = ['id', 'createdAt', 'updatedAt', 'startedAt', 'finishedAt', 'origin', 'state', 'source', 'matrix', 'model',
+  'visionModel', 'gate', 'position', 'step', 'stepTimes', 'sandbox', 'result', 'approvedAt', 'publishedAt'];
+
+// Public answers are one plain sentence each (§4.5).
+const SAY = {
+  closed: 'Live runs open soon. Meanwhile, the latest verified run shows a complete result.',
+  hour: `You have started ${PER_IP.hour} runs in the last hour from this network. Please try again later, or open the latest verified run.`,
+  day: `You have started ${PER_IP.day} runs today from this network. Please try again tomorrow, or open the latest verified run.`,
+  active: 'You already have a run in progress. Follow it, or wait until it finishes.',
+  busy: `The demo is busy right now (${MAX_QUEUED} runs waiting). Please try again in a few minutes.`,
+  budgetDay: "Today's demo budget is used up; it resets at 00:00 UTC. The latest verified run shows a complete result.",
+  budgetTotal: 'The demo budget is used up. The latest verified run shows a complete result.',
+  paused: 'Live runs are paused right now. Meanwhile, the latest verified run shows a complete result.',
+  local: 'Runs can only be started from the public internet.',
+  restarting: 'The demo is restarting. Please try again in a minute.',
+  notFound: 'There is nothing at this address.',
+  noTask: 'There is no run at this address. Runs are kept for 14 days.',
+  owner: 'Only the person who started this run can do that.',
+  internal: 'Something went wrong on our side. The latest verified run shows a complete result.',
+};
+
+/** An answer other than 200: an HTTP status and one plain sentence (plus optional headers). */
+class HttpError extends Error {
+  constructor(status, sentence, headers = {}) {
+    super(sentence);
+    this.status = status;
+    this.headers = headers;
+  }
+}
+/** A reason a run could not start, fit to show on its page. */
+class RunError extends Error {}
+
+const sha256 = (s) => createHash('sha256').update(s).digest('hex');
+const iso = (ms) => new Date(ms).toISOString();
+const delay = (ms) => new Promise((ok) => setTimeout(ok, ms).unref());
+
+// ---------------------------------------------------------------------------------------------
+// Who is asking (§4.1)
+// ---------------------------------------------------------------------------------------------
+
+/** Local admin (D-4): a loopback peer, no X-Forwarded-For (Caddy always adds one) and a loopback Host. */
+export function isAdmin(req) {
+  const loopback = ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress);
+  const viaCaddy = 'x-forwarded-for' in req.headers;
+  const hostOk = /^(127\.0\.0\.1|localhost)(:\d+)?$/.test(req.headers.host ?? '');
+  return loopback && !viaCaddy && hostOk;
+}
+
+/** The client address: the last X-Forwarded-For entry (the one Caddy added), else the socket peer. */
+export function clientIp(req) {
+  const xff = req.headers['x-forwarded-for'];
+  if (typeof xff === 'string' && xff.trim()) return xff.split(',').pop().trim();
+  return req.socket.remoteAddress ?? '';
+}
+
+const LOCAL_NETS = new net.BlockList();
+for (const [addr, bits] of [['0.0.0.0', 8], ['10.0.0.0', 8], ['127.0.0.0', 8], ['169.254.0.0', 16], ['172.16.0.0', 12], ['192.168.0.0', 16]]) {
+  LOCAL_NETS.addSubnet(addr, bits, 'ipv4');
+}
+LOCAL_NETS.addAddress('::', 'ipv6');
+LOCAL_NETS.addAddress('::1', 'ipv6');
+LOCAL_NETS.addSubnet('fc00::', 7, 'ipv6');
+LOCAL_NETS.addSubnet('fe80::', 10, 'ipv6');
+
+/** Drop an IPv6 zone and the IPv4-mapped prefix. */
+function plainIp(ip) {
+  const s = String(ip ?? '').trim().replace(/%.*$/, '');
+  return /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(s)?.[1] ?? s;
+}
+
+/** Loopback, private, link-local or not an address at all: nobody there may start a task (§4.1). */
+export function isLocalIp(ip) {
+  const s = plainIp(ip);
+  if (net.isIPv4(s)) return LOCAL_NETS.check(s, 'ipv4');
+  if (net.isIPv6(s)) return LOCAL_NETS.check(s, 'ipv6');
+  return true;
+}
+
+/** What per-IP limits count by: the IPv4 address, or the /64 of an IPv6 address. null when invalid. */
+export function ipKey(ip) {
+  const s = plainIp(ip);
+  if (net.isIPv4(s)) return s;
+  if (!net.isIPv6(s)) return null;
+  const [head, tail] = s.split('::');
+  const h = head ? head.split(':') : [];
+  const t = tail ? tail.split(':') : [];
+  const groups = tail === undefined ? h : [...h, ...Array(Math.max(0, 8 - h.length - t.length)).fill('0'), ...t];
+  return `${groups.slice(0, 4).map((g) => g.toLowerCase().replace(/^0+(?=.)/, '')).join(':')}::/64`;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Responses and request bodies
+// ---------------------------------------------------------------------------------------------
+function headers(extra) {
+  return { 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer', ...extra };
+}
+
+function sendJson(res, status, body, extra = {}) {
+  if (res.headersSent) { res.destroy(); return; }
+  const text = JSON.stringify(body);
+  res.writeHead(status, headers({ 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'content-length': Buffer.byteLength(text), ...extra }));
+  res.end(text);
+}
+
+/** Every error answer: {error: '<one plain sentence>', more: '/latest/'}, never a stack trace (§4.2). */
+function sendError(res, status, sentence, extra = {}) {
+  sendJson(res, status, { error: sentence, more: '/latest/' }, extra);
+}
+
+function sendHtml(res, html) {
+  res.writeHead(200, headers({ 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'content-security-policy': CSP, 'x-frame-options': 'DENY', 'content-length': Buffer.byteLength(html) }));
+  res.end(html);
+}
+
+const staticFiles = new Map();
+/** The UI's four files, read once. HTML gets the CSP; Caddy adds nosniff in front of the app as well. */
+function sendPublicFile(res, name) {
+  let body = staticFiles.get(name);
+  if (!body) {
+    try { body = readFileSync(path.join(PUBLIC_ROOT, name)); } catch { return sendError(res, 404, SAY.notFound); }
+    staticFiles.set(name, body);
+  }
+  const extra = { 'content-type': PUBLIC_FILES[name], 'cache-control': 'no-cache', 'content-length': body.length };
+  if (name.endsWith('.html')) Object.assign(extra, { 'content-security-policy': CSP, 'x-frame-options': 'DENY' });
+  res.writeHead(200, headers(extra));
+  res.end(body);
+}
+
+/** Read a request body of at most `limit` bytes as text; 413 past it. */
+function readBody(req, limit = BODY_LIMIT) {
+  return new Promise((resolve, reject) => {
+    const tooLarge = () => new HttpError(413, `The request body is too large (${limit / 1024} KB at most).`, { connection: 'close' });
+    if (Number(req.headers['content-length']) > limit) {
+      req.resume();
+      reject(tooLarge());
+      return;
+    }
+    const chunks = [];
+    let size = 0, done = false;
+    req.on('data', (chunk) => {
+      if (done) return;
+      size += chunk.length;
+      if (size > limit) { done = true; chunks.length = 0; reject(tooLarge()); return; }
+      chunks.push(chunk);
+    });
+    req.on('end', () => { if (!done) { done = true; resolve(Buffer.concat(chunks).toString('utf8')); } });
+    req.on('error', () => { if (!done) { done = true; reject(new HttpError(400, 'The request body could not be read.')); } });
+  });
+}
+
+/**
+ * The JSON body of a POST, after the CSRF rules (§4.2): content-type application/json, which a
+ * cross-site form cannot send and a cross-site fetch can only send after a preflight we never answer,
+ * and no Sec-Fetch-Site other than same-origin or none. Origin is not checked: behind Caddy's
+ * no-referrer policy a same-origin fetch sends "Origin: null". An empty body counts as {}.
+ */
+async function readJson(req) {
+  const site = req.headers['sec-fetch-site'];
+  if (site !== undefined && site !== 'same-origin' && site !== 'none') throw new HttpError(403, 'Requests from other sites are not accepted.');
+  const type = String(req.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase();
+  if (type !== 'application/json') throw new HttpError(415, 'Send the request body as JSON (content-type: application/json).');
+  const text = await readBody(req);
+  if (!text.trim()) return {};
+  let body;
+  try { body = JSON.parse(text); } catch { throw new HttpError(400, 'The request body is not valid JSON.'); }
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) throw new HttpError(400, 'The request body must be a JSON object.');
+  return body;
+}
+
+/** The owner token from x-ring-owner matches the task's stored SHA-256 (compared in constant time). */
+function ownerOk(rec, req) {
+  const token = req.headers['x-ring-owner'];
+  if (typeof token !== 'string' || token.length < 20 || token.length > 200) return false;
+  const want = Buffer.from(rec.private?.ownerTokenSha256 ?? '', 'hex');
+  const got = createHash('sha256').update(token).digest();
+  return want.length === got.length && timingSafeEqual(want, got);
+}
+
+/** One SSE frame (§3.2). JSON.stringify never emits a raw newline, so `data` stays one line. */
+function sseFrame(type, data, seq) {
+  return `${seq === undefined ? '' : `id: ${seq}\n`}event: ${String(type).replace(/[^a-z-]/g, '')}\ndata: ${JSON.stringify(data ?? {})}\n\n`;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The app
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Build the HTTP app around its dependencies. Every dependency has a default, so a test can pass only
+ * what it fakes (usually runFix, spend and a temporary RING_STATE_DIR). `probe` is agent/probe.mjs
+ * (probeAll); `vision` is visionCheck from agent/vision.mjs, to which each task adds its own chat,
+ * tally and guard. Without them, /admin/probe answers 503 and runs skip the vision check.
+ * @param {{config?:{get():object, set(patch:object):object}, store?:TaskStore, queue?:Queue, spend?:object|null,
+ *   runFix?:Function|null, publish?:typeof publishLatest, status?:{statusData:Function, statusHtml:Function},
+ *   now?:() => number, probe?:{probeAll:Function}|null, vision?:Function|null, stats?:RunStats, log?:(line:string) => void}} deps
+ * @returns {{server: import('node:http').Server, close(): Promise<void>, store: TaskStore, queue: Queue}}
+ */
+export function createApp(deps = {}) {
+  const config = deps.config ?? configModule;
+  const now = deps.now ?? Date.now;
+  const log = deps.log ?? ((line) => console.log(line));
+  const store = deps.store ?? new TaskStore({ dir: path.join(STATE_DIR, 'tasks'), now, log });
+  const queue = deps.queue ?? new Queue({ maxRunning: config.get().maxRunning, heavySlots: HEAVY_SLOTS, maxQueued: MAX_QUEUED, log });
+  const spend = deps.spend ?? null;
+  const runFix = deps.runFix ?? null;
+  const publish = deps.publish ?? publishLatest;
+  const status = deps.status ?? statusModule;
+  const probe = deps.probe ?? null;
+  const vision = deps.vision ?? null;
+  const stats = deps.stats ?? new RunStats(path.join(STATE_DIR, 'stats.json'));
+  const startedAt = now();
+  const streams = new Set();       // open SSE responses
+  const streamsByKey = new Map();  // client key -> number of open SSE responses
+  const announced = new Map();     // queued task -> position last sent
+  let closing = null;
+
+  const journal = (id, text) => log(`task=${id} ${oneLine(text, 400)}`);
+  const emit = (id, type, data) => store.appendEvent(id, type, data);
+
+  // --- queue, ETA, task life cycle -------------------------------------------------------------
+  queue.on('change', announcePositions);
+
+  /** Tell each waiting task its new place in line. */
+  function announcePositions() {
+    const waiting = queue.queued();
+    for (const id of waiting) {
+      const position = queue.position(id);
+      if (announced.get(id) === position) continue;
+      announced.set(id, position);
+      try {
+        store.update(id, { position });
+        emit(id, 'state', { state: 'queued', position, etaSec: etaFor(id) });
+      } catch (err) {
+        log(`task=${id} position not announced: ${oneLine(err)}`);
+      }
+    }
+    for (const id of announced.keys()) if (!waiting.includes(id)) announced.delete(id);
+  }
+
+  const elapsedSec = (id) => {
+    const t = Date.parse(store.get(id)?.startedAt ?? '');
+    return Number.isFinite(t) ? (now() - t) / 1000 : 0;
+  };
+  /** Seconds until a slot frees when every slot is busy (the running task closest to its median end). */
+  const slotFreeIn = (median) => {
+    const running = queue.running();
+    if (running.length < queue.maxRunning) return 0;
+    return Math.min(...running.map((id) => Math.max(0, median - elapsedSec(id))));
+  };
+  /** §4.4: ceil(position / maxRunning) × median + time until a slot frees. null without history. */
+  function etaFor(id) {
+    const median = stats.median();
+    const pos = queue.position(id);
+    if (median === null || pos === null) return null;
+    if (pos === 0) return Math.max(0, Math.round(median - elapsedSec(id)));
+    return Math.round(Math.ceil(pos / Math.max(1, queue.maxRunning)) * median + slotFreeIn(median));
+  }
+  /** ETA for a run submitted now (shown on /status). */
+  function etaForNew() {
+    const median = stats.median();
+    if (median === null) return null;
+    const pos = queue.queued().length + 1;
+    if (queue.queued().length === 0 && queue.running().length < queue.maxRunning) return Math.round(median);
+    return Math.round(Math.ceil(pos / Math.max(1, queue.maxRunning)) * median + slotFreeIn(median));
+  }
+
+  function createTask(origin, spec, key) {
+    const id = `t_${randomBytes(16).toString('hex')}`;
+    const ownerToken = randomBytes(32).toString('base64url');
+    store.create({
+      id, origin, label: spec.label, state: 'queued',
+      source: spec.source, matrix: spec.matrix, model: spec.model, sampling: spec.sampling,
+      visionModel: spec.visionModel, gate: spec.gate, caps: spec.caps,
+      position: null, step: 'queue', stepTimes: {}, sandbox: null, result: null,
+      startedAt: null, finishedAt: null, approvedAt: null, publishedAt: null,
+      private: { ipKey: key, ownerTokenSha256: sha256(ownerToken) },
+    });
+    emit(id, 'step', { step: 'queue', status: 'start' });
+    journal(id, `created origin=${origin} source=${spec.source.kind}:${spec.source.label} model=${spec.model} gate=${spec.gate ? 'on' : 'off'}${spec.label ? ` label=${spec.label}` : ''}`);
+    try {
+      queue.enqueue(id, { priority: spec.priority, run: (signal) => runOne(id, signal) });
+    } catch (err) {
+      endTask(id, { state: 'cancelled', error: 'The demo was too busy to queue this run.' });
+      if (err instanceof QueueFullError) throw new HttpError(503, SAY.busy);
+      throw err;
+    }
+    return { id, ownerToken, position: queue.position(id) };
+  }
+
+  /** The task as runFix takes it (§1.7): a sample gets its host folder back from the allowlist. */
+  function fixTask(rec) {
+    const s = rec.source;
+    let source;
+    if (s.kind === 'sample') {
+      if (!Object.hasOwn(SAMPLES, s.name)) throw new RunError('That sample is no longer available on this server.');
+      source = { kind: 'sample', name: s.name, dir: SAMPLES[s.name].dir, label: s.label };
+    } else {
+      source = { kind: 'github', owner: s.owner, name: s.name, label: s.label };
+    }
+    return { id: rec.id, source, matrix: rec.matrix, model: rec.model, sampling: rec.sampling, visionModel: rec.visionModel, gate: rec.gate, caps: rec.caps };
+  }
+
+  /** Events from the loop: stored and streamed; `step` also updates the record. `done` is the app's own. */
+  function loopEvent(id, type, data) {
+    if (typeof type !== 'string' || !/^[a-z]{1,20}$/.test(type)) { journal(id, 'an event with an invalid type was dropped'); return; }
+    if (type === 'done') return;   // sent by endTask, once the record holds the final state
+    try {
+      emit(id, type, data ?? {});
+      if (type === 'step' && typeof data?.step === 'string') {
+        const patch = {};
+        if (data.status === 'start') patch.step = data.step;
+        if (Number.isFinite(data.ms)) patch.stepTimes = { ...store.get(id).stepTimes, [data.step]: data.ms };
+        if (Object.keys(patch).length) store.update(id, patch);
+      }
+    } catch (err) {
+      journal(id, `event ${type} not stored: ${oneLine(err)}`);
+    }
+  }
+
+  function callRunFix(rec, signal) {
+    if (typeof runFix !== 'function') throw new RunError('The agent loop is not installed on this server yet.');
+    if (!spend) throw new RunError('The spend ledger is not available, so the run could not start.');
+    const id = rec.id;
+    const task = fixTask(rec);
+    const tally = newTally();
+    const guard = spend.guardFor({ id, origin: rec.origin, caps: rec.caps });
+    // The vision model gets its own sampling from modelSampling (§4.9), not the fix model's.
+    const visionSampling = rec.visionModel ? samplingFor(rec.visionModel, config.get(), { bench: rec.origin === 'admin' }) : {};
+    return runFix(task, {
+      chat,
+      createSandbox: async (o) => {
+        const box = await Sandbox.create(o);
+        store.update(id, { sandbox: { name: box.name, runtime: o?.runtime ?? 'runc' } });
+        return box;
+      },
+      emit: (type, data) => loopEvent(id, type, data),
+      store: {
+        put: async (name, data) => store.put(id, name, data),
+        append: async (name, data) => store.append(id, name, data),
+      },
+      guard, tally, signal,
+      runtime: RUNTIME,
+      heavy: queue.heavy,
+      // visionCheck with this task's model client, tally and spend guard; the loop's input cannot replace them.
+      vision: rec.visionModel && vision ? (input) => vision({ ...input, sampling: visionSampling, chat, tally, guard }) : null,
+      // The loop starts its own lines with task=<id>.
+      log: (line) => (String(line).startsWith('task=') ? log(oneLine(line, 400)) : journal(id, line)),
+    });
+  }
+
+  /** Run one task from the queue: runFix, then the final state, the stats and the `done` event. */
+  async function runOne(id, signal) {
+    const rec = store.get(id);
+    if (!rec) return;
+    const t0 = now();
+    store.update(id, { state: 'running', position: 0, startedAt: iso(t0), step: 'clone' });
+    emit(id, 'state', { state: 'running' });
+    emit(id, 'step', { step: 'queue', status: 'done', ms: Math.max(0, t0 - Date.parse(rec.createdAt)) });
+    journal(id, 'start');
+    let result;
+    try {
+      result = await callRunFix(rec, signal);
+    } catch (err) {
+      journal(id, `runFix threw: ${oneLine(err?.stack ?? err, 300)}`);
+      result = { status: 'failed', receipt: null, error: err instanceof RunError ? err.message : 'The run stopped because of an internal error.' };
+    }
+    let state = ['done', 'failed', 'timeout', 'cancelled'].includes(result?.status) ? result.status : 'failed';
+    if (state === 'cancelled' && signal.reason === 'shutdown') state = 'interrupted';
+    if (state === 'done') stats.add({ id, kind: rec.source.kind, sec: Math.round((now() - t0) / 100) / 10, at: iso(now()) });
+    endTask(id, { state, receipt: result?.receipt ?? null, error: errorText(state, result?.error) });
+  }
+
+  function errorText(state, err) {
+    if (state === 'done') return null;
+    if (state === 'interrupted') return INTERRUPTED;
+    if (state === 'timeout') return 'The run reached its time limit and was stopped. Nothing was changed.';
+    if (state === 'cancelled') return 'This run was cancelled.';
+    return oneLine(err || 'The run failed before any change was made.', 300);
+  }
+
+  /** Final state of a task: the record first, then `state`, Approve waiting (if there is a patch), `done`. */
+  function endTask(id, { state, receipt = null, error = null }) {
+    const rec = store.get(id);
+    if (!rec) return;
+    const patch = { state, position: null, finishedAt: iso(now()), result: { status: state, verdict: receipt?.verdict ?? null, line: receipt?.line ?? null, error } };
+    if (receipt?.containment?.sandbox) patch.sandbox = { name: receipt.containment.sandbox, runtime: receipt.containment.runtime ?? rec.sandbox?.runtime ?? null };
+    store.update(id, patch);
+    emit(id, 'state', { state });
+    if (state === 'done' && store.size(id, 'patch.diff') > 0) emit(id, 'step', { step: 'approve', status: 'start', note: 'waiting for the owner to review the patch' });
+    emit(id, 'done', error ? { status: state, error } : { status: state });
+    journal(id, `end state=${state}${receipt ? ` verdict=${receipt.verdict} "${receipt.line}"` : ''}${error ? ` error="${error}"` : ''}`);
+  }
+
+  function cancelTask(rec, who) {
+    if (FINISHED.has(rec.state)) throw new HttpError(409, 'This run has already finished.');
+    const was = queue.cancel(rec.id, 'cancelled');
+    journal(rec.id, `cancel requested ${who} (${was ?? 'not in the queue'})`);
+    // A running task ends once runFix sees the abort and its sandbox is gone; runOne then ends it.
+    if (was === 'running') return { id: rec.id, state: 'cancelling' };
+    endTask(rec.id, { state: 'cancelled', error: 'This run was cancelled.' });
+    return { id: rec.id, state: 'cancelled' };
+  }
+
+  // --- reading a task --------------------------------------------------------------------------
+  function readReceipt(id) {
+    const size = store.size(id, 'receipt.json');
+    if (size <= 0 || size > 8 * 2 ** 20) return null;
+    try { return JSON.parse(readFileSync(store.file(id, 'receipt.json'), 'utf8')); } catch { return null; }
+  }
+
+  /** The first DIFF_SHOWN_BYTES of patch.diff, for review on the task page (shown with textContent). */
+  function readDiff(id) {
+    const size = store.size(id, 'patch.diff');
+    if (size <= 0) return null;
+    const fd = openSync(store.file(id, 'patch.diff'), 'r');
+    try {
+      const buf = Buffer.alloc(Math.min(size, DIFF_SHOWN_BYTES));
+      const n = readSync(fd, buf, 0, buf.length, 0);
+      return { text: buf.subarray(0, n).toString('utf8'), bytes: size, truncated: size > n };
+    } finally {
+      closeSync(fd);
+    }
+  }
+
+  /** The public record (§3.1): never private.*, caps, label or sampling. With `full`, the receipt and the diff. */
+  function publicView(rec, { full = false } = {}) {
+    const out = { provider: PROVIDER };
+    for (const k of PUBLIC_KEYS) out[k] = rec[k] ?? null;
+    const m = rec.matrix ?? {};
+    out.cells = ['routes', 'viewports', 'schemes', 'locales'].reduce((n, k) => n * (Array.isArray(m[k]) ? m[k].length : 1), 1);
+    if (rec.state === 'queued' || rec.state === 'running') {
+      out.position = queue.position(rec.id) ?? rec.position ?? null;
+      out.etaSec = etaFor(rec.id);
+    }
+    out.hasPatch = rec.state === 'done' && store.size(rec.id, 'patch.diff') > 0;
+    out.files = store.names(rec.id, TASK_IMAGE);
+    if (full && FINISHED.has(rec.state)) {
+      out.receipt = readReceipt(rec.id);
+      out.diff = out.hasPatch ? readDiff(rec.id) : null;
+    }
+    return out;
+  }
+
+  function taskOr404(id) {
+    const rec = store.get(id);
+    if (!rec) throw new HttpError(404, SAY.noTask);
+    return rec;
+  }
+
+  function statusNow() {
+    return status.statusData({ cfg: config.get(), queue, spend, startedAt, now, runtime: RUNTIME, etaSec: etaForNew() });
+  }
+
+  // --- public routes (§4.2) --------------------------------------------------------------------
+  async function createPublicTask(c) {
+    if (!config.get().publicRuns) return sendError(c.res, 503, SAY.closed);   // D-5
+    const body = await readJson(c.req);
+    if (closing) throw new HttpError(503, SAY.restarting);
+    const ip = clientIp(c.req);
+    const key = ipKey(ip);
+    // A sandbox that reaches Caddy through the bridge gateway arrives from a private address.
+    if (!key || isLocalIp(ip)) throw new HttpError(403, SAY.local);
+    let spec;
+    try {
+      spec = taskFromBody(body, { admin: false, cfg: config.get() });
+    } catch (err) {
+      if (err instanceof TaskInputError) throw new HttpError(400, err.message);
+      throw err;
+    }
+    checkIpLimits(key);
+    if (queue.full()) throw new HttpError(503, SAY.busy);
+    if (!spend) throw new HttpError(503, SAY.paused);
+    const can = spend.canStart('public', { maxUsd: spec.caps.maxUsd });
+    if (!can.ok) {
+      log(`public run refused by the budget: ${can.reason}`);
+      throw new HttpError(503, can.scope === 'total' ? SAY.budgetTotal : SAY.budgetDay);
+    }
+    const t = createTask('public', spec, key);
+    sendJson(c.res, 202, { id: t.id, ownerToken: t.ownerToken, position: t.position, etaSec: etaFor(t.id) });
+  }
+
+  /** §4.4: one queued or running task per network, 3 starts per rolling hour, 8 per UTC day. */
+  function checkIpLimits(key) {
+    const t = now();
+    const mine = store.list({ origin: 'public' }).filter((r) => r.private?.ipKey === key);
+    if (mine.some((r) => r.state === 'queued' || r.state === 'running')) throw new HttpError(429, SAY.active);
+    const hour = mine.map((r) => Date.parse(r.createdAt)).filter((ms) => t - ms < 3_600_000).sort((a, b) => a - b);
+    if (hour.length >= PER_IP.hour) {
+      const wait = Math.ceil((hour[hour.length - PER_IP.hour] + 3_600_000 - t) / 1000);
+      throw new HttpError(429, SAY.hour, { 'retry-after': String(Math.max(1, wait)) });
+    }
+    const day = iso(t).slice(0, 10);
+    if (mine.filter((r) => String(r.createdAt).slice(0, 10) === day).length >= PER_IP.day) {
+      const wait = Math.ceil((Date.parse(`${day}T00:00:00Z`) + 86_400_000 - t) / 1000);
+      throw new HttpError(429, SAY.day, { 'retry-after': String(Math.max(1, wait)) });
+    }
+  }
+
+  function streamEvents(c) {
+    const id = c.m[1];
+    const rec = taskOr404(id);
+    const key = c.admin ? 'admin' : ipKey(clientIp(c.req)) ?? 'unknown';
+    if (streams.size >= SSE.total) throw new HttpError(503, 'Too many live views are open right now. Please try again in a minute.');
+    if ((streamsByKey.get(key) ?? 0) >= SSE.perIp) throw new HttpError(429, 'Too many live views are open from this network. Close one and try again.');
+    const after = Math.max(0, Number.parseInt(c.req.headers['last-event-id'] ?? c.url.searchParams.get('after') ?? '0', 10) || 0);
+    const res = c.res;
+    res.writeHead(200, headers({ 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-store', 'x-accel-buffering': 'no' }));
+    if (c.req.method === 'HEAD') { res.end(); return; }
+    streams.add(res);
+    streamsByKey.set(key, (streamsByKey.get(key) ?? 0) + 1);
+    let closed = false, unsubscribe = null, timer = null;
+    const close = () => {
+      if (closed) return;
+      closed = true;
+      unsubscribe?.();
+      clearInterval(timer);
+      streams.delete(res);
+      const n = (streamsByKey.get(key) ?? 1) - 1;
+      if (n > 0) streamsByKey.set(key, n); else streamsByKey.delete(key);
+      if (!res.writableEnded && !res.destroyed) res.end();
+    };
+    const write = (text) => { if (!closed && !res.destroyed) res.write(text); };
+    // Live events: a reader that stops reading is dropped before its buffer grows past 1 MB.
+    const send = (ev) => {
+      write(sseFrame(ev.type, ev.data, ev.seq));
+      if (ev.type === 'done') close();
+      else if (res.writableLength > SSE.maxBuffer) { log(`task=${id} a live view that does not keep up was closed`); close(); res.destroy(); }
+    };
+    res.on('error', () => {});
+    res.on('close', close);
+    write('retry: 3000\n\n');
+    write(sseFrame('hello', { task: publicView(rec) }));
+    // Replay, then subscribe, in the same tick: appendEvent is synchronous, so nothing falls in between.
+    for (const ev of store.events(id, after)) {
+      send(ev);
+      if (closed) return;
+    }
+    unsubscribe = store.subscribe(id, send);
+    timer = setInterval(() => write(': ping\n\n'), SSE.heartbeatMs);
+    timer.unref();
+  }
+
+  function sendTaskFile(c, id, name, type, extra = {}) {
+    const size = store.size(id, name);
+    if (size <= 0) throw new HttpError(404, 'That file does not exist for this run.');
+    c.res.writeHead(200, headers({ 'content-type': type, 'content-length': size, ...extra }));
+    if (c.req.method === 'HEAD') { c.res.end(); return; }
+    createReadStream(store.file(id, name)).on('error', () => c.res.destroy()).pipe(c.res);
+  }
+
+  async function approveTask(c) {
+    await readJson(c.req);
+    const rec = taskOr404(c.m[1]);
+    // The admin channel holds every owner token it created, so approval must come through Caddy:
+    // admin calls can never approve (§0.4).
+    if (c.admin) throw new HttpError(403, "Approval must come from the owner's browser, not from the admin channel.");
+    if (!ownerOk(rec, c.req)) throw new HttpError(403, SAY.owner);
+    if (rec.state !== 'done' || store.size(rec.id, 'patch.diff') <= 0) throw new HttpError(403, 'Only a finished run with a patch can be approved.');
+    let approvedAt = rec.approvedAt;
+    if (!approvedAt) {
+      approvedAt = iso(now());
+      store.update(rec.id, { approvedAt });
+      emit(rec.id, 'step', { step: 'approve', status: 'done', note: 'approved by the owner' });
+      journal(rec.id, 'approved by the owner');
+    }
+    sendJson(c.res, 200, { id: rec.id, approvedAt });
+  }
+
+  function downloadPatch(c) {
+    const rec = taskOr404(c.m[1]);
+    if (!ownerOk(rec, c.req) || !rec.approvedAt) throw new HttpError(403, 'The owner can download the patch after approving the run.');
+    sendTaskFile(c, rec.id, 'patch.diff', 'text/x-diff; charset=utf-8', { 'content-disposition': `attachment; filename="${rec.id}.patch"`, 'cache-control': 'no-store' });
+  }
+
+  async function cancelOwnTask(c) {
+    await readJson(c.req);
+    const rec = taskOr404(c.m[1]);
+    if (!ownerOk(rec, c.req)) throw new HttpError(403, SAY.owner);
+    sendJson(c.res, 200, cancelTask(rec, 'by its owner'));
+  }
+
+  // --- admin routes (§4.3) ---------------------------------------------------------------------
+  async function adminHealth(c) {
+    const h = await statusModule.healthData({ runtime: RUNTIME });
+    sendJson(c.res, 200, {
+      running: queue.running().length, queued: queue.queued().length, docker: h.docker, proxy: h.proxy,
+      runtime: RUNTIME ?? 'runc', runtimeAvailable: h.runtimeAvailable, sandboxes: h.sandboxes,
+      loop: typeof runFix === 'function', spend: !!spend, probe: !!probe, vision: !!vision,
+    });
+  }
+
+  async function adminCreate(c) {
+    const body = await readJson(c.req);
+    if (closing) throw new HttpError(503, SAY.restarting);
+    let spec;
+    try {
+      spec = taskFromBody(body, { admin: true, cfg: config.get() });
+    } catch (err) {
+      if (err instanceof TaskInputError) throw new HttpError(400, err.message);
+      throw err;
+    }
+    if (queue.full()) throw new HttpError(503, SAY.busy);
+    if (!spend) throw new HttpError(503, 'The spend ledger is not loaded, so no run can start.');
+    const can = spend.canStart('admin', { maxUsd: spec.caps.maxUsd });
+    if (!can.ok) throw new HttpError(503, can.reason);
+    const t = createTask('admin', spec, 'admin');
+    sendJson(c.res, 202, { id: t.id, ownerToken: t.ownerToken, ownerLink: `${PUBLIC_URL}/t/${t.id}#owner=${t.ownerToken}`, position: t.position });
+  }
+
+  function adminList(c) {
+    const state = c.url.searchParams.get('state') || undefined;
+    const label = c.url.searchParams.get('label') || undefined;
+    sendJson(c.res, 200, store.list({ state, label }));
+  }
+
+  function adminGet(c) {
+    const rec = taskOr404(c.m[1]);
+    sendJson(c.res, 200, { ...rec, receipt: readReceipt(rec.id), hasPatch: store.size(rec.id, 'patch.diff') > 0, files: store.names(rec.id, /^[a-z0-9][a-z0-9_.-]*$/) });
+  }
+
+  function adminTranscript(c) {
+    const rec = taskOr404(c.m[1]);
+    sendTaskFile(c, rec.id, 'transcript.jsonl', 'application/x-ndjson; charset=utf-8', { 'cache-control': 'no-store' });
+  }
+
+  /** Every file of a task as a tar stream: the host's own tar over files the app wrote itself. */
+  function adminBundle(c) {
+    const rec = taskOr404(c.m[1]);
+    const res = c.res;
+    const tar = spawn('tar', ['-C', store.dir(rec.id), '-cf', '-', '.'], { env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = '';
+    tar.stderr.setEncoding('utf8').on('data', (d) => { stderr = (stderr + d).slice(-500); });
+    tar.on('error', (err) => { log(`bundle ${rec.id}: tar did not start: ${oneLine(err)}`); res.destroy(); });
+    tar.on('close', (code) => {
+      // A truncated tar must not look complete: on failure the connection is cut instead of ended.
+      if (code !== 0) { log(`bundle ${rec.id}: tar exit ${code}: ${oneLine(stderr, 200)}`); res.destroy(); }
+    });
+    res.on('close', () => { if (tar.exitCode === null) tar.kill('SIGKILL'); });
+    res.writeHead(200, headers({ 'content-type': 'application/x-tar', 'content-disposition': `attachment; filename="${rec.id}.tar"`, 'cache-control': 'no-store' }));
+    tar.stdout.pipe(res);
+  }
+
+  async function adminCancel(c) {
+    await readJson(c.req);
+    sendJson(c.res, 200, cancelTask(taskOr404(c.m[1]), 'by the admin'));
+  }
+
+  async function adminPublish(c) {
+    await readJson(c.req);
+    const rec = taskOr404(c.m[1]);
+    const receipt = readReceipt(rec.id);
+    const why = notPublishable(rec, receipt);
+    if (why) throw new HttpError(409, `Not published: ${why}.`);
+    const files = {};
+    for (const name of ['proof.png', 'contact-before.png', 'contact-after.png', 'patch.diff']) {
+      if (store.size(rec.id, name) > 0) files[name] = store.file(rec.id, name);
+    }
+    let out;
+    try {
+      out = await publish({ task: publicView(rec), receipt, files, publicDir: PUBLIC_DIR });
+    } catch (err) {
+      if (err instanceof PublishError) throw new HttpError(409, `Not published: ${err.message}.`);
+      throw err;
+    }
+    const at = iso(now());
+    store.update(rec.id, { publishedAt: at });
+    const latest = path.join(STATE_DIR, 'latest.json');
+    writeFileSync(`${latest}.tmp`, `${JSON.stringify({ taskId: rec.id, at, line: receipt.line ?? null })}\n`, { mode: 0o640 });
+    renameSync(`${latest}.tmp`, latest);
+    journal(rec.id, `published to ${out.url}${rec.approvedAt ? '' : ' (not approved)'}`);
+    sendJson(c.res, 200, { id: rec.id, url: out.url, dir: out.dir, publishedAt: at, approvedAt: rec.approvedAt });
+  }
+
+  async function adminProbe(c) {
+    const body = await readJson(c.req);
+    if (!probe?.probeAll) throw new HttpError(503, 'agent/probe.mjs is not loaded on this server (see the startup log).');
+    if (!spend) throw new HttpError(503, 'The spend ledger is not loaded, so no model can be called.');
+    const can = spend.canStart('admin', { maxUsd: PROBE_CAPS.maxUsd });
+    if (!can.ok) throw new HttpError(503, can.reason);
+    const tally = newTally();
+    const guard = spend.guardFor({ id: `probe-${now()}`, origin: 'admin', caps: PROBE_CAPS });
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort('timeout'), PROBE_TIMEOUT_MS);
+    c.res.on('close', () => { if (!c.res.writableEnded) ac.abort('the caller left'); });
+    try {
+      const results = await probe.probeAll({ models: body.models ?? [], vision: body.vision ?? [] }, { tally, guard, signal: ac.signal });
+      log(`probe: ${results.map((r) => `${r.model}${r.kind === 'vision' ? ' (vision)' : ''} ${r.ok ? 'ok' : 'FAIL'}`).join(', ') || 'nothing to probe'}`);
+      sendJson(c.res, 200, results);
+    } catch (err) {
+      if (err instanceof TypeError) throw new HttpError(400, `${err.message}.`);
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function adminSetConfig(c) {
+    const body = await readJson(c.req);
+    let cfg;
+    try {
+      cfg = config.set(body);
+    } catch (err) {
+      if (err instanceof ConfigError) throw new HttpError(400, `${err.message}.`);
+      throw err;
+    }
+    queue.setMaxRunning(cfg.maxRunning);
+    try {
+      spend?.setCaps?.(cfg.spendCaps);
+    } catch (err) {
+      log(`config: the spend caps were saved but not applied: ${oneLine(err)}`);
+    }
+    log(`config: changed ${Object.keys(body).join(', ')}`);
+    sendJson(c.res, 200, cfg);
+  }
+
+  function adminSpend(c) {
+    if (!spend) throw new HttpError(503, 'The spend ledger is not loaded.');
+    sendJson(c.res, 200, { today: spend.today(), totalUsd: spend.total(), caps: spend.caps, rows: spend.breakdown() });
+  }
+
+  /**
+   * Run one test suite with no task running (§4.3): an exclusive queue lock, then the suite as a child
+   * process with childEnv only (no API key at all), its output streamed back as text. 20 minutes at most.
+   */
+  async function adminSelftest(c) {
+    const body = await readJson(c.req);
+    const suite = body.suite;
+    if (!SELFTEST_SUITES.includes(suite)) throw new HttpError(400, `suite must be one of: ${SELFTEST_SUITES.join(', ')}.`);
+    const file = path.join(REPO_ROOT, 'test', `${suite}.mjs`);
+    if (!existsSync(file)) throw new HttpError(404, `test/${suite}.mjs is not deployed.`);
+    const res = c.res;
+    res.writeHead(200, headers({ 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store', 'x-accel-buffering': 'no' }));
+    res.on('error', () => {});
+    const say = (text) => { if (!res.writableEnded && !res.destroyed) res.write(text); };
+    say(`selftest ${suite}: waiting until no task is running (new tasks wait too)\n`);
+    const release = await queue.pauseForExclusive();
+    if (res.destroyed) {
+      release();
+      log(`selftest ${suite}: the caller left before it started; not run`);
+      return;
+    }
+    log(`selftest ${suite}: started`);
+    say(`selftest ${suite}: started, runtime ${RUNTIME ?? 'runc'}\n`);
+    let finished = false, killTimer = null;
+    const child = spawn(process.execPath, [file], { cwd: os.homedir(), env: childEnv({ RING_RUNTIME: RUNTIME }), stdio: ['ignore', 'pipe', 'pipe'] });
+    const timer = setTimeout(() => {
+      say(`\nselftest ${suite}: still running after 20 minutes; stopping it\n`);
+      child.kill('SIGTERM');
+      killTimer = setTimeout(() => child.kill('SIGKILL'), 10_000);
+    }, SELFTEST_TIMEOUT_MS);
+    const finish = (how) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      clearTimeout(killTimer);
+      release();
+      log(`selftest ${suite}: ${how}`);
+      say(`\nselftest ${suite}: ${how}\n`);
+      if (!res.writableEnded && !res.destroyed) res.end();
+    };
+    child.stdout.setEncoding('utf8').on('data', say);
+    child.stderr.setEncoding('utf8').on('data', say);
+    child.on('error', (err) => finish(`could not start: ${oneLine(err)}`));
+    child.on('close', (code, signal) => finish(`exit ${code ?? signal}`));
+  }
+
+  // --- routing ---------------------------------------------------------------------------------
+  const ID = 't_[0-9a-f]{32}';
+  const PUBLIC = [
+    ['GET', new RegExp(`^/(?:t/${ID})?$`), (c) => sendPublicFile(c.res, 'index.html')],
+    ['GET', /^\/(app\.js|app\.css|favicon\.svg)$/, (c) => sendPublicFile(c.res, c.m[1])],
+    ['GET', /^\/status$/, async (c) => sendHtml(c.res, status.statusHtml(await statusNow()))],
+    ['GET', /^\/status\.json$/, async (c) => sendJson(c.res, 200, await statusNow())],
+    ['GET', /^\/api\/config$/, (c) => {
+      const cfg = config.get();
+      const etaText = stats.count('sample') >= 3 ? `about ${Math.max(1, Math.round(stats.median('sample') / 60))} min` : 'a few minutes';
+      sendJson(c.res, 200, {
+        publicRuns: cfg.publicRuns, provider: PROVIDER, fixModel: cfg.fixModel, visionModel: cfg.visionModel,
+        samples: Object.entries(SAMPLES).map(([id, s]) => ({ id, label: s.label, etaText })),
+      });
+    }],
+    ['POST', /^\/api\/tasks$/, createPublicTask],
+    ['GET', new RegExp(`^/api/tasks/(${ID})$`), (c) => sendJson(c.res, 200, publicView(taskOr404(c.m[1]), { full: true }))],
+    ['GET', new RegExp(`^/api/tasks/(${ID})/events$`), streamEvents],
+    ['GET', new RegExp(`^/api/tasks/(${ID})/files/([a-z0-9-]+\\.png)$`), (c) => {
+      const rec = taskOr404(c.m[1]);
+      if (!TASK_IMAGE.test(c.m[2]) || store.size(rec.id, c.m[2]) > 20 * 2 ** 20) throw new HttpError(404, SAY.notFound);
+      sendTaskFile(c, rec.id, c.m[2], 'image/png', { 'cache-control': 'private, max-age=3600' });
+    }],
+    ['POST', new RegExp(`^/api/tasks/(${ID})/approve$`), approveTask],
+    ['GET', new RegExp(`^/api/tasks/(${ID})/patch$`), downloadPatch],
+    ['POST', new RegExp(`^/api/tasks/(${ID})/cancel$`), cancelOwnTask],
+  ];
+  const ADMIN = [
+    ['GET', /^\/admin\/health$/, adminHealth],
+    ['GET', /^\/admin\/tasks$/, adminList],
+    ['POST', /^\/admin\/tasks$/, adminCreate],
+    ['GET', new RegExp(`^/admin/tasks/(${ID})$`), adminGet],
+    ['GET', new RegExp(`^/admin/tasks/(${ID})/transcript$`), adminTranscript],
+    ['GET', new RegExp(`^/admin/tasks/(${ID})/bundle$`), adminBundle],
+    ['POST', new RegExp(`^/admin/tasks/(${ID})/cancel$`), adminCancel],
+    ['POST', new RegExp(`^/admin/publish/(${ID})$`), adminPublish],
+    ['POST', /^\/admin\/probe$/, adminProbe],
+    ['GET', /^\/admin\/config$/, (c) => sendJson(c.res, 200, config.get())],
+    ['POST', /^\/admin\/config$/, adminSetConfig],
+    ['GET', /^\/admin\/spend$/, adminSpend],
+    ['POST', /^\/admin\/selftest$/, adminSelftest],
+  ];
+
+  function dispatch(routes, c) {
+    let allow = null;
+    for (const [method, re, fn] of routes) {
+      const m = re.exec(c.path);
+      if (!m) continue;
+      if (method === c.method) { c.m = m; return fn(c); }
+      allow = allow ? `${allow}, ${method}` : method;
+    }
+    if (allow) return sendError(c.res, 405, 'That method is not allowed here.', { allow });
+    return sendError(c.res, 404, SAY.notFound);
+  }
+
+  async function handle(req, res) {
+    const raw = req.url ?? '';
+    let url = null;
+    // Parsed against a fixed origin, so "//host/x" stays a path and never becomes a host name.
+    if (raw.startsWith('/')) url = URL.parse(`http://ring.invalid${raw}`);
+    if (!url) return sendError(res, 400, 'That address is not valid.');
+    const c = { req, res, url, path: url.pathname, method: req.method === 'HEAD' ? 'GET' : req.method, admin: isAdmin(req), m: null };
+    if (c.path === '/admin' || c.path.startsWith('/admin/')) {
+      if (!c.admin) return sendError(res, 404, SAY.notFound);   // exactly what an unknown path gets
+      return dispatch(ADMIN, c);
+    }
+    return dispatch(PUBLIC, c);
+  }
+
+  function failed(req, res, err) {
+    if (err instanceof HttpError) {
+      if (res.headersSent) { res.destroy(); return; }
+      sendError(res, err.status, err.message, err.headers);
+      return;
+    }
+    log(`request ${req.method} ${oneLine(req.url, 120)} failed: ${oneLine(err?.stack ?? err, 400)}`);
+    if (res.headersSent) { res.destroy(); return; }
+    sendError(res, 500, SAY.internal);
+  }
+
+  const server = http.createServer((req, res) => {
+    handle(req, res).catch((err) => failed(req, res, err));
+  });
+  server.keepAliveTimeout = 125_000;
+  server.headersTimeout = 126_000;
+
+  /**
+   * Stop taking work, interrupt waiting tasks, abort running ones (each loop destroys its own sandbox)
+   * and wait up to `waitMs` for them, then close every connection.
+   */
+  function close({ waitMs = 15_000 } = {}) {
+    closing ??= (async () => {
+      for (const id of queue.abortAll('shutdown')) endTask(id, { state: 'interrupted', error: INTERRUPTED });
+      for (const res of [...streams]) if (!res.writableEnded && !res.destroyed) res.end();
+      server.close();
+      server.closeIdleConnections();
+      await Promise.race([queue.idle(), delay(waitMs)]);
+      server.closeAllConnections();
+    })();
+    return closing;
+  }
+
+  return { server, close, store, queue };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Running as the service (§4.10)
+// ---------------------------------------------------------------------------------------------
+async function optional(spec, log) {
+  try {
+    return await import(spec);
+  } catch (err) {
+    log(`startup: ${spec} not loaded: ${oneLine(err, 300)}`);
+    return null;
+  }
+}
+
+async function removeAppSandboxes(when, log) {
+  try {
+    log(`${when}: removed ${await Sandbox.removeAll(APP_LABEL)} sandbox container(s) labelled ${APP_LABEL}`);
+  } catch (err) {
+    log(`${when}: could not remove the app's sandboxes: ${oneLine(err, 300)}`);
+  }
+}
+
+async function main() {
+  const log = (line) => console.log(oneLine(line, 1000));
+  const fatal = (what) => (err) => {
+    console.error(`fatal: ${what}: ${oneLine(err?.stack ?? err, 800)}`);
+    process.exit(1);   // systemd restarts the app after 3 s; startup removes orphan sandboxes
+  };
+  process.on('uncaughtException', fatal('uncaught exception'));
+  process.on('unhandledRejection', fatal('unhandled rejection'));
+
+  // 1. Sandboxes left by a crash or a restart: the app's label only, never a self-test's (§0.5 #9).
+  await removeAppSandboxes('startup', log);
+  // 2. Tasks that a previous process left queued or running.
+  const store = new TaskStore({ dir: path.join(STATE_DIR, 'tasks'), log });
+  const interrupted = store.load();
+  if (interrupted.length) log(`startup: ${interrupted.length} task(s) left by the previous process are now interrupted`);
+  const pruned = store.prune();
+  if (pruned) log(`startup: removed ${pruned} task(s) past retention`);
+  // 3. Settings and the spend ledger.
+  const cfg = configModule.get();
+  let spend = null;
+  try {
+    spend = new Spend({ dir: STATE_DIR, caps: cfg.spendCaps, log });
+  } catch (err) {
+    log(`startup: the spend ledger is not loaded, so no run can start: ${oneLine(err)}`);
+  }
+  // Parts built later tonight. The app serves its pages without them; runs fail with a plain sentence.
+  const loop = await optional('../agent/loop.mjs', log);
+  const probe = await optional('../agent/probe.mjs', log);
+  const visionModule = await optional('../agent/vision.mjs', log);
+  // 4. Can the service user drive Docker?
+  log(await statusModule.dockerVersionLine());
+
+  const app = createApp({
+    config: configModule, store, spend, log,
+    queue: new Queue({ maxRunning: cfg.maxRunning, heavySlots: HEAVY_SLOTS, maxQueued: MAX_QUEUED, log }),
+    runFix: typeof loop?.runFix === 'function' ? loop.runFix : null,
+    publish: publishLatest, status: statusModule, now: Date.now,
+    probe: typeof probe?.probeAll === 'function' ? probe : null,
+    vision: typeof visionModule?.visionCheck === 'function' ? visionModule.visionCheck : null,
+  });
+  // 5. Listen.
+  const port = Number(process.env.PORT || 8080);
+  const host = process.env.HOST || '127.0.0.1';
+  app.server.on('error', fatal('listen'));
+  app.server.listen(port, host, () => {
+    log(`listening on http://${host}:${app.server.address().port} · runtime ${RUNTIME ?? 'runc (docker default)'} · publicRuns ${cfg.publicRuns} · agent loop ${loop?.runFix ? 'loaded' : 'not installed'}`);
+  });
+  setInterval(() => {
+    const n = store.prune();
+    if (n) log(`retention: removed ${n} task(s)`);
+  }, 3_600_000).unref();
+
+  let stopping = false;
+  const stop = async (signal) => {
+    if (stopping) return;
+    stopping = true;
+    log(`shutdown: ${signal}; interrupting tasks and removing their sandboxes`);
+    setTimeout(() => { log('shutdown: not finished after 19 s; exiting anyway'); process.exit(0); }, 19_000).unref();
+    try {
+      await app.close();
+      await removeAppSandboxes('shutdown', log);
+    } catch (err) {
+      log(`shutdown: ${oneLine(err)}`);
+    }
+    process.exit(0);
+  };
+  process.on('SIGTERM', () => stop('SIGTERM'));
+  process.on('SIGINT', () => stop('SIGINT'));
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  main().catch((err) => {
+    console.error(`fatal: startup failed: ${oneLine(err?.stack ?? err, 800)}`);
+    process.exit(1);
+  });
+}
