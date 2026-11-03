@@ -1,0 +1,451 @@
+[
+  {
+    "model": "deepseek-v4.1-flash-1017",
+    "kind": "tools",
+    "ok": true,
+    "steps": [
+      {
+        "name": "p1",
+        "ok": true,
+        "status": 200,
+        "ms": 840,
+        "finishReason": "tool_calls",
+        "note": "read_file \"index.html\"; 1 tool call in the turn",
+        "tokens": {
+          "prompt": 1009,
+          "completion": 46,
+          "reasoning": 0
+        }
+      },
+      {
+        "name": "p2",
+        "ok": true,
+        "status": 200,
+        "ms": 924,
+        "finishReason": "tool_calls",
+        "note": "finish: \"The project consists of a single index.html file containing just one line, an `<h1>Hello</h1>` head…\"",
+        "tokens": {
+          "prompt": 1081,
+          "completion": 109,
+          "reasoning": 46
+        }
+      },
+      {
+        "name": "p3",
+        "ok": true,
+        "status": 200,
+        "ms": 707,
+        "finishReason": "tool_calls",
+        "note": "accepted the assistant's reasoning sent back (a stand-in text: p1 returned none); the first call is finish",
+        "tokens": {
+          "prompt": 1098,
+          "completion": 77,
+          "reasoning": 9
+        }
+      },
+      {
+        "name": "p4",
+        "ok": true,
+        "status": 200,
+        "ms": 593,
+        "finishReason": "tool_calls",
+        "note": "accepted; the first call is finish (here the model may choose it anyway: see p5)",
+        "tokens": {
+          "prompt": 1081,
+          "completion": 70,
+          "reasoning": 5
+        }
+      },
+      {
+        "name": "p5",
+        "ok": true,
+        "status": 200,
+        "ms": 660,
+        "finishReason": "tool_calls",
+        "note": "honoured: called finish although the user asked for read_file first",
+        "tokens": {
+          "prompt": 1009,
+          "completion": 62,
+          "reasoning": 0
+        }
+      }
+    ],
+    "served": "deepseek-v4.1-flash-1017",
+    "tokens": {
+      "prompt": 5278,
+      "completion": 364,
+      "reasoning": 60
+    },
+    "usd": 0.0010101
+  },
+  {
+    "model": "minimax-m3.1-flash",
+    "kind": "tools",
+    "ok": true,
+    "steps": [
+      {
+        "name": "p1",
+        "ok": true,
+        "status": 200,
+        "ms": 1025,
+        "finishReason": "tool_calls",
+        "note": "read_file \"index.html\"; 1 tool call in the turn",
+        "tokens": {
+          "prompt": 1152,
+          "completion": 29,
+          "reasoning": 0
+        }
+      },
+      {
+        "name": "p2",
+        "ok": true,
+        "status": 200,
+        "ms": 511,
+        "finishReason": "tool_calls",
+        "note": "finish: \"The project contains a single index.html file with one line of content: an <h1>Hello</h1> heading.\"",
+        "tokens": {
+          "prompt": 1212,
+          "completion": 51,
+          "reasoning": 0
+        }
+      },
+      {
+        "name": "p3",
+        "ok": true,
+        "status": 200,
+        "ms": 493,
+        "finishReason": "tool_calls",
+        "note": "accepted the assistant's reasoning sent back (a stand-in text: p1 returned none); the first call is finish",
+        "tokens": {
+          "prompt": 1230,
+          "completion": 58,
+          "reasoning": 0
+        }
+      },
+      {
+        "name": "p4",
+        "ok": true,
+        "status": 200,
+        "ms": 582,
+        "finishReason": "tool_calls",
+        "note": "accepted; the first call is finish (here the model may choose it anyway: see p5)",
+        "tokens": {
+          "prompt": 1212,
+          "completion": 46,
+          "reasoning": 0
+        }
+      },
+      {
+        "name": "p5",
+        "ok": false,
+        "status": 200,
+        "ms": 477,
+        "finishReason": "tool_calls",
+        "note": "not honoured: the first call is read_file",
+        "tokens": {
+          "prompt": 1152,
+          "completion": 35,
+          "reasoning": 0
+        }
+      }
+    ],
+    "served": "minimax-m3.1-flash",
+    "tokens": {
+      "prompt": 5958,
+      "completion": 219,
+      "reasoning": 0
+    },
+    "usd": 0.0013887
+  },
+  {
+    "model": "glm-5.3",
+    "kind": "tools",
+    "ok": true,
+    "steps": [
+      {
+        "name": "p1",
+        "ok": true,
+        "status": 200,
+        "ms": 1097,
+        "finishReason": "tool_calls",
+        "note": "read_file \"index.html\"; 1 tool call in the turn",
+        "tokens": {
+          "prompt": 869,
+          "completion": 13,
+          "reasoning": 0
+        }
+      },
+      {
+        "name": "p2",
+        "ok": true,
+        "status": 200,
+        "ms": 15555,
+        "finishReason": "tool_calls",
+        "note": "finish: \"index.html is a minimal one-line HTML file containing only an <h1>Hello</h1> heading, with no other…\"",
+        "tokens": {
+          "prompt": 902,
+          "completion": 39,
+          "reasoning": 0
+        }
+      },
+      {
+        "name": "p3",
+        "ok": true,
+        "status": 200,
+        "ms": 912,
+        "finishReason": "tool_calls",
+        "note": "accepted the assistant's reasoning sent back (a stand-in text: p1 returned none); the first call is finish",
+        "tokens": {
+          "prompt": 919,
+          "completion": 43,
+          "reasoning": 0
+        }
+      },
+      {
+        "name": "p4",
+        "ok": true,
+        "status": 200,
+        "ms": 30612,
+        "finishReason": "tool_calls",
+        "note": "accepted; the first call is finish (here the model may choose it anyway: see p5)",
+        "tokens": {
+          "prompt": 902,
+          "completion": 42,
+          "reasoning": 0
+        }
+      },
+      {
+        "name": "p5",
+        "ok": true,
+        "status": 200,
+        "ms": 734,
+        "finishReason": "tool_calls",
+        "note": "honoured: called finish although the user asked for read_file first",
+        "tokens": {
+          "prompt": 869,
+          "completion": 35,
+          "reasoning": 0
+        }
+      }
+    ],
+    "served": "glm-5.3",
+    "tokens": {
+      "prompt": 4461,
+      "completion": 172,
+      "reasoning": 0
+    },
+    "usd": 0.00386175
+  },
+  {
+    "model": "glm-5.3-flash",
+    "kind": "tools",
+    "ok": true,
+    "steps": [
+      {
+        "name": "p1",
+        "ok": true,
+        "status": 200,
+        "ms": 985,
+        "finishReason": "tool_calls",
+        "note": "read_file \"index.html\"; 1 tool call in the turn",
+        "tokens": {
+          "prompt": 869,
+          "completion": 13,
+          "reasoning": 0
+        }
+      },
+      {
+        "name": "p2",
+        "ok": true,
+        "status": 200,
+        "ms": 1051,
+        "finishReason": "tool_calls",
+        "note": "finish: \"index.html is a single-line file containing just an `<h1>Hello</h1>` heading.\"",
+        "tokens": {
+          "prompt": 902,
+          "completion": 30,
+          "reasoning": 0
+        }
+      },
+      {
+        "name": "p3",
+        "ok": true,
+        "status": 200,
+        "ms": 552,
+        "finishReason": "tool_calls",
+        "note": "accepted the assistant's reasoning sent back (a stand-in text: p1 returned none); the first call is finish",
+        "tokens": {
+          "prompt": 919,
+          "completion": 31,
+          "reasoning": 0
+        }
+      },
+      {
+        "name": "p4",
+        "ok": true,
+        "status": 200,
+        "ms": 473,
+        "finishReason": "tool_calls",
+        "note": "accepted; the first call is finish (here the model may choose it anyway: see p5)",
+        "tokens": {
+          "prompt": 902,
+          "completion": 29,
+          "reasoning": 0
+        }
+      },
+      {
+        "name": "p5",
+        "ok": true,
+        "status": 200,
+        "ms": 1295,
+        "finishReason": "tool_calls",
+        "note": "honoured: called finish although the user asked for read_file first",
+        "tokens": {
+          "prompt": 869,
+          "completion": 54,
+          "reasoning": 0
+        }
+      }
+    ],
+    "served": "glm-5.3-flash",
+    "tokens": {
+      "prompt": 4461,
+      "completion": 157,
+      "reasoning": 0
+    },
+    "usd": 0.00050105
+  },
+  {
+    "model": "qwen3.8-27b",
+    "kind": "tools",
+    "ok": true,
+    "steps": [
+      {
+        "name": "p1",
+        "ok": true,
+        "status": 200,
+        "ms": 1149,
+        "finishReason": "tool_calls",
+        "note": "read_file \"index.html\"; 1 tool call in the turn",
+        "tokens": {
+          "prompt": 1070,
+          "completion": 54,
+          "reasoning": 26
+        }
+      },
+      {
+        "name": "p2",
+        "ok": true,
+        "status": 200,
+        "ms": 628,
+        "finishReason": "tool_calls",
+        "note": "finish: \"The project's index.html is a minimal file containing only a single heading element displaying \"Hel…\"",
+        "tokens": {
+          "prompt": 1128,
+          "completion": 68,
+          "reasoning": 22
+        }
+      },
+      {
+        "name": "p3",
+        "ok": true,
+        "status": 200,
+        "ms": 599,
+        "finishReason": "tool_calls",
+        "note": "accepted the assistant's reasoning sent back; the first call is finish",
+        "tokens": {
+          "prompt": 1154,
+          "completion": 73,
+          "reasoning": 25
+        }
+      },
+      {
+        "name": "p4",
+        "ok": true,
+        "status": 200,
+        "ms": 652,
+        "finishReason": "tool_calls",
+        "note": "accepted; the first call is finish (here the model may choose it anyway: see p5)",
+        "tokens": {
+          "prompt": 1128,
+          "completion": 74,
+          "reasoning": 26
+        }
+      },
+      {
+        "name": "p5",
+        "ok": true,
+        "status": 200,
+        "ms": 607,
+        "finishReason": "tool_calls",
+        "note": "honoured: called finish although the user asked for read_file first",
+        "tokens": {
+          "prompt": 1070,
+          "completion": 64,
+          "reasoning": 28
+        }
+      }
+    ],
+    "served": "qwen3.8-27b",
+    "tokens": {
+      "prompt": 5550,
+      "completion": 333,
+      "reasoning": 127
+    },
+    "usd": 0.0011655
+  },
+  {
+    "model": "qwen3.8-27b",
+    "kind": "vision",
+    "ok": true,
+    "steps": [
+      {
+        "name": "v1",
+        "ok": true,
+        "status": 200,
+        "ms": 1692,
+        "finishReason": "stop",
+        "note": "verdict cover_up; target_visible_after false; prompt_tokens 503",
+        "tokens": {
+          "prompt": 503,
+          "completion": 236,
+          "reasoning": 161
+        }
+      }
+    ],
+    "served": "qwen3.8-27b",
+    "tokens": {
+      "prompt": 503,
+      "completion": 236,
+      "reasoning": 161
+    },
+    "usd": 0.00031145
+  },
+  {
+    "model": "deepseek-v4.1-flash-1017",
+    "kind": "vision",
+    "ok": false,
+    "steps": [
+      {
+        "name": "v1",
+        "ok": false,
+        "status": 200,
+        "ms": 5918,
+        "finishReason": "length",
+        "note": "the answer is not JSON (prompt_tokens 662): {\"verdict\":\"cover_up\",\"target_visible_after\":false,\"evidence\":\"The diff adds `#…",
+        "tokens": {
+          "prompt": 662,
+          "completion": 1024,
+          "reasoning": 43
+        }
+      }
+    ],
+    "served": "deepseek-v4.1-flash-1017",
+    "tokens": {
+      "prompt": 662,
+      "completion": 1024,
+      "reasoning": 43
+    },
+    "usd": 0.0007137
+  }
+]
