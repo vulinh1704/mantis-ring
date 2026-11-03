@@ -284,7 +284,7 @@ export async function chat(o = {}) {
   for (;;) {
     guard?.before(model, est);
     attempts++;
-    const step = await attempt({ payload, key, model, timeoutMs, signal, tally, guard });
+    const step = await attempt({ payload, key, model, est, timeoutMs, signal, tally, guard });
     if (step.ok) return { ...step.value, ms: Date.now() - started, attempts };
     const err = step.error;
     let waitMs = null;
@@ -305,8 +305,21 @@ export async function chat(o = {}) {
   }
 }
 
+/**
+ * A call that was sent but never answered (it timed out, or the caller stopped waiting) may still be
+ * billed. The spend guard records the pre-call estimate (an upper bound), so calls that never answer
+ * can never carry a task, the day or the total past its cap. The tally (the receipt's cost) is left
+ * alone: it only counts answers.
+ */
+function chargeUnanswered(guard, model, est) {
+  if (!guard || typeof est?.usd !== 'number') return;
+  try {
+    guard.after(model, { prompt_tokens: est.promptTokens, completion_tokens: est.maxCompletionTokens }, est.usd);
+  } catch { /* after() records and never throws; a broken guard must not hide the real error */ }
+}
+
 /** One HTTP attempt. Resolves {ok:true, value} or {ok:false, error, retryAfterMs}; throws only when `signal` aborts. */
-async function attempt({ payload, key, model, timeoutMs, signal, tally, guard }) {
+async function attempt({ payload, key, model, est, timeoutMs, signal, tally, guard }) {
   const timeout = AbortSignal.timeout(timeoutMs);
   const t0 = Date.now();
   let res, text;
@@ -320,6 +333,7 @@ async function attempt({ payload, key, model, timeoutMs, signal, tally, guard })
     });
     text = await res.text();
   } catch (err) {
+    if (signal?.aborted || timeout.aborted) chargeUnanswered(guard, model, est);
     if (signal?.aborted) throw abortedError(signal);
     if (timeout.aborted) return failed(new InferenceError(`${PROVIDER} did not answer within ${+(timeoutMs / 1000).toFixed(1)} s`, { retryable: true, type: 'timeout' }));
     return failed(new InferenceError(`could not reach ${PROVIDER}: ${networkReason(err)}`, { retryable: true, type: 'network' }));
@@ -341,12 +355,17 @@ async function attempt({ payload, key, model, timeoutMs, signal, tally, guard })
   }
   // The provider billed this answer, whatever comes next: record it before any check can fail.
   const served = typeof json?.model === 'string' ? json.model : null;
-  const usage = json?.usage && typeof json.usage === 'object' ? json.usage : null;
+  let usage = json?.usage && typeof json.usage === 'object' ? json.usage : null;
   const billed = served ?? model;
   const p = priceOf(billed);
-  const usd = p && Number.isFinite(usage?.prompt_tokens) && Number.isFinite(usage?.completion_tokens)
-    ? usage.prompt_tokens * p.prompt + usage.completion_tokens * p.completion
-    : null;
+  const counted = Number.isFinite(usage?.prompt_tokens) && Number.isFinite(usage?.completion_tokens);
+  let usd = p && counted ? usage.prompt_tokens * p.prompt + usage.completion_tokens * p.completion : null;
+  // A priced model that answers without usage is charged the pre-call estimate (an upper bound):
+  // the caps must fail closed, never count such a call as free.
+  if (p && !counted && typeof est?.usd === 'number') {
+    usage = { ...(usage ?? {}), prompt_tokens: est.promptTokens, completion_tokens: est.maxCompletionTokens, estimated: true };
+    usd = est.usd;
+  }
   if (tally) addToTally(tally, billed, usage, usd, Date.now() - t0);
   guard?.after(billed, usage ?? {}, usd);
 
