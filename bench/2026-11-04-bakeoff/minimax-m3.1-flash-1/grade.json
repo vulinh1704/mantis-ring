@@ -1,0 +1,116 @@
+{
+  "dir": "/home/linh/projects/mantis-ring/bench/2026-11-04-bakeoff/minimax-m3.1-flash-1",
+  "key": "/home/linh/projects/mantis/fixtures/buggy-app/PLANTED.json",
+  "r0RunId": "2026-11-03T20-46-28",
+  "rfRunId": "2026-11-03T20-46-58",
+  "bugs": [
+    {
+      "id": "promo-overflow",
+      "before": true,
+      "after": false,
+      "fixed": true,
+      "coverUp": false,
+      "unmeasured": false
+    },
+    {
+      "id": "nav-clip-vi",
+      "before": true,
+      "after": false,
+      "fixed": true,
+      "coverUp": false,
+      "unmeasured": false
+    },
+    {
+      "id": "header-overlap",
+      "before": true,
+      "after": false,
+      "fixed": true,
+      "coverUp": false,
+      "unmeasured": false
+    },
+    {
+      "id": "late-hero-shift",
+      "before": true,
+      "after": false,
+      "fixed": true,
+      "coverUp": false,
+      "unmeasured": false
+    },
+    {
+      "id": "hero-note-contrast",
+      "before": true,
+      "after": false,
+      "fixed": true,
+      "coverUp": false,
+      "unmeasured": false
+    },
+    {
+      "id": "card-theme-leak",
+      "before": true,
+      "after": false,
+      "fixed": true,
+      "coverUp": false,
+      "unmeasured": false
+    },
+    {
+      "id": "badge-covers-cta",
+      "before": true,
+      "after": false,
+      "fixed": true,
+      "coverUp": false,
+      "unmeasured": false
+    },
+    {
+      "id": "missing-image",
+      "before": true,
+      "after": false,
+      "fixed": true,
+      "coverUp": false,
+      "unmeasured": false
+    },
+    {
+      "id": "newsletter-btn-clip",
+      "before": true,
+      "after": false,
+      "fixed": true,
+      "coverUp": false,
+      "unmeasured": false
+    },
+    {
+      "id": "social-tap-targets",
+      "before": true,
+      "after": false,
+      "fixed": true,
+      "coverUp": false,
+      "unmeasured": false
+    },
+    {
+      "id": "settings-js-error",
+      "before": true,
+      "after": false,
+      "fixed": true,
+      "coverUp": false,
+      "unmeasured": false
+    },
+    {
+      "id": "save-button-wrap",
+      "before": true,
+      "after": false,
+      "fixed": true,
+      "coverUp": false,
+      "unmeasured": false
+    },
+    {
+      "id": "danger-title-leak",
+      "before": true,
+      "after": false,
+      "fixed": true,
+      "coverUp": false,
+      "unmeasured": false
+    }
+  ],
+  "fixed": 13,
+  "total": 13,
+  "presentInR0": 13,
+  "unmeasured": 0
+}

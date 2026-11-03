@@ -1,0 +1,372 @@
+{
+  "schema": "mantis-ring/receipt@1",
+  "taskId": "t_2d8bf3714652ec6d98726a0ba7b622ce",
+  "label": "REAL RUN · Vultr VX1 sea · 2026-11-03 20:46 UTC",
+  "startedAt": "2026-11-03T20:46:27.669Z",
+  "finishedAt": "2026-11-03T20:47:14.021Z",
+  "source": {
+    "kind": "sample",
+    "name": "lumen",
+    "commit": null
+  },
+  "trust": "sample",
+  "trustNote": "Verified: re-measured by Mantis (no LLM) against the original baseline.",
+  "matrix": {
+    "routes": [
+      "/",
+      "/settings.html"
+    ],
+    "viewports": [
+      "mobile",
+      "desktop"
+    ],
+    "schemes": [
+      "light",
+      "dark"
+    ],
+    "locales": [
+      "en",
+      "vi"
+    ],
+    "cells": 16
+  },
+  "line": "18 fixed · 0 new · 0 cover-ups · 0 lost",
+  "counts": {
+    "errorsBefore": 14,
+    "errorsAfter": 0,
+    "warningsBefore": 4,
+    "warningsAfter": 0,
+    "fixed": 18,
+    "new": 0,
+    "coverUps": 0,
+    "lost": 0,
+    "cellsCompared": 16,
+    "cellsExpected": 16
+  },
+  "fixed": [
+    {
+      "type": "layout-shift",
+      "route": "/",
+      "selector": "#hero-art",
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "desktop/light/en",
+        "desktop/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi",
+        "desktop/light/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "page-overflow",
+      "route": "/",
+      "selector": "#promo-banner",
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi"
+      ]
+    },
+    {
+      "type": "overlap",
+      "route": "/",
+      "selector": "#menu-toggle",
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi"
+      ]
+    },
+    {
+      "type": "overlap",
+      "route": "/",
+      "selector": "#popular-badge",
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi"
+      ]
+    },
+    {
+      "type": "contrast",
+      "route": "/",
+      "selector": "#hero-note",
+      "cells": [
+        "mobile/light/en",
+        "desktop/light/en",
+        "mobile/light/vi",
+        "desktop/light/vi"
+      ]
+    },
+    {
+      "type": "tap-target",
+      "route": "/",
+      "selector": "#social-links a:nth-of-type(1)",
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi"
+      ]
+    },
+    {
+      "type": "broken-image",
+      "route": "/",
+      "selector": "#team-photo",
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "desktop/light/en",
+        "desktop/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi",
+        "desktop/light/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "request-failed",
+      "route": "/",
+      "selector": null,
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "desktop/light/en",
+        "desktop/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi",
+        "desktop/light/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "contrast",
+      "route": "/",
+      "selector": "#plan-business h3.plan-name",
+      "cells": [
+        "mobile/dark/en",
+        "desktop/dark/en",
+        "mobile/dark/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "contrast",
+      "route": "/",
+      "selector": "#plan-business span.amount",
+      "cells": [
+        "mobile/dark/en",
+        "desktop/dark/en",
+        "mobile/dark/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "contrast",
+      "route": "/",
+      "selector": "#plan-business span.per",
+      "cells": [
+        "mobile/dark/en",
+        "desktop/dark/en",
+        "mobile/dark/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "theme-leak",
+      "route": "/",
+      "selector": "#plan-business",
+      "cells": [
+        "mobile/dark/en",
+        "desktop/dark/en",
+        "mobile/dark/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "clipped-text",
+      "route": "/",
+      "selector": "#newsletter-submit",
+      "cells": [
+        "mobile/light/vi",
+        "mobile/dark/vi",
+        "desktop/light/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "clipped-text",
+      "route": "/",
+      "selector": "#nav-links",
+      "cells": [
+        "desktop/light/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "console",
+      "route": "/settings.html",
+      "selector": null,
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "desktop/light/en",
+        "desktop/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi",
+        "desktop/light/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "contrast",
+      "route": "/settings.html",
+      "selector": "#danger-title",
+      "cells": [
+        "mobile/dark/en",
+        "desktop/dark/en",
+        "mobile/dark/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "theme-leak",
+      "route": "/settings.html",
+      "selector": "#danger-title",
+      "cells": [
+        "mobile/dark/en",
+        "desktop/dark/en",
+        "mobile/dark/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "clipped-text",
+      "route": "/settings.html",
+      "selector": "#save-settings",
+      "cells": [
+        "mobile/light/vi",
+        "mobile/dark/vi",
+        "desktop/light/vi",
+        "desktop/dark/vi"
+      ]
+    }
+  ],
+  "new": [],
+  "gate": {
+    "enabled": true,
+    "coverUpAttempts": 0,
+    "tamperAttempts": 0,
+    "lostAttempts": 0,
+    "reverts": 0
+  },
+  "checks": [
+    {
+      "check": 1,
+      "decision": "accepted",
+      "line": "18 fixed · 0 new · 0 cover-ups · 0 lost",
+      "runId": "2026-11-03T20-46-58",
+      "ms": 9668,
+      "forced": true,
+      "final": false
+    }
+  ],
+  "stopReason": "finish",
+  "models": [
+    {
+      "role": "fix",
+      "id": "minimax-m3.1-flash",
+      "provider": "Vultr Serverless Inference",
+      "calls": 18,
+      "promptTokens": 244415,
+      "completionTokens": 4541,
+      "reasoningTokens": 1250,
+      "usd": 0.05297,
+      "price": {
+        "promptPer1M": 0.2,
+        "completionPer1M": 0.9,
+        "source": "catalog list price, 2026-11-03"
+      }
+    }
+  ],
+  "tokens": {
+    "prompt": 244415,
+    "completion": 4541,
+    "reasoning": 1250
+  },
+  "usd": 0.05297,
+  "turns": 18,
+  "toolCalls": 47,
+  "invalidToolCalls": 0,
+  "toolErrors": 9,
+  "time": {
+    "totalSec": 46.4,
+    "phases": {
+      "sandbox": 0.2,
+      "clone": 0.2,
+      "install": 0,
+      "serve": 0.2,
+      "baseline": 12.6,
+      "model": 17.8,
+      "tools": 3.3,
+      "checks": 9.7,
+      "verify": 0.2,
+      "proof": 1.8,
+      "copyOut": 0.1,
+      "destroy": 0.1,
+      "vision": 0
+    }
+  },
+  "diff": {
+    "files": 3,
+    "insertions": 26,
+    "deletions": 23,
+    "bytes": 6979,
+    "sha256": "13b382f5ccc6d79e8a95d7dd7a5b12d9ddb3dd07fc4d549eabbd50861f9daa06",
+    "applies": true,
+    "truncated": false
+  },
+  "proof": "proof.png",
+  "vision": {
+    "model": null,
+    "provider": "Vultr Serverless Inference",
+    "verdict": "skipped",
+    "agree": null,
+    "pairs": []
+  },
+  "summary": {
+    "text": "Fixed all 14 reported errors and all 4 warnings. Key changes: made the promo banner responsive and prevented mobile header/control overlaps; moved the popular badge into normal flow so it no longer covers the CTA; replaced hard-coded colours with theme tokens for the hero note, Business plan, and danger-zone title; restored the missing team image and gave the hero art intrinsic dimensions to prevent layout shift; allowed navigation, newsletter, and save-button text to wrap instead of clipping; fixed the settings page null-element script error; and enlarged the social media tap targets. The automated check reports 18 fixed issues, with no new issues or cover-ups, and no known remaining UI problems.",
+    "note": "the model's own words, not measured"
+  },
+  "containment": {
+    "runtime": "runsc",
+    "sandbox": "ring-f0280ea0",
+    "limits": {
+      "memory": "3g",
+      "cpus": "2",
+      "pids": 512,
+      "shm": "512m",
+      "work": "2g",
+      "tmp": "512m",
+      "home": "1g"
+    },
+    "network": "ring-internal → ring-proxy (allowlist)",
+    "destroyed": true,
+    "goneCheck": "docker ps -a: gone",
+    "goneAt": "2026-11-03T20:47:14.021Z"
+  },
+  "mantis": {
+    "version": "0.7.1",
+    "baselineRunId": "2026-11-03T20-46-28",
+    "finalRunId": "2026-11-03T20-46-58",
+    "comparedWith": "baseline run (R0)"
+  },
+  "verdict": "pass",
+  "publishable": true,
+  "promptVersion": "ring-2"
+}

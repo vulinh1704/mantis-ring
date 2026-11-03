@@ -1,0 +1,78 @@
+{
+  "id": "t_85427a26b9ba0243ffc7841bdf58fd66",
+  "origin": "admin",
+  "label": "bakeoff-2026-11-04",
+  "state": "done",
+  "source": {
+    "kind": "sample",
+    "name": "lumen",
+    "label": "Lumen (sample site)"
+  },
+  "matrix": {
+    "routes": [
+      "/",
+      "/settings.html"
+    ],
+    "viewports": [
+      "mobile",
+      "desktop"
+    ],
+    "schemes": [
+      "light",
+      "dark"
+    ],
+    "locales": [
+      "en",
+      "vi"
+    ]
+  },
+  "model": "deepseek-v4.1-flash-1017",
+  "sampling": {
+    "temperature": 1,
+    "topP": 1,
+    "seed": 7
+  },
+  "visionModel": null,
+  "gate": true,
+  "caps": {
+    "maxChecks": 3,
+    "maxTurns": 36,
+    "maxTurnsPerCheck": 14,
+    "maxCallsPerTurn": 12,
+    "maxCompletionTokens": 8192,
+    "reasoning": {
+      "effort": "low",
+      "max_tokens": 2048
+    },
+    "maxPromptTokens": 1200000,
+    "maxUsd": 1.5,
+    "wallClockSec": 900,
+    "lookTimeoutSec": 300
+  },
+  "position": null,
+  "step": "gate",
+  "stepTimes": {
+    "clone": 181,
+    "install": 198,
+    "look": 12683,
+    "fix": 87073,
+    "gate": 220,
+    "cleanup": 110
+  },
+  "sandbox": {
+    "name": "ring-626c6156",
+    "runtime": "runsc"
+  },
+  "result": {
+    "status": "done",
+    "verdict": "pass",
+    "line": "18 fixed · 0 new · 0 cover-ups · 0 lost",
+    "error": null
+  },
+  "startedAt": "2026-11-03T20:46:25.047Z",
+  "finishedAt": "2026-11-03T20:48:07.442Z",
+  "approvedAt": null,
+  "publishedAt": null,
+  "createdAt": "2026-11-03T20:46:25.046Z",
+  "updatedAt": "2026-11-03T20:48:07.442Z"
+}

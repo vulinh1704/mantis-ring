@@ -1,0 +1,381 @@
+{
+  "schema": "mantis-ring/receipt@1",
+  "taskId": "t_85427a26b9ba0243ffc7841bdf58fd66",
+  "label": "REAL RUN · Vultr VX1 sea · 2026-11-03 20:46 UTC",
+  "startedAt": "2026-11-03T20:46:25.048Z",
+  "finishedAt": "2026-11-03T20:48:07.441Z",
+  "source": {
+    "kind": "sample",
+    "name": "lumen",
+    "commit": null
+  },
+  "trust": "sample",
+  "trustNote": "Verified: re-measured by Mantis (no LLM) against the original baseline.",
+  "matrix": {
+    "routes": [
+      "/",
+      "/settings.html"
+    ],
+    "viewports": [
+      "mobile",
+      "desktop"
+    ],
+    "schemes": [
+      "light",
+      "dark"
+    ],
+    "locales": [
+      "en",
+      "vi"
+    ],
+    "cells": 16
+  },
+  "line": "18 fixed · 0 new · 0 cover-ups · 0 lost",
+  "counts": {
+    "errorsBefore": 14,
+    "errorsAfter": 0,
+    "warningsBefore": 4,
+    "warningsAfter": 0,
+    "fixed": 18,
+    "new": 0,
+    "coverUps": 0,
+    "lost": 0,
+    "cellsCompared": 16,
+    "cellsExpected": 16
+  },
+  "fixed": [
+    {
+      "type": "layout-shift",
+      "route": "/",
+      "selector": "#hero-art",
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "desktop/light/en",
+        "desktop/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi",
+        "desktop/light/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "page-overflow",
+      "route": "/",
+      "selector": "#promo-banner",
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi"
+      ]
+    },
+    {
+      "type": "overlap",
+      "route": "/",
+      "selector": "#menu-toggle",
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi"
+      ]
+    },
+    {
+      "type": "overlap",
+      "route": "/",
+      "selector": "#popular-badge",
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi"
+      ]
+    },
+    {
+      "type": "contrast",
+      "route": "/",
+      "selector": "#hero-note",
+      "cells": [
+        "mobile/light/en",
+        "desktop/light/en",
+        "mobile/light/vi",
+        "desktop/light/vi"
+      ]
+    },
+    {
+      "type": "tap-target",
+      "route": "/",
+      "selector": "#social-links a:nth-of-type(1)",
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi"
+      ]
+    },
+    {
+      "type": "broken-image",
+      "route": "/",
+      "selector": "#team-photo",
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "desktop/light/en",
+        "desktop/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi",
+        "desktop/light/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "request-failed",
+      "route": "/",
+      "selector": null,
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "desktop/light/en",
+        "desktop/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi",
+        "desktop/light/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "contrast",
+      "route": "/",
+      "selector": "#plan-business h3.plan-name",
+      "cells": [
+        "mobile/dark/en",
+        "desktop/dark/en",
+        "mobile/dark/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "contrast",
+      "route": "/",
+      "selector": "#plan-business span.amount",
+      "cells": [
+        "mobile/dark/en",
+        "desktop/dark/en",
+        "mobile/dark/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "contrast",
+      "route": "/",
+      "selector": "#plan-business span.per",
+      "cells": [
+        "mobile/dark/en",
+        "desktop/dark/en",
+        "mobile/dark/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "theme-leak",
+      "route": "/",
+      "selector": "#plan-business",
+      "cells": [
+        "mobile/dark/en",
+        "desktop/dark/en",
+        "mobile/dark/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "clipped-text",
+      "route": "/",
+      "selector": "#newsletter-submit",
+      "cells": [
+        "mobile/light/vi",
+        "mobile/dark/vi",
+        "desktop/light/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "clipped-text",
+      "route": "/",
+      "selector": "#nav-links",
+      "cells": [
+        "desktop/light/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "console",
+      "route": "/settings.html",
+      "selector": null,
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "desktop/light/en",
+        "desktop/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi",
+        "desktop/light/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "contrast",
+      "route": "/settings.html",
+      "selector": "#danger-title",
+      "cells": [
+        "mobile/dark/en",
+        "desktop/dark/en",
+        "mobile/dark/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "theme-leak",
+      "route": "/settings.html",
+      "selector": "#danger-title",
+      "cells": [
+        "mobile/dark/en",
+        "desktop/dark/en",
+        "mobile/dark/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "clipped-text",
+      "route": "/settings.html",
+      "selector": "#save-settings",
+      "cells": [
+        "mobile/light/vi",
+        "mobile/dark/vi",
+        "desktop/light/vi",
+        "desktop/dark/vi"
+      ]
+    }
+  ],
+  "new": [],
+  "gate": {
+    "enabled": true,
+    "coverUpAttempts": 0,
+    "tamperAttempts": 0,
+    "lostAttempts": 0,
+    "reverts": 0
+  },
+  "checks": [
+    {
+      "check": 1,
+      "decision": "accepted",
+      "line": "14 fixed · 0 new · 0 cover-ups · 0 lost",
+      "runId": "2026-11-03T20-47-20",
+      "ms": 9895,
+      "forced": true,
+      "final": false
+    },
+    {
+      "check": 2,
+      "decision": "accepted",
+      "line": "18 fixed · 0 new · 0 cover-ups · 0 lost",
+      "runId": "2026-11-03T20-47-43",
+      "ms": 10025,
+      "forced": false,
+      "final": false
+    }
+  ],
+  "stopReason": "finish",
+  "models": [
+    {
+      "role": "fix",
+      "id": "deepseek-v4.1-flash-1017",
+      "provider": "Vultr Serverless Inference",
+      "calls": 28,
+      "promptTokens": 359195,
+      "completionTokens": 13401,
+      "reasoningTokens": 9539,
+      "usd": 0.06192,
+      "price": {
+        "promptPer1M": 0.15,
+        "completionPer1M": 0.6,
+        "source": "catalog list price, 2026-11-03"
+      }
+    }
+  ],
+  "tokens": {
+    "prompt": 359195,
+    "completion": 13401,
+    "reasoning": 9539
+  },
+  "usd": 0.06192,
+  "turns": 28,
+  "toolCalls": 44,
+  "invalidToolCalls": 0,
+  "toolErrors": 0,
+  "time": {
+    "totalSec": 102.4,
+    "phases": {
+      "sandbox": 0.1,
+      "clone": 0.4,
+      "install": 0,
+      "serve": 0.2,
+      "baseline": 12.6,
+      "model": 63.5,
+      "tools": 3.4,
+      "checks": 19.9,
+      "verify": 0.2,
+      "proof": 1.8,
+      "copyOut": 0.1,
+      "destroy": 0.1,
+      "vision": 0
+    }
+  },
+  "diff": {
+    "files": 3,
+    "insertions": 23,
+    "deletions": 22,
+    "bytes": 6725,
+    "sha256": "c9478fcb3fdfc44c6d5066454e8aab5ccff75a6a43c74769678e2bffeb65dafc",
+    "applies": true,
+    "truncated": false
+  },
+  "proof": "proof.png",
+  "vision": {
+    "model": null,
+    "provider": "Vultr Serverless Inference",
+    "verdict": "skipped",
+    "agree": null,
+    "pairs": []
+  },
+  "summary": {
+    "text": "Fixed all 18 issues (14 errors + 4 warnings) with no new problems introduced.\n\nWhat I changed:\n- Promo banner: `width: 600px` → `width: 100%; max-width: 600px`, so it no longer overflows mobile viewports.\n- Nav links: replaced the `max-width: 420px; overflow: hidden; white-space: nowrap` clipping with `flex-wrap: wrap`, so long Vietnamese labels (\"Câu hỏi thường gặp\") stay fully visible on desktop.\n- Header on mobile: removed the absolute-positioned `.menu-toggle` rule that made it overlap the header CTA, and tightened the header gap.\n- Popular badge: removed the mobile rule that pushed `.badge` down onto the plan CTA text.\n- Hero note: swapped hard-coded `#aaa` for the `--muted` token (fixes light-mode contrast).\n- Business plan card: replaced hard-coded `background: #fff` with `var(--surface)`, which fixes the dark-mode theme leak and the three contrast failures on its name/amount/per text.\n- Newsletter button: `width: 120px` → `min-width: 120px` and dropped `overflow: hidden`, so the Vietnamese label isn't cut off.\n- Settings save button: `width: 84px` → `min-width: 84px`, letting \"Lưu tất cả thay đổi\" fit instead of wrapping to 4 lines.\n- Danger zone title: hard-coded `#7f1d1d` → `var(--danger-ink)` token (contrast + theme leak in dark mode).\n- Hero art: added `aspect-ratio: 16 / 9` to reserve space and remove the 0.161 layout shift.\n- Social links: 16×16px icons → 32×32px tap targets with real spacing.\n- Team photo: pointed `src` at the existing `/img/team.svg` instead o",
+    "note": "the model's own words, not measured"
+  },
+  "containment": {
+    "runtime": "runsc",
+    "sandbox": "ring-626c6156",
+    "limits": {
+      "memory": "3g",
+      "cpus": "2",
+      "pids": 512,
+      "shm": "512m",
+      "work": "2g",
+      "tmp": "512m",
+      "home": "1g"
+    },
+    "network": "ring-internal → ring-proxy (allowlist)",
+    "destroyed": true,
+    "goneCheck": "docker ps -a: gone",
+    "goneAt": "2026-11-03T20:48:07.440Z"
+  },
+  "mantis": {
+    "version": "0.7.1",
+    "baselineRunId": "2026-11-03T20-46-25",
+    "finalRunId": "2026-11-03T20-47-43",
+    "comparedWith": "baseline run (R0)"
+  },
+  "verdict": "pass",
+  "publishable": true,
+  "promptVersion": "ring-2"
+}

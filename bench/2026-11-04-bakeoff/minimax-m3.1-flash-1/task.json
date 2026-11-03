@@ -1,0 +1,78 @@
+{
+  "id": "t_2d8bf3714652ec6d98726a0ba7b622ce",
+  "origin": "admin",
+  "label": "bakeoff-2026-11-04",
+  "state": "done",
+  "source": {
+    "kind": "sample",
+    "name": "lumen",
+    "label": "Lumen (sample site)"
+  },
+  "matrix": {
+    "routes": [
+      "/",
+      "/settings.html"
+    ],
+    "viewports": [
+      "mobile",
+      "desktop"
+    ],
+    "schemes": [
+      "light",
+      "dark"
+    ],
+    "locales": [
+      "en",
+      "vi"
+    ]
+  },
+  "model": "minimax-m3.1-flash",
+  "sampling": {
+    "temperature": 1,
+    "topP": 0.95,
+    "seed": 7
+  },
+  "visionModel": null,
+  "gate": true,
+  "caps": {
+    "maxChecks": 3,
+    "maxTurns": 36,
+    "maxTurnsPerCheck": 14,
+    "maxCallsPerTurn": 12,
+    "maxCompletionTokens": 8192,
+    "reasoning": {
+      "effort": "low",
+      "max_tokens": 2048
+    },
+    "maxPromptTokens": 1200000,
+    "maxUsd": 1.5,
+    "wallClockSec": 900,
+    "lookTimeoutSec": 300
+  },
+  "position": null,
+  "step": "gate",
+  "stepTimes": {
+    "clone": 255,
+    "install": 286,
+    "look": 12620,
+    "fix": 30902,
+    "gate": 232,
+    "cleanup": 113
+  },
+  "sandbox": {
+    "name": "ring-f0280ea0",
+    "runtime": "runsc"
+  },
+  "result": {
+    "status": "done",
+    "verdict": "pass",
+    "line": "18 fixed · 0 new · 0 cover-ups · 0 lost",
+    "error": null
+  },
+  "startedAt": "2026-11-03T20:46:27.668Z",
+  "finishedAt": "2026-11-03T20:47:14.022Z",
+  "approvedAt": null,
+  "publishedAt": null,
+  "createdAt": "2026-11-03T20:46:27.668Z",
+  "updatedAt": "2026-11-03T20:47:14.022Z"
+}

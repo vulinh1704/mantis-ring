@@ -1,0 +1,381 @@
+{
+  "schema": "mantis-ring/receipt@1",
+  "taskId": "t_6b1108b81c844c053fd572d101596dbd",
+  "label": "REAL RUN · Vultr VX1 sea · 2026-11-03 20:48 UTC",
+  "startedAt": "2026-11-03T20:48:26.116Z",
+  "finishedAt": "2026-11-03T20:50:53.651Z",
+  "source": {
+    "kind": "sample",
+    "name": "lumen",
+    "commit": null
+  },
+  "trust": "sample",
+  "trustNote": "Verified: re-measured by Mantis (no LLM) against the original baseline.",
+  "matrix": {
+    "routes": [
+      "/",
+      "/settings.html"
+    ],
+    "viewports": [
+      "mobile",
+      "desktop"
+    ],
+    "schemes": [
+      "light",
+      "dark"
+    ],
+    "locales": [
+      "en",
+      "vi"
+    ],
+    "cells": 16
+  },
+  "line": "18 fixed · 0 new · 0 cover-ups · 0 lost",
+  "counts": {
+    "errorsBefore": 14,
+    "errorsAfter": 0,
+    "warningsBefore": 4,
+    "warningsAfter": 0,
+    "fixed": 18,
+    "new": 0,
+    "coverUps": 0,
+    "lost": 0,
+    "cellsCompared": 16,
+    "cellsExpected": 16
+  },
+  "fixed": [
+    {
+      "type": "layout-shift",
+      "route": "/",
+      "selector": "#hero-art",
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "desktop/light/en",
+        "desktop/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi",
+        "desktop/light/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "page-overflow",
+      "route": "/",
+      "selector": "#promo-banner",
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi"
+      ]
+    },
+    {
+      "type": "overlap",
+      "route": "/",
+      "selector": "#menu-toggle",
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi"
+      ]
+    },
+    {
+      "type": "overlap",
+      "route": "/",
+      "selector": "#popular-badge",
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi"
+      ]
+    },
+    {
+      "type": "contrast",
+      "route": "/",
+      "selector": "#hero-note",
+      "cells": [
+        "mobile/light/en",
+        "desktop/light/en",
+        "mobile/light/vi",
+        "desktop/light/vi"
+      ]
+    },
+    {
+      "type": "tap-target",
+      "route": "/",
+      "selector": "#social-links a:nth-of-type(1)",
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi"
+      ]
+    },
+    {
+      "type": "broken-image",
+      "route": "/",
+      "selector": "#team-photo",
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "desktop/light/en",
+        "desktop/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi",
+        "desktop/light/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "request-failed",
+      "route": "/",
+      "selector": null,
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "desktop/light/en",
+        "desktop/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi",
+        "desktop/light/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "contrast",
+      "route": "/",
+      "selector": "#plan-business h3.plan-name",
+      "cells": [
+        "mobile/dark/en",
+        "desktop/dark/en",
+        "mobile/dark/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "contrast",
+      "route": "/",
+      "selector": "#plan-business span.amount",
+      "cells": [
+        "mobile/dark/en",
+        "desktop/dark/en",
+        "mobile/dark/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "contrast",
+      "route": "/",
+      "selector": "#plan-business span.per",
+      "cells": [
+        "mobile/dark/en",
+        "desktop/dark/en",
+        "mobile/dark/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "theme-leak",
+      "route": "/",
+      "selector": "#plan-business",
+      "cells": [
+        "mobile/dark/en",
+        "desktop/dark/en",
+        "mobile/dark/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "clipped-text",
+      "route": "/",
+      "selector": "#newsletter-submit",
+      "cells": [
+        "mobile/light/vi",
+        "mobile/dark/vi",
+        "desktop/light/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "clipped-text",
+      "route": "/",
+      "selector": "#nav-links",
+      "cells": [
+        "desktop/light/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "console",
+      "route": "/settings.html",
+      "selector": null,
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "desktop/light/en",
+        "desktop/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi",
+        "desktop/light/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "contrast",
+      "route": "/settings.html",
+      "selector": "#danger-title",
+      "cells": [
+        "mobile/dark/en",
+        "desktop/dark/en",
+        "mobile/dark/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "theme-leak",
+      "route": "/settings.html",
+      "selector": "#danger-title",
+      "cells": [
+        "mobile/dark/en",
+        "desktop/dark/en",
+        "mobile/dark/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "clipped-text",
+      "route": "/settings.html",
+      "selector": "#save-settings",
+      "cells": [
+        "mobile/light/vi",
+        "mobile/dark/vi",
+        "desktop/light/vi",
+        "desktop/dark/vi"
+      ]
+    }
+  ],
+  "new": [],
+  "gate": {
+    "enabled": true,
+    "coverUpAttempts": 0,
+    "tamperAttempts": 0,
+    "lostAttempts": 0,
+    "reverts": 0
+  },
+  "checks": [
+    {
+      "check": 1,
+      "decision": "accepted",
+      "line": "16 fixed · 0 new · 0 cover-ups · 0 lost",
+      "runId": "2026-11-03T20-50-05",
+      "ms": 10033,
+      "forced": true,
+      "final": false
+    },
+    {
+      "check": 2,
+      "decision": "accepted",
+      "line": "18 fixed · 0 new · 0 cover-ups · 0 lost",
+      "runId": "2026-11-03T20-50-32",
+      "ms": 9916,
+      "forced": false,
+      "final": false
+    }
+  ],
+  "stopReason": "finish",
+  "models": [
+    {
+      "role": "fix",
+      "id": "glm-5.3",
+      "provider": "Vultr Serverless Inference",
+      "calls": 25,
+      "promptTokens": 301900,
+      "completionTokens": 6797,
+      "reasoningTokens": 2633,
+      "usd": 0.246816,
+      "price": {
+        "promptPer1M": 0.75,
+        "completionPer1M": 3,
+        "source": "catalog list price, 2026-11-03"
+      }
+    }
+  ],
+  "tokens": {
+    "prompt": 301900,
+    "completion": 6797,
+    "reasoning": 2633
+  },
+  "usd": 0.246816,
+  "turns": 25,
+  "toolCalls": 66,
+  "invalidToolCalls": 0,
+  "toolErrors": 30,
+  "time": {
+    "totalSec": 147.5,
+    "phases": {
+      "sandbox": 0.1,
+      "clone": 0.3,
+      "install": 0,
+      "serve": 0.2,
+      "baseline": 12.7,
+      "model": 106.6,
+      "tools": 5.4,
+      "checks": 19.9,
+      "verify": 0.2,
+      "proof": 1.8,
+      "copyOut": 0.1,
+      "destroy": 0.1,
+      "vision": 0
+    }
+  },
+  "diff": {
+    "files": 3,
+    "insertions": 18,
+    "deletions": 17,
+    "bytes": 6554,
+    "sha256": "cd71fbea828769bff5e9e86dfecf46bf7e64cbd15f6102354de16a0e027c3dad",
+    "applies": true,
+    "truncated": false
+  },
+  "proof": "proof.png",
+  "vision": {
+    "model": null,
+    "provider": "Vultr Serverless Inference",
+    "verdict": "skipped",
+    "agree": null,
+    "pairs": []
+  },
+  "summary": {
+    "text": "All 14 errors and 4 warnings are fixed, verified by check_ui (18 fixed, 0 new, 0 cover-ups).\n\nMain changes in styles.css: promo banner now uses max-width:100% instead of a fixed 600px (fixes horizontal scroll); menu-toggle no longer absolutely positioned so it doesn't overlap the header CTA; \"Popular\" badge repositioned above the plan button so it doesn't cover its label; hero-note uses the --muted theme token instead of #aaa; #plan-business uses var(--surface) so it themes correctly in dark mode; newsletter button and nav links allowed to wrap/sized naturally (fixes Vietnamese clipped text); save-settings fixed width removed; social links enlarged to 24px tap targets; danger-title uses a --danger-ink token.\n\nIn index.html: team photo points to /img/team.svg (the existing asset, fixing the 404), and the lazy hero image has explicit width/height attributes reserving space (fixes the CLS 0.161 layout shift). In settings.js: the script queried a nonexistent #save-btn (null) causing the TypeError — it now targets the real #save-settings button with a null guard.",
+    "note": "the model's own words, not measured"
+  },
+  "containment": {
+    "runtime": "runsc",
+    "sandbox": "ring-d07b5ef9",
+    "limits": {
+      "memory": "3g",
+      "cpus": "2",
+      "pids": 512,
+      "shm": "512m",
+      "work": "2g",
+      "tmp": "512m",
+      "home": "1g"
+    },
+    "network": "ring-internal → ring-proxy (allowlist)",
+    "destroyed": true,
+    "goneCheck": "docker ps -a: gone",
+    "goneAt": "2026-11-03T20:50:53.650Z"
+  },
+  "mantis": {
+    "version": "0.7.1",
+    "baselineRunId": "2026-11-03T20-48-26",
+    "finalRunId": "2026-11-03T20-50-32",
+    "comparedWith": "baseline run (R0)"
+  },
+  "verdict": "pass",
+  "publishable": true,
+  "promptVersion": "ring-2"
+}
