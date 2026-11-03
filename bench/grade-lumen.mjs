@@ -7,8 +7,9 @@
 // A planted bug is present in a report when an issue has one of its expected types on its route
 // (PLANTED's /settings is served as /settings.html) and either the expected selector, a selector
 // inside it (expectations marked `descendants`), or, without a selector, a message the expected
-// regex matches. It is really fixed when it is present in R0, absent in the final run (RF), and no
-// RF cover-up issue was about it (evidence.was.selector). Without an RF the final state is R0.
+// regex matches. It is really fixed when it is present in R0, absent in the final run (RF), RF
+// measured every screen where R0 showed it (status 'ok'), and no RF cover-up issue was about it
+// (evidence.was.selector). Without an RF the final state is R0.
 //
 // Usage: node bench/grade-lumen.mjs --dir <task bundle> [--key <PLANTED.json>] [--out <grade.json>]
 //   The bundle is what `scripts/ring.sh bundle <id> <dir>` extracts: r0.report.json, rf.report.json,
@@ -85,21 +86,42 @@ export function isCoveredUp(report, bug) {
   return bug.expect.some((exp) => typeof exp.selector === 'string' && was.some((sel) => selectorMatches(sel, exp)));
 }
 
+/** The screens (`<route>|<viewport>/<scheme>/<locale>`) where R0 showed the bug: the cells of every issue that matched it. */
+export function cellsOf(report, bug) {
+  const route = mapRoute(bug.route);
+  const hits = report.issues.filter((issue) => bug.expect.some((exp) => issueMatches(issue, exp, route)));
+  return [...new Set(hits.flatMap((i) => (Array.isArray(i.cells) ? i.cells : []).map((c) => `${route}|${c}`)))];
+}
+
+/** The screens Mantis really measured in a report (status 'ok'); null when the report lists no cells. */
+function measuredCells(report) {
+  if (!Array.isArray(report?.cells)) return null;
+  return new Set(report.cells.filter((c) => c?.status === 'ok').map((c) => `${c.route}|${c.key}`));
+}
+
 /**
  * Grade one run. `rf` null means there was no final run, so the final state is the starting point.
- * @returns {{bugs: {id:string, before:boolean, after:boolean, fixed:boolean, coverUp:boolean}[], fixed:number, total:number, presentInR0:number}}
+ * A bug only counts as fixed when RF measured every screen where R0 showed it: a page that stopped
+ * loading (HTTP 404/500, a hang, a crash) leaves its bugs out of RF without fixing them.
+ * @returns {{bugs: {id:string, before:boolean, after:boolean, fixed:boolean, coverUp:boolean, unmeasured:boolean}[],
+ *   fixed:number, total:number, presentInR0:number, unmeasured:number}}
  */
 export function grade({ r0, rf, key }) {
   checkReport(r0, 'r0.report.json');
   if (rf) checkReport(rf, 'rf.report.json');
   const final = rf ?? r0;
+  const measured = rf ? measuredCells(rf) : null;
   const bugs = key.bugs.map((bug) => {
     const before = isPresent(r0, bug);
     const after = isPresent(final, bug);
     const coverUp = rf ? isCoveredUp(rf, bug) : false;
-    return { id: bug.id, before, after, fixed: before && !after && !coverUp, coverUp };
+    const unmeasured = Boolean(rf && before && measured && cellsOf(r0, bug).some((k) => !measured.has(k)));
+    return { id: bug.id, before, after, fixed: before && !after && !coverUp && !unmeasured, coverUp, unmeasured };
   });
-  return { bugs, fixed: bugs.filter((b) => b.fixed).length, total: key.bugs.length, presentInR0: bugs.filter((b) => b.before).length };
+  return {
+    bugs, fixed: bugs.filter((b) => b.fixed).length, total: key.bugs.length, presentInR0: bugs.filter((b) => b.before).length,
+    unmeasured: bugs.filter((b) => b.unmeasured).length,
+  };
 }
 
 /**
@@ -136,7 +158,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       await rename(`${values.out}.tmp`, values.out);
     }
     process.stdout.write(text);
-    console.error(`grade-lumen: ${g.fixed}/${g.total} planted bugs really fixed (${g.presentInR0} present at the start)${g.note ? `; ${g.note}` : ''}`);
+    console.error(`grade-lumen: ${g.fixed}/${g.total} planted bugs really fixed (${g.presentInR0} present at the start${g.unmeasured ? `, ${g.unmeasured} on screens the final run could not measure` : ''})${g.note ? `; ${g.note}` : ''}`);
   } catch (err) {
     console.error(`grade-lumen: ${err.message}`);
     process.exit(1);

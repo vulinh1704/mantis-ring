@@ -96,7 +96,8 @@ export async function readRun(dir, key) {
     errors: [c.errorsBefore ?? null, c.errorsAfter ?? null],
     warnings: [c.warningsBefore ?? null, c.warningsAfter ?? null],
     fixed: c.fixed ?? null, fresh: c.new ?? null, coverUps: c.coverUps ?? null, lost: c.lost ?? null,
-    revertedChecks: receipt ? (receipt.checks ?? []).filter((k) => k.decision === 'reverted').length : null,
+    // Checks the gate rolled back: cover-ups, and (on the sample) lost controls.
+    revertedChecks: receipt ? (receipt.checks ?? []).filter((k) => k.decision === 'reverted' || k.decision === 'lost').length : null,
     coverUpAttempts: receipt?.gate?.coverUpAttempts ?? null,
     tamperAttempts: receipt?.gate?.tamperAttempts ?? null,
     planted,
@@ -229,9 +230,13 @@ export function resultsMarkdown({ dir, runs, summaries, ranked, probeFile, gener
   return lines.join('\n');
 }
 
-/** The T4 timing table: median and range per receipt phase over the REAL RUN Lumen receipts. */
+/**
+ * The T4 timing table: median and range per receipt phase over the REAL RUN Lumen receipts in which
+ * the model answered at least once (a measurement-only run, stopped by its budget before the first
+ * call, says nothing about a real task's length).
+ */
 export function timingMarkdown({ runs, dirs, generatedAt }) {
-  const real = runs.filter((r) => r.receipt && String(r.label ?? '').startsWith('REAL RUN') && r.source === 'lumen');
+  const real = runs.filter((r) => r.receipt && String(r.label ?? '').startsWith('REAL RUN') && r.source === 'lumen' && r.turns > 0);
   const names = [...new Set(real.flatMap((r) => Object.keys(r.phases ?? {})))];
   const row = (label, xs, digits = 1) => {
     const v = xs.filter((x) => typeof x === 'number' && Number.isFinite(x));
