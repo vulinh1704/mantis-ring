@@ -5,6 +5,21 @@
 // look() reads the report that `mantis look --json` prints and finds the run folder from the report's
 // own runId, so a missing or repeated run is an error (LookError), never a guess.
 //
+// A repository is judged inside its sandbox, never on the host:
+// - bringIn() clones it there, and stops a clone that grows past MAX_REPO_MB;
+// - inspectProject() reads package.json, the lock files and the workspace files there, and
+//   planProject() (pure, unit-tested) picks the package manager, refuses a monorepo or a repository
+//   with nothing to serve, and builds the command that starts the app;
+// - installDeps() installs with that package manager. pnpm and yarn are first installed with npm into
+//   the sandbox user's home, through the same proxy as every package. Corepack is not used: by default
+//   it fetches Yarn 2+ from repo.yarnpkg.com, which the allowlist refuses. A lock file that is out of
+//   date and a peer-dependency conflict are each retried once, within the same 300 s;
+// - startDevServer() starts a dev server it knows (Vite, Astro, Next.js and others) directly, bound to
+//   127.0.0.1:3000, and runs anything else through its package manager with PORT and HOST set. It then
+//   waits for an answer on 127.0.0.1 or ::1, on port 3000 or on a port the server printed.
+// A failed step throws SetupError: `publicMessage` is one plain sentence for the person who started the
+// task (BUILD-SPEC §4.5), and `message` keeps the detail for the journal.
+//
 // Usage: node runner/run-task.mjs --repo <github url | local dir> [--routes /,/settings] [--locales en,vi]
 //        [--port 3000] [--dev-cmd "npm run dev"] [--timeout 600] [--out out] [--runtime runsc]
 import { realpathSync } from 'node:fs';
@@ -17,6 +32,25 @@ import { Sandbox } from './sandbox.mjs';
 export const sh = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
 export const APP_DIR = '/work/app';
 export const MANTIS_OUT = '/work/.mantis';
+/** The most a cloned repository may take in the sandbox, its .git folder included. */
+export const MAX_REPO_MB = 300;
+export const CLONE_SEC = 120;
+export const INSTALL_SEC = 300;
+export const SERVE_SEC = 90;
+/** The folders, in order, where a project without a dev server may keep its index.html ('' is the root). */
+export const INDEX_DIRS = ['', 'public', 'src', 'docs', 'site', 'www', 'static', 'dist', 'build'];
+/** The package.json scripts that may start the app, in order of preference. */
+export const RUNNABLE = ['dev', 'start', 'develop', 'serve'];
+/** Where pnpm or yarn is installed for one task: the sandbox user's home, a tmpfs. */
+const PM_PREFIX = '/home/ring/.ring-pm';
+const DEV_LOG = '/tmp/dev.log';
+const DEV_PID = '/tmp/ring-dev.pid';
+/** The hosts the proxy lets through (proxy/allowlist). */
+const ALLOWLIST = ['registry.npmjs.org', 'github.com', 'codeload.github.com', 'objects.githubusercontent.com'];
+const LOOPBACK = ['127.0.0.1', '::1'];
+const PROJECT_FILES = ['package.json', 'package-lock.json', 'npm-shrinkwrap.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lockb', 'bun.lock', '.yarnrc.yml', 'lerna.json', 'rush.json'];
+const VERSION = /^\d{1,4}(?:\.\d{1,4}){0,2}(?:-[0-9A-Za-z.-]{1,40})?$/; // 12, 12.3 or 12.3.4, with an optional pre-release
+const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g;
 
 // The same rule as the app's public check (BUILD-SPEC §4.6); the clone URL is rebuilt from the two parts.
 const GITHUB_URL = /^https:\/\/github\.com\/([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/([A-Za-z0-9._-]{1,100}?)(?:\.git)?\/?$/;
@@ -29,8 +63,71 @@ const sleep = (ms) => new Promise((ok) => setTimeout(ok, ms));
 const lastLine = (text) => String(text).trim().split('\n').pop() ?? '';
 const tailOf = (text) => String(text).trim().split('\n').slice(-20).join('\n').slice(-2000);
 
+/** The last lines of a command's output on one line, without colour codes, for the journal. */
+export function tailLine(text, max = 600) {
+  const s = String(text ?? '').replace(ANSI, '').split('\n').map((l) => l.trim()).filter(Boolean).slice(-6).join(' | ');
+  return s.length > max ? `…${s.slice(-max)}` : s;
+}
+
 function checkPort(port) {
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new TypeError(`invalid port: ${port}`);
+}
+
+function checkHost(host) {
+  if (!LOOPBACK.includes(host)) throw new TypeError(`invalid host: ${String(host).slice(0, 40)} (127.0.0.1 or ::1)`);
+}
+
+/** The address of the app inside its sandbox: http://127.0.0.1:3000 or http://[::1]:3000. */
+export function baseUrl({ host = '127.0.0.1', port } = {}) {
+  checkHost(host);
+  checkPort(port);
+  return `http://${host.includes(':') ? `[${host}]` : host}:${port}`;
+}
+
+/** The sentences a person sees when setup fails (BUILD-SPEC §4.5: one plain sentence each). */
+export const SAY = Object.freeze({
+  notFound: 'The repository was not found on GitHub, or it is private.',
+  empty: 'The repository is empty.',
+  tooBig: `The repository is larger than ${MAX_REPO_MB} MB, too big for the sandbox.`,
+  cloneTime: `The repository could not be cloned within ${CLONE_SEC} s.`,
+  clone: 'The repository could not be cloned from GitHub.',
+  inspect: 'The project could not be inspected inside the sandbox.',
+  badPackageJson: "The repository's package.json could not be read.",
+  monorepo: 'This repository is a monorepo with several packages; give a repository with one app at its root.',
+  nothingToServe: 'The repository has no dev or start script and no index.html to serve.',
+  installTime: `The project's dependencies could not be installed within ${INSTALL_SEC} s.`,
+  installMemory: "The install was stopped at the sandbox's memory limit.",
+  installSpace: 'The install ran out of space in the sandbox.',
+  installPrivate: 'A dependency could not be found on the public npm registry.',
+  installNode: "The project's dependencies need a different Node.js version than the sandbox's Node 22.",
+  serveNode: "The app's dev server needs a newer Node.js than the sandbox's Node 22.",
+  serveStopped: "The app's dev server stopped before it answered.",
+  serveTime: `The app did not answer within ${SERVE_SEC} s, on port 3000 or on a port its dev server printed.`,
+});
+
+/** The sentence for an install that tried a host the proxy refuses; `host` is named when it is known. */
+export function sayOffAllowlist(host) {
+  return host
+    ? `The install tried to reach ${host}, which is outside the sandbox's allowlist (only npm and GitHub).`
+    : "The install tried to reach a host outside the sandbox's allowlist (only npm and GitHub).";
+}
+
+/** The sentence for any other install failure. */
+export function sayInstallFailed(pm) {
+  return `The project's dependencies could not be installed with ${['npm', 'pnpm', 'yarn'].includes(pm) ? pm : 'npm'}.`;
+}
+
+/** A setup step failed: `publicMessage` is one sentence for the person who started the task, `message` the detail. */
+export class SetupError extends Error {
+  /**
+   * @param {string} publicMessage  one plain sentence
+   * @param {string} [detail]  for the journal, on one line
+   */
+  constructor(publicMessage, detail = '') {
+    super(detail ? String(detail).replace(/\s*\n\s*/g, ' | ') : publicMessage);
+    this.name = 'SetupError';
+    this.publicMessage = publicMessage;
+  }
 }
 
 /** `mantis look` gave no usable measurement. `reason` says why; `stderrTail` is the end of its stderr. */
@@ -74,6 +171,28 @@ function parseSource(source) {
   throw new Error('unknown source: give a local folder, a github.com URL, {kind: "local", dir} or {kind: "github", owner, name}');
 }
 
+// Inside the sandbox: the clone runs in the background while the folder's size is checked once a
+// second. Past the limit git is stopped and the script exits 90. $1 the URL, $2 the folder, $3 the
+// limit in KB. No credential helper and no prompt: a private or missing repository fails at once.
+const CLONE = [
+  'GIT_TERMINAL_PROMPT=0 git -c protocol.file.allow=never -c credential.helper= clone --depth 1 --no-tags -- "$1" "$2" 2> /tmp/clone.err &',
+  'pid=$!',
+  'while kill -0 "$pid" 2> /dev/null; do',
+  '  sleep 1',
+  '  kb=$(du -sk "$2" 2> /dev/null | cut -f1)',
+  '  if [ -n "$kb" ] && [ "$kb" -gt "$3" ]; then kill "$pid" 2> /dev/null; wait "$pid" 2> /dev/null; echo "the clone passed $3 KB" >&2; exit 90; fi',
+  'done',
+  'wait "$pid"; s=$?',
+  'tail -c 4000 /tmp/clone.err >&2',
+  'exit "$s"',
+].join('\n');
+
+/** The sentence for a failed `git clone`: a repository that is missing or private, or any other failure. */
+export function cloneFailure(stderr) {
+  return /could not read Username|terminal prompts disabled|Repository not found|repository '[^']*' not found|Authentication failed|returned error: 40[134]/i.test(String(stderr ?? ''))
+    ? SAY.notFound : SAY.clone;
+}
+
 /**
  * Bring the project into /work/app: copy a local folder in, or clone a public GitHub repository
  * inside the sandbox, through the allowlist proxy. The host never fetches the URL.
@@ -81,6 +200,7 @@ function parseSource(source) {
  * @param {string | {kind: 'local'|'sample', dir: string} | {kind: 'github', owner: string, name: string}} source
  *   a local folder or a github.com URL (the old string form), or the parts; a sample is a local folder
  * @returns {Promise<{kind: 'local'} | {kind: 'github', url: string, commit: string}>}
+ * @throws {SetupError} for a clone that fails, takes too long or grows past MAX_REPO_MB
  */
 export async function bringIn(box, source) {
   const src = parseSource(source);
@@ -90,73 +210,564 @@ export async function bringIn(box, source) {
     return { kind: 'local' };
   }
   const url = `https://github.com/${src.owner}/${src.name}.git`;
-  const r = await box.execArgs(['env', 'GIT_TERMINAL_PROMPT=0', 'timeout', '-k', '5', '120',
-    'git', '-c', 'protocol.file.allow=never', 'clone', '--depth', '1', '--no-tags', '--', url, APP_DIR], { timeoutMs: 135_000 });
-  if (r.timedOut || r.code === 124 || r.code === 137) throw new Error('git clone did not finish within 120 s');
-  if (r.code !== 0) throw new Error(`git clone failed: ${lastLine(r.stderr) || `exit ${r.code}`}`);
+  const r = await box.execArgs(['timeout', '-k', '5', String(CLONE_SEC), 'sh', '-c', CLONE, 'clone', url, APP_DIR, String(MAX_REPO_MB * 1024)],
+    { timeoutMs: (CLONE_SEC + 15) * 1000 });
+  if (r.code === 90) throw new SetupError(SAY.tooBig, `git clone stopped past ${MAX_REPO_MB} MB: ${tailLine(r.stderr)}`);
+  if (r.timedOut || r.code === 124 || r.code === 137) throw new SetupError(SAY.cloneTime, `git clone did not finish within ${CLONE_SEC} s`);
+  if (r.code !== 0) throw new SetupError(cloneFailure(r.stderr), `git clone failed (exit ${r.code}): ${tailLine(r.stderr)}`);
   const head = await box.execArgs(['git', '-C', APP_DIR, 'rev-parse', 'HEAD'], { timeoutMs: 30_000 });
   const commit = head.stdout.trim();
   if (head.code !== 0 || !/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(commit)) {
-    throw new Error(`could not read the cloned commit: ${lastLine(head.stderr) || `exit ${head.code}`}`);
+    throw new SetupError(/empty repository/i.test(r.stderr) ? SAY.empty : SAY.clone,
+      `could not read the cloned commit: ${lastLine(head.stderr) || `exit ${head.code}`}`);
   }
   return { kind: 'github', url, commit };
 }
 
-/** Read package.json scripts; a folder without one is served as static files. */
-export async function inspectProject(box) {
-  const r = await box.exec(`cd ${APP_DIR} && if [ -f package.json ]; then timeout -k 2 20 node -p "JSON.stringify({scripts: require('./package.json').scripts || {}, lock: require('fs').existsSync('package-lock.json')})"; else echo static; fi`, { timeoutMs: 40_000 });
-  if (r.code !== 0) {
-    const why = r.stderr.split('\n').find((l) => /Error/.test(l))?.trim() || lastLine(r.stderr) || `exit ${r.code}`;
-    throw new Error(`could not read the project's package.json: ${why.slice(0, 300)}`);
-  }
-  const out = r.stdout.trim();
-  if (out === 'static') return { static: true };
+// Inside the sandbox (its own Node 22): what planProject() needs, as one line of JSON. Values that
+// come from the repository are cut to size here and checked again on the host.
+const FACTS = `
+const fs = require('fs');
+process.chdir(${JSON.stringify(APP_DIR)});
+const isFile = (p) => { try { return fs.statSync(p).isFile(); } catch { return false; } };
+const head = (p, n) => {
+  if (!isFile(p)) return null;
   try {
-    return JSON.parse(out);
-  } catch {
-    throw new Error("could not read the project's package.json: unexpected output");
-  }
+    const fd = fs.openSync(p, 'r');
+    try { const b = Buffer.alloc(n); return b.subarray(0, fs.readSync(fd, b, 0, n, 0)).toString('utf8'); } finally { fs.closeSync(fd); }
+  } catch { return null; }
+};
+const out = { node: process.version, files: {}, pkg: null, pkgError: null, index: [] };
+for (const f of ${JSON.stringify(PROJECT_FILES)}) out.files[f] = isFile(f);
+if (out.files['package.json']) {
+  try {
+    const j = JSON.parse(head('package.json', 2097152) || '');
+    if (!j || typeof j !== 'object' || Array.isArray(j)) throw new Error('not a JSON object');
+    const scripts = {};
+    if (j.scripts && typeof j.scripts === 'object') for (const [k, v] of Object.entries(j.scripts)) if (typeof v === 'string' && k.length <= 100) scripts[k] = v.slice(0, 2000);
+    const ws = Array.isArray(j.workspaces) ? j.workspaces : j.workspaces && Array.isArray(j.workspaces.packages) ? j.workspaces.packages : [];
+    const count = (o) => (o && typeof o === 'object' ? Object.keys(o).length : 0);
+    out.pkg = { scripts, packageManager: typeof j.packageManager === 'string' ? j.packageManager.slice(0, 200) : null, workspaces: ws.length, deps: count(j.dependencies) + count(j.devDependencies) };
+  } catch (e) { out.pkgError = String((e && e.message) || e).slice(0, 200); }
 }
+out.pnpmWorkspace = head('pnpm-workspace.yaml', 16384);
+out.yarnrc = head('.yarnrc.yml', 16384);
+out.yarnLock = head('yarn.lock', 1024);
+out.pnpmLock = head('pnpm-lock.yaml', 256);
+for (const d of ${JSON.stringify(INDEX_DIRS)}) if (isFile(d ? d + '/index.html' : 'index.html')) out.index.push(d);
+const m = /^yarnPath:[ \\t]*["']?([^"'\\s#]+)/m.exec(out.yarnrc || '');
+out.yarnPath = m && isFile(m[1]) ? m[1].slice(0, 300) : null;
+process.stdout.write(JSON.stringify(out));
+`;
 
-export function startCommand(kind, { devCmd, port }) {
-  if (devCmd) return devCmd;
-  if (kind.static) return `node /opt/ring/static-server.mjs ${APP_DIR} ${port}`;
-  if (kind.scripts.dev) return `PORT=${port} npm run dev -- --port ${port}`;
-  if (kind.scripts.start) return `PORT=${port} npm start`;
-  return `node /opt/ring/static-server.mjs ${APP_DIR} ${port}`;
-}
-
-/** Install the dependencies inside the sandbox (npm ci when there is a lock file), 300 s at most. */
-export async function installDeps(box, kind) {
-  if (kind.static) return;
-  const r = await box.exec(`cd ${APP_DIR} && timeout -k 5 300 ${kind.lock ? 'npm ci' : 'npm install'} --no-audit --no-fund`, { timeoutMs: 320_000 });
-  if (r.timedOut || r.code === 124) throw new Error('install failed (timeout): it did not finish within 300 s');
-  if (r.code !== 0) {
-    const killed = r.code >= 128 ? ', killed at the time or memory limit' : '';
-    throw new Error(`install failed (exit ${r.code}${killed}): ${r.stderr.trim().split('\n').slice(-3).join(' | ')}`);
-  }
-}
-
-/** Start the dev server in the background and wait until it answers (90 s at most). */
-export async function startDevServer(box, start, port, isExpired = () => false) {
+/**
+ * Inspect /work/app inside the sandbox and plan the install and the start (planProject()).
+ * @param {Sandbox} box
+ * @param {{port?: number}} [o]
+ * @returns {Promise<ReturnType<typeof planProject>>}
+ * @throws {SetupError} for a monorepo, a broken package.json or a project with nothing to serve
+ */
+export async function inspectProject(box, { port = 3000 } = {}) {
   checkPort(port);
-  const d = await box.execDetached(`cd ${APP_DIR} && ${start}`, '/tmp/dev.log');
+  const r = await box.execArgs(['timeout', '-k', '2', '20', 'node', '-e', FACTS], { timeoutMs: 40_000, maxBytes: 2 ** 20 });
+  if (r.code !== 0 || r.truncated) throw new SetupError(SAY.inspect, `inspecting the project failed (exit ${r.code}): ${tailLine(r.stderr)}`);
+  let facts;
+  try {
+    facts = JSON.parse(r.stdout);
+  } catch {
+    throw new SetupError(SAY.inspect, 'inspecting the project printed no JSON');
+  }
+  return planProject(facts, { port });
+}
+
+/** How many package folders pnpm-workspace.yaml lists under `packages:`, not counting the root ('.') or exclusions ('!…'). */
+export function pnpmPackages(text) {
+  if (typeof text !== 'string') return 0;
+  const lines = text.split(/\r?\n/);
+  const at = lines.findIndex((l) => /^packages\s*:/.test(l));
+  if (at < 0) return 0;
+  const items = [];
+  const flow = /^packages\s*:\s*\[(.*)\]\s*(?:#.*)?$/.exec(lines[at]);
+  if (flow) {
+    items.push(...flow[1].split(','));
+  } else {
+    for (const l of lines.slice(at + 1)) {
+      if (/^\s*(?:#.*)?$/.test(l)) continue;
+      const m = /^\s+-\s*(.*?)\s*(?:#.*)?$/.exec(l);
+      if (!m) break;
+      items.push(m[1]);
+    }
+  }
+  return items.map((s) => s.trim().replace(/^['"]|['"]$/g, '')).filter((s) => s && s !== '.' && s !== './' && !s.startsWith('!')).length;
+}
+
+/** Why the project counts as a monorepo (several packages, declared as workspaces), or null. */
+export function monorepoOf(facts) {
+  const files = facts?.files ?? {};
+  if (Number(facts?.pkg?.workspaces) > 0) return 'package.json declares workspaces';
+  if (pnpmPackages(facts?.pnpmWorkspace) > 0) return 'pnpm-workspace.yaml lists packages';
+  if (files['lerna.json']) return 'it has lerna.json';
+  if (files['rush.json']) return 'it has rush.json';
+  return null;
+}
+
+/**
+ * The package manager to install with, from the packageManager field, else the lock file.
+ * @returns {{pm: 'npm'|'pnpm'|'yarn', version: string|null, lock: boolean, why: string, berry?: boolean,
+ *   yarnPath?: string|null, note?: string}}  version: what npm installs (pnpm@<version>), checked against VERSION or 'latest'
+ */
+export function packageManagerOf(facts) {
+  const files = facts?.files ?? {};
+  const field = /^(npm|pnpm|yarn|bun)@(\S+)$/.exec(String(facts?.pkg?.packageManager ?? '').trim());
+  const asked = field ? field[2].split('+')[0] : null; // "pnpm@10.15.1+sha512.…": the hash is not needed
+  const pinned = asked && VERSION.test(asked) ? asked : null;
+  const npmLock = files['package-lock.json'] ? 'package-lock.json' : files['npm-shrinkwrap.json'] ? 'npm-shrinkwrap.json' : null;
+  const bunLock = files['bun.lock'] ? 'bun.lock' : files['bun.lockb'] ? 'bun.lockb' : null;
+  const pm = field?.[1] ?? (files['pnpm-lock.yaml'] ? 'pnpm' : files['yarn.lock'] ? 'yarn' : bunLock ? 'bun' : 'npm');
+  const why = field ? `packageManager ${field[1]}@${pinned ?? 'unreadable version'}`
+    : { pnpm: 'pnpm-lock.yaml', yarn: 'yarn.lock', bun: bunLock, npm: npmLock ?? 'no lock file' }[pm];
+  if (pm === 'bun') return { pm: 'npm', version: null, lock: false, why, note: 'bun is not in the sandbox, so npm installs from package.json' };
+  if (pm === 'npm') return { pm, version: null, lock: Boolean(npmLock), why };
+  if (pm === 'pnpm') {
+    const lockMajor = /lockfileVersion:\s*['"]?(\d+)/.exec(String(facts?.pnpmLock ?? ''))?.[1];
+    const version = pinned ?? ({ 5: '7', 6: '8', 9: '10' }[lockMajor] ?? 'latest');
+    return { pm, version, lock: Boolean(files['pnpm-lock.yaml']), why };
+  }
+  const lock = String(facts?.yarnLock ?? '');
+  const berry = pinned ? Number(pinned.split('.')[0]) >= 2 : /__metadata:/.test(lock) || (!/yarn lockfile v1/.test(lock) && Boolean(files['.yarnrc.yml']));
+  const yarnPath = berry && typeof facts?.yarnPath === 'string' && /^(?!\/)(?!.*\.\.)[\w./-]{1,200}\.c?js$/.test(facts.yarnPath) ? facts.yarnPath : null;
+  return { pm: 'yarn', version: pinned ?? (berry ? '4' : '1'), berry, yarnPath, lock: Boolean(files['yarn.lock']), why };
+}
+
+/** "npm ci", "npm install", "pnpm 10" or "yarn 4 (berry)": what installs the project. */
+export function pmText(info) {
+  if (!info || info.pm === 'npm') return info?.lock ? 'npm ci' : 'npm install';
+  if (info.pm === 'pnpm') return `pnpm ${info.version}`;
+  return `yarn ${info.yarnPath ? `from ${info.yarnPath}` : info.version}${info.berry ? ' (berry)' : ''}`;
+}
+
+/** A script that is one plain command: optional VAR=value words (or cross-env), a tool, its arguments. Null otherwise. */
+export function parseCommand(script) {
+  if (typeof script !== 'string') return null;
+  const words = script.trim().split(/\s+/);
+  // No quotes, $, globs, ~, redirections, pipes, &&, ; or subshells: every word is plain.
+  if (!words[0] || words.length > 40 || !words.every((w) => /^[A-Za-z0-9_@%+=:,./-]+$/.test(w))) return null;
+  let i = 0;
+  if (words[i] === 'cross-env') i++;
+  const env = [];
+  while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_@%+:,./-]*$/.test(words[i])) env.push(words[i++]);
+  if (words[i] === 'npx' || words[i] === 'bunx') i++;
+  if (i >= words.length || words[i].startsWith('-') || words[i].includes('=')) return null;
+  return { env, tool: words[i], args: words.slice(i + 1) };
+}
+
+// Dev servers started directly, bound to the host and port Ring gives them. subs: the tool's
+// subcommands (anything else first is an argument, as in `vite src`); dev: the ones that serve ('' for
+// none); swap: production ones that need a build, replaced with the dev one; port and host: the
+// tool's own flags, dropped from the script before Ring's are added (a repeated --port becomes an
+// array in some CLIs); drop: flags dropped on their own. react-scripts reads PORT and HOST instead.
+const DEV_TOOLS = (() => {
+  const both = (h, p) => ['--host', h, '--port', p];
+  const t = {
+    vite: { subs: ['dev', 'serve', 'preview', 'build', 'optimize'], dev: ['', 'dev', 'serve'], swap: { preview: '' }, port: ['--port'], host: ['--host'], drop: ['--strictPort'], add: (h, p) => [...both(h, p), '--strictPort'] },
+    astro: { subs: ['dev', 'start', 'preview', 'build', 'check', 'sync'], dev: ['dev', 'start'], swap: { preview: 'dev' }, port: ['--port'], host: ['--host'], add: both },
+    next: { subs: ['dev', 'start', 'build', 'lint', 'export', 'info', 'telemetry'], dev: ['', 'dev'], swap: { start: 'dev' }, port: ['--port', '-p'], host: ['--hostname', '-H'], add: (h, p) => ['--hostname', h, '--port', p] },
+    nuxt: { subs: ['dev', 'start', 'preview', 'build', 'generate'], dev: ['dev'], swap: { start: 'dev', preview: 'dev' }, port: ['--port', '-p'], host: ['--host'], add: both },
+    'react-scripts': { subs: ['start', 'build', 'test', 'eject'], dev: ['start'], port: [], host: [], add: () => [] },
+    'vue-cli-service': { subs: ['serve', 'build', 'lint', 'inspect'], dev: ['serve'], port: ['--port'], host: ['--host'], add: both },
+    webpack: { subs: ['serve', 'build', 'watch', 'info'], dev: ['serve'], port: ['--port'], host: ['--host'], add: both },
+    'webpack-dev-server': { subs: [], dev: [''], port: ['--port'], host: ['--host'], add: both },
+    ng: { subs: ['serve', 'build', 'test', 'lint', 'e2e'], dev: ['serve'], port: ['--port'], host: ['--host'], add: both },
+    gatsby: { subs: ['develop', 'build', 'serve', 'clean'], dev: ['develop'], swap: { serve: 'develop' }, port: ['--port', '-p'], host: ['--host', '-H'], add: both },
+    docusaurus: { subs: ['start', 'build', 'serve', 'deploy', 'clear'], dev: ['start'], swap: { serve: 'start' }, port: ['--port'], host: ['--host'], drop: ['--no-open'], add: (h, p) => [...both(h, p), '--no-open'] },
+    vitepress: { subs: ['dev', 'build', 'preview', 'serve'], dev: ['', 'dev'], swap: { preview: 'dev', serve: 'dev' }, port: ['--port'], host: ['--host'], add: both },
+    'svelte-kit': { subs: ['dev', 'build', 'preview', 'sync'], dev: ['dev'], swap: { preview: 'dev' }, port: ['--port', '-p'], host: ['--host', '-H'], add: both },
+    'react-router': { subs: ['dev', 'build', 'routes', 'typegen', 'reveal'], dev: ['dev'], port: ['--port'], host: ['--host'], add: both },
+    remix: { subs: ['vite:dev', 'vite:build', 'dev', 'build', 'routes'], dev: ['vite:dev'], port: ['--port'], host: ['--host'], add: both },
+    rsbuild: { subs: ['dev', 'build', 'preview', 'inspect'], dev: ['', 'dev'], swap: { preview: 'dev' }, port: ['--port'], host: ['--host'], add: both },
+    vinxi: { subs: ['dev', 'build', 'start'], dev: ['dev'], swap: { start: 'dev' }, port: ['--port'], host: ['--host'], add: both },
+    parcel: { subs: ['serve', 'watch', 'build'], dev: ['', 'serve'], port: ['--port', '-p'], host: ['--host'], add: both },
+  };
+  t.nuxi = t.nuxt;
+  return t;
+})();
+
+/** The arguments without the tool's own port and host flags (and their values) and without `drop`. */
+function stripFlags(args, tool) {
+  const withValue = [...tool.port, ...tool.host];
+  const out = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if ((tool.drop ?? []).includes(a)) continue;
+    if (withValue.includes(a.split('=')[0])) {
+      if (!a.includes('=') && i + 1 < args.length && !args[i + 1].startsWith('-')) i++;
+      continue;
+    }
+    out.push(a);
+  }
+  return out;
+}
+
+const QUIET = 'NEXT_TELEMETRY_DISABLED=1 ASTRO_TELEMETRY_DISABLED=1 NUXT_TELEMETRY_DISABLED=1 GATSBY_TELEMETRY_DISABLED=1 DO_NOT_TRACK=1';
+// For the install: downloads that only test tools need (the allowlist would refuse them anyway) and
+// git hooks are skipped.
+const INSTALL_ENV = `PATH=${PM_PREFIX}/bin:$PATH PUPPETEER_SKIP_DOWNLOAD=1 PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=1 PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 `
+  + `CYPRESS_INSTALL_BINARY=0 ELECTRON_SKIP_BINARY_DOWNLOAD=1 HUSKY=0 SKIP_INSTALL_SIMPLE_GIT_HOOKS=1 DISABLE_OPENCOLLECTIVE=1 ADBLOCK=1 ${QUIET}`;
+// Yarn 2+ in the sandbox: node_modules (so dev servers find their binaries), no global or in-repo cache, the proxy.
+const YARN_BERRY_ENV = 'YARN_NODE_LINKER=node-modules YARN_ENABLE_IMMUTABLE_INSTALLS=false YARN_ENABLE_GLOBAL_CACHE=false '
+  + 'YARN_CACHE_FOLDER=/work/.yarn-cache YARN_ENABLE_TELEMETRY=0 YARN_ENABLE_PROGRESS_BARS=false YARN_HTTP_PROXY=$HTTP_PROXY YARN_HTTPS_PROXY=$HTTPS_PROXY';
+
+function devEnv(port, host, binFirst) {
+  return `export PATH=${binFirst ? `${APP_DIR}/node_modules/.bin:` : ''}${PM_PREFIX}/bin:$PATH BROWSER=none PORT=${port} HOST=${host} ${QUIET}`;
+}
+
+/** The static file server on `root` (a folder from INDEX_DIRS). */
+function staticCommand(root, port) {
+  if (!INDEX_DIRS.includes(root)) throw new TypeError(`invalid static root: ${root}`);
+  return `cd ${APP_DIR} && exec node /opt/ring/static-server.mjs ${root ? `${APP_DIR}/${root}` : APP_DIR} ${port}`;
+}
+
+/**
+ * The command that starts the app from one package.json script. A plain command of a dev server in
+ * DEV_TOOLS runs directly (node_modules/.bin first on PATH), with its own port and host flags replaced
+ * by `host` and `port`; anything else runs as `<pm> run <name>` with PORT and HOST set. BROWSER=none
+ * keeps `--open` from trying to start a browser.
+ * @param {string} script  the script's text
+ * @param {{name: string, pm?: string, port: number, host?: string}} o
+ * @returns {{tool: string|null, start: string, shown: string}}  shown: the command, for the live log
+ */
+export function devCommand(script, { name, pm = 'npm', port, host = '127.0.0.1' }) {
+  checkPort(port);
+  checkHost(host);
+  if (!RUNNABLE.includes(name)) throw new TypeError(`not a runnable script: ${name}`);
+  const parsed = parseCommand(script);
+  const tool = parsed && Object.hasOwn(DEV_TOOLS, parsed.tool) ? DEV_TOOLS[parsed.tool] : null;
+  if (tool) {
+    let args = parsed.args;
+    let sub = args.length && tool.subs.includes(args[0]) ? args[0] : '';
+    if (sub) args = args.slice(1);
+    if (tool.swap && Object.hasOwn(tool.swap, sub)) sub = tool.swap[sub];
+    if (tool.dev.includes(sub)) {
+      const words = [parsed.tool, ...(sub ? [sub] : []), ...stripFlags(args, tool), ...tool.add(host, String(port))];
+      const env = parsed.env.length ? `env ${parsed.env.join(' ')} ` : '';
+      return { tool: parsed.tool, start: `cd ${APP_DIR} && ${devEnv(port, host, true)} && exec ${env}${words.join(' ')}`, shown: words.join(' ') };
+    }
+  }
+  const run = `${['npm', 'pnpm', 'yarn'].includes(pm) ? pm : 'npm'} run ${name}`;
+  return { tool: parsed?.tool ?? null, start: `cd ${APP_DIR} && ${devEnv(port, host, false)} && exec ${run}`, shown: `${run} (PORT=${port} HOST=${host})` };
+}
+
+/** Follow a script that only runs another one (`npm run dev`, `pnpm dev`, `yarn start`), two steps at most. */
+function resolveScript(scripts, name) {
+  let current = name;
+  for (let depth = 0; depth < 2; depth++) {
+    const p = parseCommand(scripts[current]);
+    if (!p || p.env.length || !['npm', 'pnpm', 'yarn'].includes(p.tool)) break;
+    const a = p.args[0] === 'run' || p.args[0] === 'run-script' ? p.args.slice(1) : p.args;
+    if (a.length !== 1 || a[0] === current || !RUNNABLE.includes(a[0]) || typeof scripts[a[0]] !== 'string') break;
+    current = a[0];
+  }
+  return current;
+}
+
+/**
+ * Plan a project from what inspectProject() found: whether to install and with what, and how to start
+ * it. Pure; it throws SetupError for a project Ring refuses. Everything taken from the repository is
+ * checked here before it reaches a command.
+ * @param {object} facts  the JSON that FACTS prints inside the sandbox
+ * @param {{port?: number, host?: string}} [o]
+ * @returns {{static: boolean, install: boolean, root: string|null, pm: string|null, pmInfo: object|null,
+ *   script: string|null, tool: string|null, start: string, shown: string, notes: string[], lock: boolean,
+ *   scripts: Record<string, string>}}
+ *   static: no package.json at all; root: the folder the static server serves; shown: for the live log
+ */
+export function planProject(facts, { port = 3000, host = '127.0.0.1' } = {}) {
+  checkPort(port);
+  checkHost(host);
+  const f = facts && typeof facts === 'object' ? facts : {};
+  const files = f.files && typeof f.files === 'object' ? f.files : {};
+  const index = (Array.isArray(f.index) ? f.index : []).filter((d) => INDEX_DIRS.includes(d));
+  const notes = [];
+  const servedFrom = (root) => `static files from /${root}`;
+  if (!files['package.json']) {
+    if (!index.length) throw new SetupError(SAY.nothingToServe, 'no package.json and no index.html');
+    return {
+      static: true, install: false, root: index[0], pm: null, pmInfo: null, script: null, tool: null,
+      start: staticCommand(index[0], port), shown: servedFrom(index[0]), notes, lock: false, scripts: {},
+    };
+  }
+  if (f.pkgError || !f.pkg || typeof f.pkg !== 'object') throw new SetupError(SAY.badPackageJson, `package.json: ${String(f.pkgError ?? 'not read').slice(0, 200)}`);
+  const mono = monorepoOf(f);
+  if (mono) throw new SetupError(SAY.monorepo, `a monorepo: ${mono}`);
+  const pmInfo = packageManagerOf(f);
+  if (pmInfo.note) notes.push(pmInfo.note);
+  const scripts = {};
+  for (const [k, v] of Object.entries(f.pkg.scripts && typeof f.pkg.scripts === 'object' ? f.pkg.scripts : {})) if (typeof v === 'string') scripts[k] = v;
+  const deps = Number(f.pkg.deps) || 0;
+  if (!deps) notes.push('no dependencies to install');
+  const base = { static: false, install: deps > 0, pm: pmInfo.pm, pmInfo, notes, lock: pmInfo.lock, scripts };
+  const name = RUNNABLE.find((n) => typeof scripts[n] === 'string' && scripts[n].trim());
+  if (!name) {
+    if (!index.length) throw new SetupError(SAY.nothingToServe, `package.json has no ${RUNNABLE.join(', ')} script, and there is no index.html`);
+    notes.push(`no ${RUNNABLE.join('/')} script`);
+    return { ...base, root: index[0], script: null, tool: null, start: staticCommand(index[0], port), shown: servedFrom(index[0]) };
+  }
+  const resolved = resolveScript(scripts, name);
+  const dev = devCommand(scripts[resolved], { name: resolved, pm: pmInfo.pm, port, host });
+  return { ...base, root: null, script: resolved, tool: dev.tool, start: dev.start, shown: dev.shown };
+}
+
+/** One line for the live log: the package manager and why, and how the app starts. */
+export function describePlan(kind) {
+  if (!kind || typeof kind !== 'object') return 'project: not inspected';
+  const parts = kind.static ? ['no package.json'] : kind.pmInfo ? [`${pmText(kind.pmInfo)} (${kind.pmInfo.why})`] : [];
+  parts.push(kind.script ? `start: ${kind.shown}` : kind.shown ?? 'static files');
+  return `project: ${[...parts, ...(kind.notes ?? [])].join(' · ')}`.slice(0, 400);
+}
+
+/**
+ * The start command: `devCmd` when given, else the one inspectProject() planned. The older shapes
+ * ({static: true} or {scripts, lock}) still work.
+ */
+export function startCommand(kind, { devCmd, port = 3000 } = {}) {
+  if (devCmd) return devCmd;
+  if (typeof kind?.start === 'string') return kind.start;
+  if (kind?.static || !kind?.scripts) return staticCommand('', port);
+  const name = ['dev', 'start'].find((n) => typeof kind.scripts[n] === 'string');
+  return name ? devCommand(kind.scripts[name], { name, port }).start : staticCommand('', port);
+}
+
+/** The first install command for a package manager. */
+function installCommand(info) {
+  if (info.pm === 'pnpm') return 'pnpm install --store-dir /work/.pnpm-store';
+  if (info.pm === 'yarn') {
+    return info.berry ? 'yarn install'
+      : 'yarn install --non-interactive --ignore-engines --no-progress --cache-folder /work/.yarn-cache --network-timeout 300000 --proxy "$HTTP_PROXY" --https-proxy "$HTTPS_PROXY"';
+  }
+  return info.lock ? 'npm ci --no-audit --no-fund' : 'npm install --no-audit --no-fund';
+}
+
+/**
+ * The command to try after an install failed, or null: `npm ci` with a lock file that is out of date
+ * becomes `npm install`; a peer-dependency conflict (ERESOLVE) gets `--legacy-peer-deps`; pnpm's lock
+ * file errors get `--no-frozen-lockfile`. Each happens at most once.
+ */
+export function installRetry(info, cmd, output) {
+  const t = String(output ?? '');
+  if (info?.pm === 'npm' || !info?.pm) {
+    if (cmd.startsWith('npm ci') && /can only install packages when your package\.json and package-lock\.json|are in sync|Missing: \S+ from lock file|Invalid: lock file|\bEUSAGE\b/i.test(t)) return 'npm install --no-audit --no-fund';
+    if (/\bERESOLVE\b/.test(t) && !cmd.includes('--legacy-peer-deps')) return 'npm install --no-audit --no-fund --legacy-peer-deps';
+    return null;
+  }
+  if (info.pm === 'pnpm' && /ERR_PNPM_(?:OUTDATED_LOCKFILE|LOCKFILE_BREAKING_CHANGE|BROKEN_LOCKFILE|LOCKFILE_MISSING_DEPENDENCY|FROZEN_LOCKFILE)/.test(t) && !cmd.includes('--no-frozen-lockfile')) {
+    return `${cmd} --no-frozen-lockfile`;
+  }
+  return null;
+}
+
+/**
+ * The host an install tried to reach outside the allowlist: its name, '' when the proxy refused a host
+ * that the output does not name, or null when the failure was not about the network outside.
+ */
+export function offAllowlistHost(output) {
+  const t = String(output ?? '');
+  const hosts = [];
+  for (const m of t.matchAll(/(?:ENOTFOUND|EAI_AGAIN)\s+([a-z0-9-]+(?:\.[a-z0-9-]+)+)/gi)) hosts.push(m[1]);
+  for (const m of t.matchAll(/https?:\/\/([a-z0-9-]+(?:\.[a-z0-9-]+)+)(?::\d+)?/gi)) hosts.push(m[1]);
+  const network = /ENOTFOUND|EAI_AGAIN|getaddrinfo|tunneling socket|statusCode=403|403 Forbidden|Bad response: 403|Received HTTP code 403|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH/i.test(t);
+  if (!network) return null;
+  const off = hosts.map((h) => h.toLowerCase()).filter((h) => !ALLOWLIST.includes(h) && h.length <= 100);
+  if (off.length) return off.at(-1);
+  return /tunneling socket|statusCode=403|403 Forbidden|Bad response: 403|Received HTTP code 403|ENOTFOUND|EAI_AGAIN/i.test(t) ? '' : null;
+}
+
+/** The sentence for an install that failed, from its output, exit code and whether its time ran out. */
+export function installFailure(output, { code = 1, timedOut = false, pm = 'npm' } = {}) {
+  const t = String(output ?? '');
+  if (timedOut || code === 124) return SAY.installTime;
+  if (/\bENOSPC\b|no space left on device/i.test(t)) return SAY.installSpace;
+  const host = offAllowlistHost(t);
+  if (host !== null) return sayOffAllowlist(host);
+  if (/\bE404\b|404 Not Found - GET https:\/\/registry\.npmjs\.org|ERR_PNPM_FETCH_404|\bETARGET\b|No matching version found|Couldn't find package/i.test(t)) return SAY.installPrivate;
+  if (/\bEBADENGINE\b|ERR_PNPM_UNSUPPORTED_ENGINE|engine "node" is incompatible|Unsupported engine/i.test(t)) return SAY.installNode;
+  if (code === 137 || code > 128) return SAY.installMemory;
+  return sayInstallFailed(pm);
+}
+
+/**
+ * Install the dependencies inside the sandbox, 300 s at most in all: pnpm or yarn first when the
+ * project uses it, then the install, then at most two retries (installRetry()).
+ * @param {Sandbox} box
+ * @param {object} kind  what inspectProject() returned
+ * @returns {Promise<{pm: string|null, ran: string[]}>}  pm: pmText(); ran: the commands, in order
+ * @throws {SetupError}
+ */
+export async function installDeps(box, kind) {
+  if (kind?.static || kind?.install === false) return { pm: null, ran: [] };
+  const info = kind?.pmInfo ?? { pm: 'npm', lock: Boolean(kind?.lock), version: null };
+  const env = `${INSTALL_ENV}${info.pm === 'yarn' && info.berry ? ` ${YARN_BERRY_ENV}` : ''}`;
+  const until = Date.now() + INSTALL_SEC * 1000;
+  const ran = [];
+  let last = null;
+  const attempt = async (cmd) => {
+    const left = Math.floor((until - Date.now()) / 1000);
+    if (left < 5) throw new SetupError(SAY.installTime, `no time was left for: ${cmd}`);
+    ran.push(cmd);
+    const r = await box.exec(`cd ${APP_DIR} && export ${env} && timeout -k 5 ${left} ${cmd}`, { timeoutMs: (left + 20) * 1000 });
+    last = { cmd, r, outOfTime: Date.now() >= until - 1000 };
+    return r.code === 0 && !r.timedOut;
+  };
+  const fail = () => {
+    const { cmd, r, outOfTime } = last;
+    const text = `${r.stderr}\n${r.stdout}`; // pnpm prints its errors on stdout
+    throw new SetupError(installFailure(text, { code: r.code, timedOut: r.timedOut || outOfTime, pm: info.pm }),
+      `${cmd} failed (exit ${r.code}): ${tailLine(text)}`);
+  };
+
+  if (info.pm === 'yarn' && info.yarnPath) {
+    // The project ships its own yarn: a `yarn` on PATH that runs it.
+    const shim = `mkdir -p ${PM_PREFIX}/bin && printf '%s\\n' '#!/bin/sh' 'exec node ${APP_DIR}/${info.yarnPath} "$@"' > ${PM_PREFIX}/bin/yarn && chmod +x ${PM_PREFIX}/bin/yarn`;
+    if (!(await attempt(`sh -c ${sh(shim)}`))) fail();
+  } else if (info.pm === 'pnpm' || info.pm === 'yarn') {
+    const name = info.pm === 'pnpm' ? 'pnpm' : info.berry ? '@yarnpkg/cli-dist' : 'yarn';
+    const version = info.version === 'latest' || VERSION.test(String(info.version)) ? info.version : 'latest';
+    const get = (v) => `npm install --global --prefix ${PM_PREFIX} --no-audit --no-fund ${name}@${v}`;
+    if (!(await attempt(get(version)))) {
+      // A version npm does not have: its major release line, once.
+      const major = /^(\d+)\./.exec(version)?.[1];
+      if (!major || !/\bETARGET\b|No matching version|\bE404\b/i.test(`${last.r.stderr}\n${last.r.stdout}`) || !(await attempt(get(major)))) fail();
+    }
+  }
+  let cmd = installCommand(info);
+  for (let tries = 0; tries < 3; tries++) {
+    if (await attempt(cmd)) return { pm: pmText(info), ran };
+    const next = installRetry(info, cmd, `${last.r.stderr}\n${last.r.stdout}`);
+    if (!next || last.outOfTime) break;
+    cmd = next;
+  }
+  fail();
+}
+
+/** The ports a dev server printed in its log (http://localhost:5173/, "listening on port 8080"), at most 4. */
+export function portsInLog(text) {
+  const t = String(text ?? '').replace(ANSI, '');
+  const found = [];
+  const add = (s) => {
+    const p = Number(s);
+    if (Number.isInteger(p) && p >= 1 && p <= 65535 && !found.includes(p)) found.push(p);
+  };
+  for (const m of t.matchAll(/\bhttps?:\/\/(?:\[[0-9a-f:.]*\]|[a-z0-9.-]+):(\d{2,5})\b/gi)) add(m[1]);
+  for (const m of t.matchAll(/\b(?:listening|running|started|serving|available|ready)\b[^\n]{0,40}?\bport\s*:?\s*(\d{2,5})\b/gi)) add(m[1]);
+  return found.slice(0, 4);
+}
+
+/** The sentence for a dev server that never answered: a Node version it refuses, a process that exited, or silence. */
+export function serveFailure(log, { alive = true } = {}) {
+  const t = String(log ?? '').replace(ANSI, '');
+  if (/You are using Node\.js|requires? Node(?:\.js)?(?: version)? *[>=v^~]*\d|Node\.js v?\d[\d.]* is not supported|Node\.js version [^\n]{0,40} is required|Unsupported Node\.js version/i.test(t)) return SAY.serveNode;
+  return alive ? SAY.serveTime : SAY.serveStopped;
+}
+
+// Inside the sandbox: fetch every candidate address at once (4 s each) and print the first that
+// answered, in the given order, and whether the dev server's process (its pid file) is still running.
+const PROBE = `
+const fs = require('fs');
+const [list, pidFile] = process.argv.slice(1);
+let alive = null;
+let pid = 0;
+try { pid = Number(fs.readFileSync(pidFile, 'utf8').trim()); } catch {}
+if (pid > 1) {
+  try { const st = fs.readFileSync('/proc/' + pid + '/stat', 'utf8'); alive = st.charAt(st.lastIndexOf(')') + 2) !== 'Z'; } catch { alive = false; }
+}
+const cands = JSON.parse(list);
+const url = (c) => 'http://' + (c.host.includes(':') ? '[' + c.host + ']' : c.host) + ':' + c.port + '/';
+Promise.all(cands.map((c) => fetch(url(c), { signal: AbortSignal.timeout(4000), redirect: 'manual' }).then(() => true, () => false)))
+  .then((ok) => process.stdout.write(JSON.stringify({ up: ok.indexOf(true) >= 0 ? cands[ok.indexOf(true)] : null, alive })));
+`;
+
+// Inside the sandbox: request each route once, 60 s in all, so a dev server that compiles a page on
+// its first request (Next.js, Astro) has done so before Mantis measures it.
+const WARM = `
+const [base, list] = process.argv.slice(1);
+const until = Date.now() + 60000;
+(async () => {
+  const out = [];
+  for (const r of JSON.parse(list)) {
+    const left = until - Date.now();
+    if (left < 1000) break;
+    const t = Date.now();
+    try {
+      const res = await fetch(base + r, { signal: AbortSignal.timeout(Math.min(45000, left)), redirect: 'manual' });
+      await res.arrayBuffer().catch(() => {});
+      out.push(r + ' ' + res.status + ' in ' + (Date.now() - t) + ' ms');
+    } catch (e) { out.push(r + ' ' + ((e && e.name) || 'error') + ' after ' + (Date.now() - t) + ' ms'); }
+  }
+  process.stdout.write(out.join(', '));
+})();
+`;
+
+/** Where the app answers now, if anywhere, and whether its process is still running. */
+async function probeServer(box, port) {
+  const log = await box.exec(`tail -c 16384 ${DEV_LOG} 2> /dev/null`, { timeoutMs: 15_000 });
+  const ports = [port, ...portsInLog(log.stdout).filter((p) => p !== port)].slice(0, 5);
+  const cands = ports.flatMap((p) => LOOPBACK.map((host) => ({ host, port: p })));
+  const r = await box.execArgs(['node', '-e', PROBE, JSON.stringify(cands), DEV_PID], { timeoutMs: 20_000, maxBytes: 4096 });
+  let out = {};
+  try { out = JSON.parse(r.stdout); } catch { out = {}; }
+  const up = out?.up && LOOPBACK.includes(out.up.host) && ports.includes(out.up.port) ? { host: out.up.host, port: out.up.port } : null;
+  return { up, alive: typeof out?.alive === 'boolean' ? out.alive : null };
+}
+
+/**
+ * Start the app in the background and wait until it answers, 90 s at most: on 127.0.0.1 or ::1, on
+ * `port` or on a port its log names. Gives up early when its process has exited. Then each of
+ * `routes` is requested once (warm-up).
+ * @param {Sandbox} box
+ * @param {string} start  startCommand()
+ * @param {number} port
+ * @param {() => boolean} [isExpired]
+ * @param {{routes?: string[]}} [o]
+ * @returns {Promise<{host: string, port: number, url: string, warm: string}>}
+ * @throws {SetupError} when nothing answered; Error('task timed out') when isExpired()
+ */
+export async function startDevServer(box, start, port, isExpired = () => false, { routes = [] } = {}) {
+  checkPort(port);
+  const d = await box.execDetached(`echo $$ > ${DEV_PID}; ${start}`, DEV_LOG);
   if (d.code !== 0) throw new Error(isExpired() ? 'task timed out' : `could not start the dev server: ${lastLine(d.stderr) || `exit ${d.code}`}`);
-  // Each probe is capped at 5 s, so a server that accepts connections but never answers cannot stall the wait.
-  const until = Date.now() + 90_000;
+  // Each probe is capped at 4 s, so a server that accepts connections but never answers cannot stall the wait.
+  const until = Date.now() + SERVE_SEC * 1000;
+  let gone = 0;
   while (Date.now() < until) {
-    if (await devServerUp(box, port)) return;
+    const p = await probeServer(box, port);
+    if (p.up) {
+      const url = baseUrl(p.up);
+      const paths = (Array.isArray(routes) ? routes : []).filter((r) => typeof r === 'string' && r.startsWith('/') && r.length <= 200 && !/\s/.test(r)).slice(0, 3);
+      let warm = '';
+      if (paths.length && !isExpired()) {
+        const w = await box.execArgs(['node', '-e', WARM, url, JSON.stringify(paths)], { timeoutMs: 75_000, maxBytes: 8192 });
+        warm = String(w.stdout).slice(0, 500);
+      }
+      return { ...p.up, url, warm };
+    }
     if (isExpired()) throw new Error('task timed out');
+    gone = p.alive === false ? gone + 1 : 0;
+    if (gone >= 2) break; // exited, and nothing answers in its place
     await sleep(1000);
   }
-  const tail = await box.exec('tail -n 20 /tmp/dev.log', { timeoutMs: 15_000 });
-  throw new Error(`dev server did not answer on port ${port} within 90 s:\n${tail.stdout}`);
+  if (isExpired()) throw new Error('task timed out');
+  const tail = await box.exec(`tail -c 4000 ${DEV_LOG}`, { timeoutMs: 15_000 });
+  throw new SetupError(serveFailure(tail.stdout, { alive: gone < 2 }),
+    `dev server ${gone >= 2 ? 'exited' : `did not answer within ${SERVE_SEC} s`}: ${tailLine(tail.stdout) || 'no output'}`);
 }
 
-/** One request to the dev server, 5 s at most. True when it answers at all, whatever the status code. */
-export async function devServerUp(box, port) {
-  checkPort(port);
-  const r = await box.exec(`node -e "fetch('http://127.0.0.1:${port}/', { signal: AbortSignal.timeout(5000) }).then(() => process.exit(0), () => process.exit(1))"`, { timeoutMs: 20_000 });
+/**
+ * One request to the app, 5 s at most. True when it answers at all, whatever the status code.
+ * @param {Sandbox} box
+ * @param {number | {host: string, port: number}} origin  a port on 127.0.0.1, or where startDevServer() found the app
+ */
+export async function devServerUp(box, origin) {
+  const url = baseUrl(typeof origin === 'number' ? { port: origin } : origin);
+  const r = await box.exec(`node -e "fetch('${url}/', { signal: AbortSignal.timeout(5000) }).then(() => process.exit(0), () => process.exit(1))"`, { timeoutMs: 20_000 });
   return r.code === 0;
 }
 
@@ -172,21 +783,22 @@ function csv(name, value) {
  * explicit baseline run folder or with none, never `auto`, which would pick up a rejected run.
  * The run is time-limited inside the sandbox (`timeout -k`), so a stuck look never outlives its limit.
  * @param {Sandbox} box
- * @param {{port: number, routes?: string|string[], locales?: string|string[], viewports?: string|string[],
+ * @param {{port: number, host?: string, routes?: string|string[], locales?: string|string[], viewports?: string|string[],
  *   schemes?: string|string[], baseline?: 'none'|string, prevRunId?: string, timeoutSec?: number}} o
+ *   host: 127.0.0.1 (the default) or ::1, where startDevServer() found the app;
  *   baseline: 'none' (the default) or the absolute run folder inside the sandbox to compare with;
  *   prevRunId: the previous look's run id, which this look must not return again; timeoutSec: 300.
  * @returns {Promise<{report: object, runId: string, runDir: string, exitCode: 0|1|2, crashed: boolean, ms: number}>}
  *   crashed: exit 2 with a report, some cells could not be analysed (the rest were measured)
  * @throws {LookError} when there is no usable report
  */
-export async function look(box, { port, routes = '/', locales, viewports, schemes, baseline = 'none', prevRunId, timeoutSec = 300 } = {}) {
-  checkPort(port);
+export async function look(box, { port, host = '127.0.0.1', routes = '/', locales, viewports, schemes, baseline = 'none', prevRunId, timeoutSec = 300 } = {}) {
+  const url = baseUrl({ host, port });
   if (!Number.isInteger(timeoutSec) || timeoutSec < 1 || timeoutSec > 3600) throw new TypeError(`look: invalid timeoutSec ${timeoutSec}`);
   if (baseline !== 'none' && !(typeof baseline === 'string' && baseline.startsWith('/'))) {
     throw new TypeError(`look: baseline must be 'none' or an absolute run folder, got ${JSON.stringify(baseline)}`);
   }
-  const args = ['look', `http://127.0.0.1:${port}`, '--routes', csv('routes', routes)];
+  const args = ['look', url, '--routes', csv('routes', routes)];
   for (const [name, value] of [['locales', locales], ['viewports', viewports], ['schemes', schemes]]) {
     if (value != null && value !== '') args.push(`--${name}`, csv(name, value));
   }
@@ -229,7 +841,8 @@ export async function look(box, { port, routes = '/', locales, viewports, scheme
  *   timeoutSec?: number, outDir?: string, runtime?: string}} opts
  * @param {(line: string) => void} [log]
  * @returns {Promise<{ok: boolean, repo: string, steps: {name: string, ms: number}[], sandbox?: string,
- *   network?: string, reportDir?: string, summary?: object, error?: string, destroyed?: boolean, seconds: number}>}
+ *   network?: string, plan?: string, url?: string, reportDir?: string, summary?: object, error?: string,
+ *   destroyed?: boolean, seconds: number}>}
  *   `destroyed`: the container is gone and so is its own network
  */
 export async function runTask(opts, log = () => {}) {
@@ -262,11 +875,15 @@ export async function runTask(opts, log = () => {}) {
 
   try {
     await step('bring the repo in', () => bringIn(box, repo));
-    const kind = await step('inspect the project', () => inspectProject(box));
+    const kind = await step('inspect the project', () => inspectProject(box, { port }));
+    result.plan = describePlan(kind);
+    log(`  ${result.plan}`);
     const start = startCommand(kind, { devCmd, port });
-    if (!kind.static) await step('install dependencies', () => installDeps(box, kind));
-    await step('start the dev server', () => startDevServer(box, start, port, () => expired));
-    const { report, runDir } = await step('mantis look', () => look(box, { port, routes, locales }));
+    if (!kind.static && kind.install !== false) await step('install dependencies', () => installDeps(box, kind));
+    const routeList = String(routes).split(',').map((s) => s.trim()).filter(Boolean);
+    const origin = await step('start the dev server', () => startDevServer(box, start, port, () => expired, { routes: routeList }));
+    result.url = origin.url;
+    const { report, runDir } = await step('mantis look', () => look(box, { port: origin.port, host: origin.host, routes, locales }));
 
     const dest = path.resolve(outDir, box.name);
     await step('copy the report out', async () => {
@@ -281,7 +898,7 @@ export async function runTask(opts, log = () => {}) {
     });
     Object.assign(result, { ok: true, reportDir: dest, summary: report.summary });
   } catch (err) {
-    result.error = expired ? `task timed out after ${timeoutSec}s` : err.message;
+    result.error = expired ? `task timed out after ${timeoutSec}s` : err.publicMessage ? `${err.publicMessage} (${err.message})` : err.message;
   } finally {
     clearTimeout(deadline);
     try {

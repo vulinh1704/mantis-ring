@@ -24,7 +24,7 @@ import { buildReceipt, diffStats, receiptLine, receiptMarkdown } from './receipt
 import { FILE_TOOL_NAMES, TOOL_SCHEMAS, ToolError, WRITE_TOOL_NAMES, fileTools, parseToolCall } from './tools.mjs';
 import { changedSince, initWorkspace, isClean, patchApplies, patchSince, revertTo, snapshot, stageAll, tamperHits } from './workspace.mjs';
 import { LIMITS, Sandbox, networkText } from '../runner/sandbox.mjs';
-import { bringIn, devServerUp, inspectProject, installDeps, look, startCommand, startDevServer } from '../runner/run-task.mjs';
+import { baseUrl, bringIn, describePlan, devServerUp, inspectProject, installDeps, look, startCommand, startDevServer } from '../runner/run-task.mjs';
 
 /** Caps of a public task (§2.4). Admin tasks may raise them up to ADMIN_MAX. */
 export const DEFAULT_CAPS = Object.freeze({
@@ -369,7 +369,8 @@ class FixRun {
     this.tallyBeforeVision = null; // set after destroy, so the receipt can tell fix calls from vision calls
     // setup results. `expected`: the R0 screens every later run must measure again (status 'ok' and a
     // state in R0's state.json, so Mantis can compare them); a run that loses one is not accepted.
-    this.src = null; this.start = null; this.serverKind = 'static files'; this.matrixArgs = null;
+    // `origin`: where the app answers in its sandbox ({host, port}), as startDevServer() found it.
+    this.src = null; this.start = null; this.serverKind = 'static files'; this.matrixArgs = null; this.origin = null;
     this.R0 = null; this.R0dir = null; this.r0Crashed = 0; this.noIssues = false; this.expected = new Set(); this.r0State = null;
     // conversation. `seenCompactable`: how many compactable tool results the model has already been sent.
     this.messages = []; this.compactable = []; this.seenCompactable = 0; this.tools = null;
@@ -571,7 +572,8 @@ class FixRun {
       this.src = await this.timed('clone', () => bringIn(this.box, s.kind === 'github' ? { kind: 'github', owner: s.owner, name: s.name } : { kind: 'local', dir: s.dir }));
     } catch (err) {
       if (this.ac.signal.aborted) throw new Stopped();
-      throw failure(s.kind === 'github' ? 'The repository could not be cloned from GitHub.' : 'The sample could not be copied into the sandbox.', err);
+      // The runner's own sentence when it has one: a missing or private repository, one too big, a slow clone.
+      throw failure(err?.publicMessage ?? (s.kind === 'github' ? 'The repository could not be cloned from GitHub.' : 'The sample could not be copied into the sandbox.'), err);
     }
     const commit = this.src?.commit ? String(this.src.commit).slice(0, 12) : null;
     this.say(s.kind === 'github' ? `clone done · ${s.owner}/${s.name} at commit ${commit ?? 'unknown'}` : `sample ${s.name} copied in`);
@@ -581,24 +583,31 @@ class FixRun {
     const ti = Date.now();
     this.step('install', 'start');
     let kind;
+    let installed = null;
     try {
-      kind = await this.timed('install', () => inspectProject(this.box));
+      // A monorepo, a broken package.json or nothing to serve is refused here, with the runner's sentence.
+      kind = await this.timed('install', () => inspectProject(this.box, { port: PORT }));
       this.start = startCommand(kind, { port: PORT });
-      await this.timed('install', () => this.heavy(() => installDeps(this.box, kind)));
+      this.say(describePlan(kind));
+      installed = await this.timed('install', () => this.heavy(() => installDeps(this.box, kind)));
     } catch (err) {
       if (err instanceof Stopped || this.ac.signal.aborted) throw new Stopped();
-      throw failure(/time(d)? ?out/i.test(String(err?.message)) ? "The project's dependencies could not be installed in time." : FAILURE.install, err);
+      throw failure(err?.publicMessage ?? (/time(d)? ?out/i.test(String(err?.message)) ? "The project's dependencies could not be installed in time." : FAILURE.install), err);
     }
     this.serverKind = /static-server/.test(String(this.start)) ? 'static files' : 'its dev server';
-    this.say(kind?.static ? 'static files: nothing to install' : `dependencies installed through the proxy in ${secs(Date.now() - ti)} s`);
+    this.say(kind?.static ? 'static files: nothing to install'
+      : kind?.install === false ? 'no dependencies: nothing to install'
+        : `dependencies installed through the proxy in ${secs(Date.now() - ti)} s${installed?.ran?.length ? ` (${installed.ran.at(-1).split(' --')[0]})` : ''}`);
     this.phase = 'serve';
     try {
-      await this.timed('serve', () => startDevServer(this.box, this.start, PORT, () => this.ac.signal.aborted));
+      this.origin = await this.timed('serve', () => startDevServer(this.box, this.start, PORT, () => this.ac.signal.aborted, { routes: m.routes }));
     } catch (err) {
       if (this.ac.signal.aborted) throw new Stopped();
-      throw failure(`The app did not start inside the sandbox (no answer on port ${PORT}).`, err);
+      throw failure(err?.publicMessage ?? `The app did not start inside the sandbox (no answer on port ${PORT}).`, err);
     }
-    this.say(`dev server up on port ${PORT} (${this.serverKind})`);
+    this.useOrigin(this.origin);
+    this.say(`dev server up at ${baseUrl(this.matrixArgs)} (${this.serverKind})${this.matrixArgs.port !== PORT ? `; it chose port ${this.matrixArgs.port} itself` : ''}`);
+    if (this.origin?.warm) this.journal(`warm-up: ${this.origin.warm}`);
     this.step('install', 'done', ti);
 
     this.phase = 'baseline';
@@ -680,7 +689,7 @@ class FixRun {
     this.push({
       role: 'user',
       content: taskMessage({
-        projectLabel: task.source.label || task.source.name, serverKind: this.serverKind, port: PORT, matrix: task.matrix,
+        projectLabel: task.source.label || task.source.name, serverKind: this.serverKind, port: this.matrixArgs?.port ?? PORT, matrix: task.matrix,
         report: this.R0.report, maxChecks: caps.maxChecks,
       }),
     });
@@ -940,15 +949,27 @@ class FixRun {
     return Math.min(this.caps.lookTimeoutSec, Math.floor((this.deadline - Date.now() - this.reserveMs) / 1000));
   }
 
+  /**
+   * Measure where startDevServer() found the app: 127.0.0.1 or ::1, port 3000 or the port the server
+   * chose itself. Anything else (an older runner that returned nothing) means 127.0.0.1:3000.
+   */
+  useOrigin(o) {
+    const host = o?.host === '::1' ? '::1' : '127.0.0.1';
+    const port = Number.isInteger(o?.port) && o.port >= 1 && o.port <= 65535 ? o.port : PORT;
+    this.origin = { ...(o && typeof o === 'object' ? o : {}), host, port };
+    this.matrixArgs.host = host;
+    this.matrixArgs.port = port;
+  }
+
   /** Restart the dev server if it stopped answering (the model's edit, or the S7b test hook). */
   async ensureServer() {
     let up = false;
-    try { up = await devServerUp(this.box, PORT); } catch { up = false; }
+    try { up = await devServerUp(this.box, { host: this.matrixArgs.host ?? '127.0.0.1', port: this.matrixArgs.port }); } catch { up = false; }
     if (up) return;
     if (this.ac.signal.aborted) throw new Stopped();
     this.say('the dev server was not answering; restarting it');
-    await startDevServer(this.box, this.start, PORT, () => this.ac.signal.aborted);
-    this.say('dev server up again');
+    this.useOrigin(await startDevServer(this.box, this.start, PORT, () => this.ac.signal.aborted));
+    this.say(`dev server up again at ${baseUrl(this.matrixArgs)}`);
   }
 
   /** Cover-up issues of a check that were not already there in the accepted state (gate OFF keeps old ones). */
