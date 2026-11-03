@@ -10,7 +10,7 @@ Built for the Vultr Agent Rush hackathon (Challenge 1, Blast Radius Zero). See [
 
 ## Status
 
-The demo runs on a Vultr VM at https://104-156-252-200.sslip.io, with every task sandbox under gVisor (`runsc`) on an internal network of its own. The VM runs commit `2e01f41`. Later commits change only the docs.
+The demo runs on a Vultr VM at https://104-156-252-200.sslip.io, with every task sandbox under gVisor (`runsc`) on an internal network of its own. The VM runs commit `468c5f6`. Later commits change only the docs and the bench files.
 
 **Built before the event (non-AI scaffolding):**
 - the task sandbox;
@@ -25,18 +25,24 @@ The demo runs on a Vultr VM at https://104-156-252-200.sslip.io, with every task
 - **The vision second opinion** (`agent/vision.mjs`): up to four before/after crops go to a vision model, `qwen3.8-27b` by default. It never changes the counts, the gate or the publish bar.
 - **The web app and orchestrator** (`app/`): a queue, live progress over Server-Sent Events, the receipt page, Approve and the patch download for the run's owner, `/status`, the published "Latest verified run" at `/latest/`, and a local-admin API that answers only local requests.
 - **One network per sandbox** (`runner/sandbox.mjs`): each sandbox gets an internal network of its own, `ring-task-<id>`, which the proxy joins and which is removed with the sandbox, so two tasks that run at once cannot reach each other. Before this, every sandbox shared `ring-internal`.
+- **The GitHub path** (`runner/run-task.mjs`): a repository is inspected inside its sandbox, which decides the package manager (npm, or pnpm or yarn installed with npm) and the command that starts the app. Ring also refuses a monorepo, a repository over 300 MB or one with nothing to serve, with one sentence. Known dev servers such as Vite, Astro and Next.js are bound to 127.0.0.1:3000, and the probe also asks ::1 and any port the server printed. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#a-github-repository).
 - **The rest:** the deploy and admin scripts (`scripts/deploy.sh`, `scripts/ring.sh`), the Lumen sample (`demo/lumen`), the new tests (`test/fake-gateway.mjs`, `test/fake-docker.mjs`, `test/agent-loop.mjs`, `test/app-api.mjs`) and the bench tooling (`bench/`).
 
-**Measured on the VM** on 3 Nov between 19:28 and 21:59 UTC (02:28–04:59 ICT on 4 Nov):
+**Measured on the VM** on 3 Nov between 19:28 and 22:45 UTC (02:28–05:45 ICT on 4 Nov):
 - Self-tests on `0c2e46d`, sandboxes under gVisor: containment 13/13, scenes 17/17, agent-loop 83/83. The agent-loop suite drives the loop with a fake model and spends no tokens.
 - Self-tests on `2e01f41`, the per-sandbox networks, at 21:53–21:59 UTC: containment 16/16, including two sandboxes at once that cannot reach each other; scenes 17/17; agent-loop 91/91. The first scenes run gave 16/17, because gVisor stopped the endless-spawn sandbox at the process cap before the scene's time limit (docs/ARCHITECTURE.md, "Containment, measured"); the rerun of the same commit passed.
 - The first calls to the real Vultr Serverless Inference, a tool-calling probe ([bench/probe-2026-11-04.md](bench/probe-2026-11-04.md)): all five candidate text models passed the two steps the bake-off needs. It also settled three open questions. The gateway accepts an assistant message sent back with its `reasoning` field (the client still strips it). It accepts a forced `tool_choice`, but `minimax-m3.1-flash` ignores it, so the loop keeps ending a task itself. And it accepts a strict `json_schema` response format for the vision model.
 - One real run on Lumen, and a bake-off of three models: see [First real runs](#first-real-runs).
 - The probe, the real run and the bake-off cost $0.839 together, at list price.
+- **The GitHub path** at 22:09–22:45 UTC ([bench/2026-11-04-github-path.md](bench/2026-11-04-github-path.md)). Four public repositories went through clone, install, dev server and the first look, with no model call: a Vite + React app on npm, a Vite + Vue app on pnpm 12, an Astro site on pnpm, and a static site.
+  - On `2e01f41`, only the static site reached a measurement. Vite and Astro never answered on 127.0.0.1, and npm could not install pnpm catalogs.
+  - On `468c5f6`, all four were measured on 4 of 4 screens, each in 7–40 s.
+  - A monorepo, a missing repository and one over 300 MB were each refused with one sentence.
+- Self-tests on `468c5f6` at 22:36–22:43 UTC: containment 16/16, agent-loop 104/104. Scenes gave 16/17 inside the deploy, again the endless-spawn scene, and 17/17 on the rerun.
 
 **Not done yet:**
 - **Public runs are closed.** `publicRuns` is false, so the "Run sample" button is disabled and `POST /api/tasks` answers 503. Runs start only through the admin channel.
-- **No GitHub repository has gone through the loop yet.** The code path exists (a clone through the proxy, an install, the project's own dev server, a 20-minute limit), but it has not been run or timed on the VM.
+- **No model has fixed a GitHub repository yet.** Four public repositories have been through the setup and the first look on the VM, with no model call (see above), but none through a whole run.
 - **A harder benchmark.** Every bake-off run fixed everything Mantis found on Lumen, so Lumen no longer tells these models apart.
 
 ## First real runs
@@ -71,8 +77,8 @@ The rule ranks models by planted bugs fixed, then new issues, then cost, then ti
 **The tests** need Node 22 or newer. Two suites need nothing else:
 
 ```bash
-node test/agent-loop.mjs --unit     # path and tool rules, the receipt, check messages, the tamper guard, the client against a fake gateway, the sandbox's network against a fake docker (56 checks)
-node test/app-api.mjs               # the HTTP API: the admin rule, closed public runs, limits, approval and patch rules, SSE replay (49 checks)
+node test/agent-loop.mjs --unit     # path and tool rules, the receipt, check messages, the tamper guard, the client against a fake gateway, the sandbox's network against a fake docker, the GitHub path's decisions (69 checks)
+node test/app-api.mjs               # the HTTP API: the admin rule, closed public runs, limits, approval and patch rules, SSE replay, pasted repository addresses (50 checks)
 ```
 
 The others need Docker:
@@ -146,6 +152,18 @@ The loop follows the routine that the `mantis-fix` skill already describes (fix,
 - **Costs are list prices.** Receipts, `/status` and the bench files count every call at the list price in the Vultr catalogue. The bill may differ.
 - **A sandbox can reach the VM itself.** A sandbox's network has no route out, but the VM holds the network's gateway address, and a sandbox can open connections to it. In the containment run, sshd on port 22 (keys only) answered there, and Caddy listens on every address for 80 and 443. The app listens on loopback only, and Caddy passes the sandbox's private address on, so the app would refuse a run from it. `containment.mjs` prints this as a note, not a check. Closing it needs a host firewall rule (root), or networks whose bridge has no host address.
 - **The sandboxes share one proxy.** Each sandbox has a network of its own, so two tasks cannot reach each other, but `ring-proxy` is on every one of those networks and runs under runc, not gVisor. It relays only to four allowlisted hosts on port 443, so it is no path from one sandbox to another (`containment.mjs` checks this), but a flaw in tinyproxy would touch every task. The proxy joins each network while it runs (`docker network connect`); before the proxy moves under gVisor, check that runsc allows that, or give each task its own proxy. Each running sandbox also holds one of Docker's address pools (about 30 by default), so a host could run only some 25 sandboxes at once; the app runs at most 2 tasks.
+- **What a GitHub repository can be.** One app at the root of the repository, at most 300 MB, which installs in 300 s and answers within 90 s on Node 22. Ring refuses the following, each with one sentence:
+  - a monorepo, including one whose root app could run on its own;
+  - a repository with no dev or start script and no `index.html`.
+
+  A dev server Ring does not know runs through its package manager with `PORT=3000` and `HOST=127.0.0.1`. Ring then looks for it on 127.0.0.1 and ::1, on port 3000 and on any port it printed.
+
+  The sandbox reaches only npm and GitHub, so these do not work:
+  - an app that needs a database, an API key or another service;
+  - an install script that downloads from elsewhere (its sentence names the host);
+  - fonts or scripts from a CDN, which are left out of the page Mantis measures.
+
+  bun is not in the sandbox: a `bun.lock` falls back to npm.
 
 ## License
 

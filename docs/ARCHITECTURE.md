@@ -32,7 +32,7 @@ Operator (WSL) ──SSH as deploy──► curl http://127.0.0.1:8080/admin/…
    - on an internal network of its own, `ring-task-<id>`, made for it and removed with it (see [The sandbox's network](#the-sandboxs-network)). No other sandbox is on it, so two tasks that run at once cannot reach each other. Its single exit is `ring-proxy`, which lets through `registry.npmjs.org`, `github.com`, `codeload.github.com` and `objects.githubusercontent.com` on port 443 and refuses every other host. The proxy's address on that network is written into the sandbox's `/etc/hosts` (`--add-host`), because under gVisor Docker's embedded DNS cannot be reached and the name would not resolve;
    - no environment from the host. The inference key stays in the app's process;
    - `--runtime runsc` on the VM. The loop reads the runtime back from Docker, logs it and puts it on the receipt.
-3. **Bring in, install, serve** (`runner/run-task.mjs`). The sample is copied in as a tar stream of our own files. A GitHub repository is cloned inside the sandbox through the proxy (`git clone --depth 1`), from a URL rebuilt out of the checked owner and name, so the host never fetches a URL a user typed. Then `npm ci` or `npm install` (at most 5 minutes) and the project's dev server on port 3000. Lumen is static, so it gets a small static server.
+3. **Bring in, install, serve** (`runner/run-task.mjs`). The sample is copied in as a tar stream of our own files. A GitHub repository is cloned inside the sandbox through the proxy (`git clone --depth 1`), from a URL rebuilt out of the checked owner and name, so the host never fetches a URL a user typed. It is then inspected, installed (at most 5 minutes) and started inside the sandbox, as described in [A GitHub repository](#a-github-repository). Lumen is static, so it gets a small static server.
 4. **R0, the baseline.** `mantis look … --baseline none --json` measures every route × screen size × colour scheme × language. The screens R0 could measure are the ones every later check must measure again. If R0 finds no issue, the task ends with the verdict `no-issues` and no model call.
 5. **The conversation** (`agent/loop.mjs`). The model gets Ring's system prompt (`agent/prompt.mjs`, version `ring-2`), a task message with R0's issues, and the seven tools below. It works until it calls `finish` or a cap stops it.
 6. **Checks.** When the model calls `check_ui`, the orchestrator measures again, compares with R0 and decides what stays (see [Each check, against R0](#each-check-against-r0)).
@@ -56,6 +56,49 @@ Before commit `08030d6`, every sandbox joined one shared network, `ring-internal
 On the VM the proxy has an address on `ring-egress` (its way out) and one on each running task's network. It relays only to the four allowlisted hosts on port 443, so a request through it to another sandbox, by address or by name, gets 403.
 
 **Nothing piles up.** Each network takes one of Docker's address pools (about 30 on a stock daemon), so none may leak. The app removes its own containers and networks at startup and shutdown. At startup and every hour it also removes any sandbox network, by label and name, that no sandbox runs on and that is older than 10 minutes; younger ones are left alone, because a sandbox may be starting on one. `containment.mjs` and the agent-loop scenarios sweep the same way before they start, and a self-test stopped by a signal destroys its sandboxes and their networks before it exits. `/admin/health` counts the app's networks. `scripts/setup.sh` no longer creates `ring-internal`; when it restarts the proxy, it removes `ring-internal` and every unused sandbox network. On the VM, `ring-internal` stays, with only the proxy on it, until `ring-setup` runs again.
+
+## A GitHub repository
+
+Everything that reads the repository runs inside its sandbox (`runner/run-task.mjs`). The host only parses the small JSON reports that come back, and checks every value taken from the repository before it reaches a command.
+
+1. **The address.** The app accepts an address as people paste it: spaces around it, `http://`, `www.`, no scheme at all, `.git`, `#readme` or `?tab=…`. The owner and name must still match the pattern of BUILD-SPEC §4.6, and the clone URL is rebuilt from those two parts. A link to a branch, file or pull request gets its own sentence, which asks for the repository's own address (`app/tasks.mjs`, `repoFromInput()`).
+2. **The clone** runs in the background while the folder's size is checked once a second. Past 300 MB, `.git` included, git is stopped. A clone also stops at 120 s. git never prompts, so a missing or private repository fails at once.
+3. **The inspection** (`inspectProject()`) reads `package.json`, the lock files, `pnpm-workspace.yaml`, `.yarnrc.yml` and where an `index.html` is. `planProject()` is pure and unit-tested (U12). It decides:
+   - **Refused:**
+     - a monorepo: workspaces in `package.json`, a `pnpm-workspace.yaml` that lists packages, `lerna.json` or `rush.json`. A `pnpm-workspace.yaml` that holds only settings or catalogs does not count;
+     - a broken `package.json`;
+     - a project with no `dev`, `start`, `develop` or `serve` script and no `index.html`.
+   - **Static:** without a script that starts the app, the static server serves the first folder with an `index.html`, from the root, `public/`, `src/`, `docs/`, `site/`, `www/`, `static/`, `dist/` or `build/`.
+   - **The package manager** comes from the `packageManager` field, else from the lock file. For pnpm, `pnpm-lock.yaml` version 9 means pnpm 10, version 6 pnpm 8 and version 5 pnpm 7. For yarn, `yarn.lock` tells version 1 from version 2 and later. A `bun.lock` falls back to npm, with a note in the live log.
+   - **The start command.**
+     - A dev server Ring knows starts directly, with `node_modules/.bin` first on `PATH`, when its script is one plain command. The known tools are Vite, Astro, Next.js, Nuxt, react-scripts, Vue CLI, webpack, Angular, Gatsby, Docusaurus, VitePress, SvelteKit, React Router, Remix, Rsbuild, Vinxi and Parcel. A plain command has no `$`, quotes, `&&`, pipes or subshells.
+     - The script's own `--port` and `--host` flags are replaced with `--host 127.0.0.1 --port 3000`, plus `--strictPort` for Vite. Some CLIs turn a repeated `--port` into a list. A production command that needs a build first (`next start`, `astro preview`) becomes the dev command.
+     - Anything else runs as `<package manager> run <script>`, with `PORT=3000` and `HOST=127.0.0.1`.
+     - `BROWSER=none` keeps `--open` from trying to start a browser, and the frameworks' telemetry is off.
+4. **The install** takes 300 s at most in all.
+   - **pnpm and yarn** are first installed with npm into the sandbox user's home, through the same proxy as every package, at the version the project names. Yarn 2 and later runs with the node-modules linker and a cache outside the repository. Corepack is not used: by default it fetches Yarn 2 and later from repo.yarnpkg.com, which the allowlist refuses. A yarn that the repository ships (`yarnPath`) is used as it is.
+   - **Retries.** `npm ci` with a lock file that is out of date is retried as `npm install`. A peer-dependency conflict is retried with `--legacy-peer-deps`, and pnpm's lock-file errors with `--no-frozen-lockfile`. Each happens once.
+   - **Skipped:** the browser downloads of Puppeteer, Playwright, Cypress and Electron, which the allowlist would refuse anyway, and git hooks.
+   - **A failure gives one sentence** from the output:
+     - a host outside the allowlist, which is named;
+     - a package that is not on the public registry;
+     - no space;
+     - a Node version;
+     - the time limit, or the memory limit.
+5. **The dev server** starts in the background, and its process id is kept. The runner then asks `127.0.0.1` and `::1`, on port 3000 and on any port the server printed in its log (4 s per request, all at once, once a second, 90 s at most).
+   - It gives up early once the process has exited.
+   - The address that answered is where every look and check measures, and the live log names it. Unless told otherwise, Vite and Astro listen on `localhost`, which can be `::1` inside the sandbox.
+   - Each route is then requested once, so a server that compiles a page on its first request (Next.js, Astro) is warm before R0.
+   - If the server stops answering during a task, it is restarted with the same command.
+6. **The live log** shows the plan before the install, for example `project: pnpm 10 (pnpm-lock.yaml) · start: astro dev --host 127.0.0.1 --port 3000`.
+
+Every failure in these steps is a `SetupError`. Its `publicMessage` is the one sentence that the task's page shows, and its `message` keeps the detail, such as the last lines of the install or the dev-server log, for the journal.
+
+**Measured on the VM** on 3 Nov ([bench/2026-11-04-github-path.md](../bench/2026-11-04-github-path.md)), with no model call:
+- **The repositories:** a Vite + React app on npm (TailAdmin), a Vite + Vue app on pnpm 12 with catalogs (vitesse-lite), an Astro site on pnpm (astro-paper) and a static site (vcard).
+- **Before this path,** on `2e01f41`, only the static site was measured. The Vite and Astro servers never answered on 127.0.0.1, and npm could not read pnpm catalogs.
+- **After it,** on `468c5f6`, all four were measured on 4 of 4 screens. The whole task took 7–40 s, with installs of 8.5–14.6 s.
+- **Edge cases:** `vitejs/vite` was refused as a monorepo, a missing repository and `torvalds/linux` each got their sentence, and the Linux clone was stopped at 300 MB after 14 s.
 
 ## The tools
 
@@ -197,9 +240,13 @@ The two-sandbox check also prints a note that is not part of any check: whether 
 - a hostile repository that hunts for secrets, calls hosts off the allowlist (the cloud metadata address included), runs `rm -rf` on the whole filesystem and spawns processes without end;
 - a dev server that never answers and ignores SIGTERM.
 
-`node test/agent-loop.mjs` drives the loop with a fake model in real sandboxes (scenarios S1–S10): an honest fix, a cover-up with the gate on and off, a measurement tamper, paths out of the project, every cap, malformed tool calls, an inference error, a dev server that dies, a route that stops loading and a link the edit removed. After every scenario, the sandbox and its network must be gone. Its unit part (`--unit`, no Docker) includes U11, which drives the network's life cycle against `test/fake-docker.mjs`, a stand-in for the docker CLI, so that every failure path runs: a `docker run` that fails, a proxy that cannot join, a network that will not go at once or at all, the sweeps and a test stopped by a signal.
+`node test/agent-loop.mjs` drives the loop with a fake model in real sandboxes (scenarios S1–S10): an honest fix, a cover-up with the gate on and off, a measurement tamper, paths out of the project, every cap, malformed tool calls, an inference error, a dev server that dies, a route that stops loading and a link the edit removed. After every scenario, the sandbox and its network must be gone. Its unit part (`--unit`, no Docker) includes U11, which drives the network's life cycle against `test/fake-docker.mjs`, a stand-in for the docker CLI, so that every failure path runs: a `docker run` that fails, a proxy that cannot join, a network that will not go at once or at all, the sweeps and a test stopped by a signal. It also includes U12, which checks the GitHub path's decisions on the facts the runner reads in a sandbox (see [A GitHub repository](#a-github-repository)).
 
-All three take `RING_RUNTIME=runsc` to run the sandboxes in gVisor, and a full run of each writes the result file that `/status` shows. On the VM, on commit `2e01f41` under gVisor, they passed 16/16, 17/17 and 91/91 (3 Nov, 21:53–21:59 UTC). The first scenes run that night gave 16/17: in the endless-spawn scene, gVisor stopped the whole sandbox at the process cap after 9 s, instead of holding it there until the 20 s limit. The same commit then passed 17/17. The containment fork bomb already accepts that outcome under gVisor; the scene does not yet. Before the per-sandbox networks, on `0c2e46d`, the suites passed 13/13, 17/17 and 83/83.
+All three take `RING_RUNTIME=runsc` to run the sandboxes in gVisor, and a full run of each writes the result file that `/status` shows.
+- **`2e01f41`** (3 Nov, 21:53–21:59 UTC), under gVisor on the VM: 16/16, 17/17 and 91/91. The first scenes run that night gave 16/17. In the endless-spawn scene, gVisor stopped the whole sandbox at the process cap after 9 s, instead of holding it there until the 20 s limit. The same commit then passed 17/17.
+- **`468c5f6`** (22:36–22:43 UTC), the GitHub path: containment 16/16 and agent-loop 104/104. Scenes gave 16/17 inside `deploy.sh --selftest`, because the same scene was stopped after 1 s, and 17/17 on the rerun.
+- **The flake:** the containment fork bomb already accepts that outcome under gVisor, but the scene does not yet.
+- **Before the per-sandbox networks,** on `0c2e46d`, the suites passed 13/13, 17/17 and 83/83.
 
 ## Built before the event vs during it
 
