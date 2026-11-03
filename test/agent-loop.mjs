@@ -713,6 +713,71 @@ async function u11() {
     check('U11 destroyLive() (a test stopped by a signal) removes every sandbox it made and has not destroyed, with its network',
       Object.keys(s.containers).length === 0 && taskNets(s).length === 0 && !s.networks[x.network] && !s.networks[y.network],
       `left: ${[...Object.keys(s.containers), ...taskNets(s)].join(' ') || 'nothing'}`);
+
+    // A signal while a sandbox is still starting: destroyLive() waits for that create(), which then
+    // removes what it made; no create() starts meanwhile, and one may start again afterwards.
+    fresh();
+    const starting = Sandbox.create({});
+    const sweeping = Sandbox.destroyLive(15_000);
+    const refused = await rejection(Sandbox.create({}));
+    const [startErr] = await Promise.all([rejection(starting), sweeping]);
+    s = state();
+    const nothingLeft = Object.keys(s.containers).length === 0 && taskNets(s).length === 0;
+    const again = await rejection(Sandbox.create({}).then((box) => box.destroy()));
+    check('U11 destroyLive() waits for a sandbox that is still starting and leaves nothing of it; no sandbox starts meanwhile, and one starts again afterwards',
+      /destroyLive/.test(startErr?.message ?? '') && /destroyLive/.test(refused?.message ?? '') && nothingLeft && again === null && Object.keys(state().containers).length === 0,
+      `starting: ${oneLine(startErr?.message ?? 'not stopped')}; during: ${oneLine(refused?.message ?? 'not refused')}; left: ${[...Object.keys(s.containers), ...taskNets(s)].join(' ') || 'nothing'}; afterwards: ${again ? oneLine(again.message) : 'ok'}`);
+
+    // Orphans: sandbox containers older than the limit go, the app's and a self-test's alike, and then
+    // their networks. The sandbox of a task that runs stays, and so does a container that is not ours.
+    fresh();
+    const running = await Sandbox.create({ labels: { 'mantis-ring.owner': 'app' } });
+    const oldApp = await Sandbox.create({ labels: { 'mantis-ring.owner': 'app' } });
+    const oldSelfTest = await Sandbox.create({});
+    s = state();
+    const longAgo = new Date(Date.now() - 2 * 3_600_000).toISOString();
+    for (const box of [oldApp, oldSelfTest]) {
+      s.containers[box.name].created = longAgo;
+      s.networks[box.network].created = longAgo;
+    }
+    s.containers['not-ours'] = { id: 'ctr900', labels: { 'com.example': 'x' }, network: 'bridge', addHost: [], running: true, image: 'other', created: longAgo };
+    save(s);
+    const stale = await Sandbox.removeStale(80 * 60_000);
+    s = state();
+    const tooShort = await rejection(Sandbox.removeStale(60_000));
+    check('U11 removeStale(): sandbox containers past the age limit go (the app\'s and a self-test\'s), then their networks; the sandbox of a running task and a container without the label stay',
+      stale?.containers === 2 && stale?.networks === 2 && !s.containers[oldApp.name] && !s.containers[oldSelfTest.name] && !s.networks[oldApp.network] && !s.networks[oldSelfTest.network]
+        && Boolean(s.containers[running.name]) && Boolean(s.networks[running.network]?.members['ring-proxy']) && Boolean(s.containers['not-ours']) && tooShort instanceof TypeError,
+      `removed ${JSON.stringify(stale)}; left: ${[...Object.keys(s.containers), ...taskNets(s)].join(' ') || 'nothing'}; a 1-minute limit: ${tooShort ? 'refused' : 'accepted'}`);
+    await running.destroy();
+
+    // The loop's side of a `docker run` that gave up while the daemon still made the container: create()
+    // fails, the container appears after destroy() looked, so its network cannot go either, and the
+    // loop never got the box. The loop removes both by the task's own label before the task fails.
+    const loop = await load('../agent/loop.mjs');
+    const inf = await load('../agent/inference.mjs');
+    if (loop && inf) {
+      fresh();
+      failNext('run-late', 1);
+      const id = `t_${'5'.repeat(32)}`;
+      const lines = [];
+      const task = {
+        id, origin: 'admin', source: { kind: 'sample', name: 'lumen', dir: LUMEN, label: 'Lumen (sample site)' }, matrix: MATRIX,
+        model: 'fake-coder', sampling: {}, visionModel: null, gate: true, caps: {},
+      };
+      const res = await loop.runFix(task, {
+        chat: async () => { throw new Error('U11 calls no model'); },
+        createSandbox: (o) => Sandbox.create({ labels: o?.labels }),
+        emit: () => {}, store: { put: async () => {} }, tally: inf.newTally(), heavy: { run: (fn) => fn() },
+        log: (l) => lines.push(String(l)),
+      });
+      s = state();
+      const failedStart = lines.find((l) => /stopped during sandbox/.test(l)) ?? '';
+      check('U11 a sandbox whose docker run gave up while the daemon still made it: the task fails, and its container and network go by the task\'s own label',
+        res?.status === 'failed' && /docker run failed/.test(failedStart) && lines.some((l) => /removed by this task's label: 1 container\(s\), 1 network\(s\)/.test(l))
+          && Object.keys(s.containers).length === 0 && taskNets(s).length === 0,
+        `${res?.status}: ${oneLine(res?.error)}; left: ${[...Object.keys(s.containers), ...taskNets(s)].join(' ') || 'nothing'}; journal: ${oneLine(lines.filter((l) => /label|stopped/.test(l)).join(' | '))}`);
+    }
   } finally {
     process.env.PATH = oldPath;
     delete process.env.DOCKER_FAKE_STATE;
@@ -848,6 +913,44 @@ async function u12() {
   check('U12 installRetry: npm ci with a stale lock file → npm install; ERESOLVE → --legacy-peer-deps once; pnpm lock-file errors → --no-frozen-lockfile; anything else → no retry',
     retries[0] === 'npm install --no-audit --no-fund' && retries[1] === 'npm install --no-audit --no-fund --legacy-peer-deps' && retries[2] === null
       && retries[3] === 'pnpm install --store-dir /work/.pnpm-store --no-frozen-lockfile' && retries[4] === null, JSON.stringify(retries));
+
+  // A flood of install output: the checks read only its last INSTALL_TAIL characters, so a hostile
+  // install cannot hold the app's event loop, and output that was cut off is not the memory limit.
+  const filler = 'npm verbose lots of honest detail\n'.repeat(Math.ceil((rt.INSTALL_TAIL + 4096) / 34));
+  const flood = 'npm error network request to http://a.bc/x failed, reason: getaddrinfo ENOTFOUND a.bc\n'.repeat(200_000); // 17 MB
+  const tf = performance.now();
+  const floodSentence = installFailure(flood, { code: 1 });
+  const floodMs = Math.round(performance.now() - tf);
+  const windowed = {
+    early404: installFailure(`npm error code E404\n${filler}`, { code: 1 }),
+    late404: installFailure(`${filler}npm error code E404\n`, { code: 1 }),
+    earlyRetry: installRetry({ pm: 'npm', lock: true }, 'npm ci --no-audit --no-fund', `npm error \`npm ci\` can only install packages when your package.json and package-lock.json are in sync\n${filler}`),
+    cutOff: installFailure('Killed', { code: 137, truncated: true }),
+    cutOffTime: installFailure('', { code: 137, truncated: true, timedOut: true }),
+  };
+  check('U12 install output: only its end is read (a 17 MB flood is classified at once, a line before the last 64 KiB is not seen), and output that was cut off gets its own sentence, not the memory limit',
+    floodSentence === rt.sayOffAllowlist('a.bc') && floodMs < 250 && windowed.early404 === rt.sayInstallFailed('npm') && windowed.late404 === SAY.installPrivate
+      && windowed.earlyRetry === null && windowed.cutOff === SAY.installOutput && windowed.cutOffTime === SAY.installTime,
+    `flood in ${floodMs} ms: ${floodSentence}; ${JSON.stringify(windowed)}`);
+
+  // installDeps() against a fake box: the install's output goes to a file in the sandbox and only its
+  // end comes out; output cut off on the way is never followed by a second install beside the first.
+  const fakeBox = (answers) => {
+    const calls = [];
+    return { calls, exec: async (script, opts) => { calls.push({ script, opts }); return { stdout: '', stderr: '', timedOut: false, truncated: false, ...(answers[calls.length - 1] ?? { code: 0 }) }; } };
+  };
+  const npmLock = { pmInfo: { pm: 'npm', lock: true, version: null }, install: true, static: false };
+  const stale = fakeBox([{ code: 1, stdout: 'npm error `npm ci` can only install packages when your package.json and package-lock.json are in sync.' }, { code: 0 }]);
+  const staleRan = await rt.installDeps(stale, npmLock).then((r) => r.ran, (e) => e);
+  const cut = fakeBox([{ code: 137, truncated: true, stdout: 'npm error ERESOLVE could not resolve\n'.repeat(1000) }]);
+  const cutErr = await rt.installDeps(cut, npmLock).then(() => null, (e) => e);
+  const first = stale.calls[0];
+  const wrapped = /> \/tmp\/ring-install\.log 2>&1; s=\$\?; tail -c 65536 \/tmp\/ring-install\.log 2> \/dev\/null; rm -f \/tmp\/ring-install\.log; exit \$s$/.test(first?.script ?? '')
+    && /timeout -k 5 \d+ npm ci --no-audit --no-fund >/.test(first?.script ?? '') && first?.opts?.maxBytes === 2 ** 20;
+  check('U12 installDeps: the output goes to a log in the sandbox and only its last 64 KiB come out (1 MiB at most); a stale lock file is retried; output cut off fails at once, with no second install',
+    wrapped && Array.isArray(staleRan) && staleRan.join(' | ') === 'npm ci --no-audit --no-fund | npm install --no-audit --no-fund'
+      && cutErr instanceof SetupError && cutErr.publicMessage === SAY.installOutput && cut.calls.length === 1 && /output cut off/.test(cutErr.message),
+    `script: ${oneLine(first?.script)}; stale lock: ${Array.isArray(staleRan) ? staleRan.join(' → ') : oneLine(staleRan?.message)}; cut off: ${oneLine(cutErr?.publicMessage)} after ${cut.calls.length} install(s)`);
 
   const clone = [cloneFailure("fatal: could not read Username for 'https://github.com': terminal prompts disabled"), cloneFailure('fatal: early EOF')];
   const serve = [

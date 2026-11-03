@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-// Containment scenes built on the fixtures in test/fixtures/: a hostile repository and a dev server
-// that never exits. The fixtures are test data: each is copied into a fresh sandbox and runs there,
-// and hostile.sh refuses to run anywhere else. Each check prints PASS or FAIL, like containment.mjs.
+// Containment scenes built on the fixtures in test/fixtures/: a hostile repository, an install that
+// prints a flood and a dev server that never exits. The fixtures are test data: each is copied into a
+// fresh sandbox and runs there, and hostile.sh refuses to run anywhere else. Each check prints PASS or
+// FAIL, like containment.mjs.
 // Usage: node test/scenes.mjs   (after scripts/setup.sh; RING_RUNTIME=runsc runs the sandboxes in gVisor)
 // At exit it writes ~/.ring/selftest/scenes.json, the result the app shows on /status.
 import { spawnSync } from 'node:child_process';
@@ -10,12 +11,14 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 import { LIMITS, Sandbox, run } from '../runner/sandbox.mjs';
-import { runTask } from '../runner/run-task.mjs';
+import { SetupError, installDeps, runTask, sayInstallFailed } from '../runner/run-task.mjs';
 
 const FIXTURES = fileURLToPath(new URL('./fixtures/', import.meta.url));
 const HOSTILE = path.join(FIXTURES, 'hostile-repo');
+const FLOOD = path.join(FIXTURES, 'install-flood');
 const NEVER = path.join(FIXTURES, 'never-exits');
 const runtime = process.env.RING_RUNTIME || undefined;
 
@@ -154,6 +157,37 @@ try {
   await spin.destroy();
 }
 check('hostile repo: the spawn-loop container is gone too', await gone(spin.name));
+
+// An install that prints a flood (25 MiB), run by the runner's own installDeps() as the yarn that the
+// repository ships: the output stays in the sandbox and only its end comes out, so an install that
+// exits 0 finishes, and one that fails keeps its own exit code and gets its plain sentence.
+const flood = await Sandbox.create({ runtime });
+try {
+  await flood.copyIn(FLOOD, '/work/app');
+  const kind = { static: false, install: true, pmInfo: { pm: 'yarn', berry: true, yarnPath: 'flood.mjs', lock: false, version: null } };
+  const loopDelay = monitorEventLoopDelay({ resolution: 10 });
+  const install = async (exitCode) => {
+    await flood.exec(`printf '%s\\n' ${exitCode} > /work/app/flood-exit`);
+    const t = Date.now();
+    const r = await installDeps(flood, kind).then((v) => ({ ok: v }), (err) => ({ err }));
+    return { ...r, secs: ((Date.now() - t) / 1000).toFixed(1) };
+  };
+  loopDelay.enable();
+  const passed = await install(0);
+  const failedRun = await install(7);
+  loopDelay.disable();
+  const blockedMs = Math.round(loopDelay.max / 1e6);
+  check('hostile repo: an install that prints 25 MiB and exits 0 finishes; only the end of its output leaves the sandbox',
+    passed.ok?.ran?.at(-1) === 'yarn install',
+    passed.ok ? `${passed.ok.ran.length} steps in ${passed.secs}s; the host's event loop waited ${blockedMs} ms at most` : `${passed.err?.publicMessage ?? ''} (${passed.err?.message})`);
+  const e = failedRun.err;
+  check('hostile repo: the same install exiting 7 keeps its exit code and gets the plain sentence for it, not the memory limit',
+    e instanceof SetupError && e.publicMessage === sayInstallFailed('yarn') && /\(exit 7\)/.test(e.message) && /ring-flood-last-line/.test(e.message),
+    e ? `"${e.publicMessage}" after ${failedRun.secs}s; ${String(e.message).slice(0, 80)}…${String(e.message).slice(-40)}` : 'the install did not fail');
+} finally {
+  await flood.destroy();
+}
+check('hostile repo: the install-flood container is gone too', await gone(flood.name));
 
 // Scene 2: a dev server that never exits: it listens, never answers and ignores SIGTERM.
 const dev = await Sandbox.create({ runtime });

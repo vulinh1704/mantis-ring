@@ -528,6 +528,22 @@ try {
   const busy = await admin('GET', '/admin/busy');
   check('/admin/busy answers running, queued and the self-test in progress', busy.status === 200 && busy.json?.running === 0 && busy.json?.queued === 0 && busy.json?.selftest === null,
     oneLine(busy.text));
+
+  // The loop's createSandbox: a step after Sandbox.create() that fails (here the task record cannot be
+  // written) destroys the box, because the loop never gets it. A fake box: no Docker here.
+  const { sandboxStarter } = await import('../app/server.mjs');
+  const fakeBox = () => ({ name: 'ring-0000fake', destroyed: 0, async runtimeName() { return 'runsc'; }, async destroy() { this.destroyed++; } });
+  const starterLog = [];
+  const goodBox = fakeBox();
+  const patches = [];
+  const started = await sandboxStarter('t_starter', { create: async () => goodBox, store: { update: (tid, p) => patches.push(p) }, journal: (tid, l) => starterLog.push(l) })({ runtime: 'runsc', labels: {} });
+  const badBox = fakeBox();
+  const unwritable = { update() { throw new Error('EIO: the state folder cannot be written'); } };
+  const startErr = await sandboxStarter('t_starter', { create: async () => badBox, store: unwritable, journal: (tid, l) => starterLog.push(l) })({ runtime: 'runsc', labels: {} }).then(() => null, (e) => e);
+  check('the loop\'s createSandbox records the runtime Docker reports; when recording fails, the new box is destroyed before the error goes on',
+    started === goodBox && goodBox.destroyed === 0 && patches[0]?.sandbox?.name === 'ring-0000fake' && patches[0]?.sandbox?.runtime === 'runsc'
+      && /EIO/.test(startErr?.message ?? '') && badBox.destroyed === 1,
+    `recorded ${JSON.stringify(patches[0] ?? null)}; failed start: ${oneLine(startErr?.message ?? 'no error')}, destroyed ${badBox.destroyed} time(s)`);
   check('no request reached the model service', gw.chats().length === 0, `${gw.chats().length} chat requests`);
 } catch (err) {
   check('app-api tests ran to the end', false, `stopped: ${err.stack?.split('\n').slice(0, 3).join(' ') ?? err}`);

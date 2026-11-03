@@ -3,7 +3,9 @@
 // sandbox container and its own network, played against a JSON state file named by
 // DOCKER_FAKE_STATE (a DOCKER_* variable, so childEnv() passes it on). It never calls the real
 // docker and makes no container and no network. `fail` in the state makes an operation fail that
-// many times: run, rm, network-create, network-connect, network-rm.
+// many times: run, rm, network-create, network-connect, network-rm. `run-late` plays a `docker run`
+// whose client gives up while the daemon goes on: the run fails and makes nothing, and the container
+// appears, running on its network, at the next `network disconnect` (after destroy() saw it gone).
 // Usage: put a `docker` shim that runs this file first on PATH (U11 does), or call it directly.
 import { mkdirSync, readFileSync, renameSync, rmdirSync, writeFileSync } from 'node:fs';
 
@@ -85,6 +87,14 @@ function handle(a) {
     return 0;
   }
   if (cmd === 'network' && sub === 'disconnect') {
+    if (st.late) {
+      const { name, net: home, ...c } = st.late;
+      delete st.late;
+      if (st.networks[home]) {
+        st.containers[name] = { ...c, network: home, running: true };
+        st.networks[home].members[name] = `10.${st.networks[home].subnet}.0.3`;
+      }
+    }
     const [net, ctr] = parse(a.slice(2)).pos;
     if (!st.networks[net]) return no(`Error response from daemon: network ${net} not found`);
     if (!Object.hasOwn(st.networks[net].members, ctr)) return no(`Error response from daemon: container ${ctr} is not connected to network ${net}`);
@@ -132,6 +142,16 @@ function handle(a) {
       out.push('runc');
       return 0;
     }
+    if (fmt === '{{.Id}} {{.Created}}' && flags['--type']?.[0] === 'container') {
+      // Like the real one: a reference that is gone fails the command, and the others are still printed.
+      let code = 0;
+      for (const ref of pos) {
+        const c = st.containers[ref] ?? Object.values(st.containers).find((x) => x.id === ref);
+        if (!c) { code = no(`Error: No such container: ${ref}`); continue; }
+        out.push(`${c.id} ${c.created}`);
+      }
+      return code;
+    }
     return no(`fake docker: this inspect format is not played: ${fmt}`, 2);
   }
   if (cmd === 'run') {
@@ -141,8 +161,13 @@ function handle(a) {
     if (st.containers[name]) return no(`docker: Error response from daemon: Conflict. The container name "/${name}" is already in use`, 125);
     if (!st.networks[net]) return no(`docker: Error response from daemon: network ${net} not found`, 125);
     const id = `ctr${++st.seq}`;
+    const record = { id, labels: labelsOf(flags['--label']), network: net, addHost: flags['--add-host'] ?? [], running: false, image: pos.at(-1), created: new Date().toISOString() };
+    if (fails('run-late')) {
+      st.late = { name, net, ...record };
+      return no('docker: error during connect: context canceled', 125);
+    }
     // Like the real one, a run that fails to start may leave the container created.
-    st.containers[name] = { id, labels: labelsOf(flags['--label']), network: net, addHost: flags['--add-host'] ?? [], running: false, image: pos.at(-1) };
+    st.containers[name] = record;
     if (fails('run')) return no('docker: Error response from daemon: failed to create task for container: OCI runtime create failed', 125);
     st.containers[name].running = true;
     st.networks[net].members[name] = `10.${st.networks[net].subnet}.0.3`;
