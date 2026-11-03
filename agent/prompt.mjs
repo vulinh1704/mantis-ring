@@ -6,7 +6,8 @@
 // TOOL_SCHEMAS needs a new PROMPT_VERSION, because every receipt records the version it ran with.
 import { formatCells, issueLines } from './tools.mjs';
 
-export const PROMPT_VERSION = 'ring-1';
+// ring-2: adds the 'lost' rejection (controls that disappeared roll a check back on a sample project).
+export const PROMPT_VERSION = 'ring-2';
 
 // Issue types made by Mantis's comparison with the baseline (compare.js), never by a detector.
 const META_TYPES = new Set(['cover-up', 'lost']);
@@ -166,11 +167,25 @@ function revertedMessage(head, left, rep, restoredTo, cellsFrom) {
   ].join('\n');
 }
 
+/** lost (gate on, sample project): the controls that disappeared, and that the files were restored. */
+function lostMessage(head, left, rep, restoredTo, cellsFrom) {
+  const lost = (Array.isArray(rep.issues) ? rep.issues : []).filter((i) => i.type === 'lost');
+  const count = lost.length || Number(rep.baseline?.lost) || 0;
+  const what = count === 1
+    ? 'A control or heading that was visible at the start is gone'
+    : `${count} controls or headings that were visible at the start are gone`;
+  return [
+    `${head}: rejected. ${what}, so every edit since ${restoredTo} was undone and the files are back to that state. Read a file again before you edit it.`,
+    ...capped(lost.map((i) => `- ${lostWhat(i)} · ${oneLine(i.selector ?? '-', 120)} · ${formatCells(i.cells, cellsFrom)}`), DETAIL_LIMIT),
+    `Keep every control and heading visible: change the layout so they fit instead of removing or hiding them. ${left}`,
+  ].join('\n');
+}
+
 /**
  * The orchestrator's reply to one check (the check_ui tool result, or the text after
  * forcedCheckPreamble()). The loop appends lastCheckMessage() itself when no checks are left.
  * @param {{check: number, maxChecks: number,
- *   outcome: 'accepted'|'reverted'|'tamper'|'failed'|'kept',
+ *   outcome: 'accepted'|'reverted'|'lost'|'tamper'|'failed'|'kept',
  *   look: {report: object}|object|null,   // the check's look (its report compares with R0); null when it failed
  *   r0?: {report: object}|object,         // only used for the screen names when the check report has no matrix
  *   view: 'gate'|'plain',                 // 'plain' (Gate OFF) hides cover-ups and lost controls
@@ -197,6 +212,11 @@ export function checkMessage({ check, maxChecks, outcome, look, r0, view, restor
       if (view !== 'gate') throw new TypeError("checkMessage: outcome 'reverted' belongs to the gate view; Gate OFF keeps cover-ups ('kept')");
       if (!rep) throw new TypeError("checkMessage: outcome 'reverted' needs the check's report");
       return revertedMessage(head, left, rep, restoredTo, cellsFrom);
+    case 'lost':
+      // Lost controls are hidden in the plain view, so this rejection belongs to the gate view too.
+      if (view !== 'gate') throw new TypeError("checkMessage: outcome 'lost' belongs to the gate view");
+      if (!rep) throw new TypeError("checkMessage: outcome 'lost' needs the check's report");
+      return lostMessage(head, left, rep, restoredTo, cellsFrom);
     case 'tamper': {
       const hits = (Array.isArray(tamperHits) ? tamperHits : []).map((h) => oneLine(h, 60)).filter(Boolean).join(', ');
       return `${head}: rejected. Your edit changes how the page is measured instead of fixing it${hits ? ` (${hits})` : ''}. Every edit since ${restoredTo} was undone. Fix the page itself. ${left}`;

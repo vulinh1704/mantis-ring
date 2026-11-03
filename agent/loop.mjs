@@ -5,8 +5,11 @@
 // "auto"). The orchestrator, never the model, decides what stays:
 // - a cover-up is rolled back and explained when the gate is on; with the gate off (the admin-only
 //   control arm) it is kept, and the cover-up and "lost" lines are hidden from the model;
+// - on a sample project with the gate on, a control or heading that disappeared ("lost") is rolled
+//   back and explained the same way;
 // - an edit aimed at the measurement itself (data-mantis-ignore, headless checks) is rolled back in
-//   both arms;
+//   both arms, and so is a check that could not measure every screen R0 measured (a page that no
+//   longer loads would otherwise simply drop out of the comparison);
 // - every cap (checks, turns, tool calls, tokens, money, wall clock) is enforced here;
 // - edits that were never measured never reach the patch.
 // The sandbox is destroyed on every exit path, and a hard timer destroys it at the deadline.
@@ -20,7 +23,7 @@ import {
 import { buildReceipt, diffStats, receiptLine, receiptMarkdown } from './receipt.mjs';
 import { FILE_TOOL_NAMES, TOOL_SCHEMAS, ToolError, WRITE_TOOL_NAMES, fileTools, parseToolCall } from './tools.mjs';
 import { changedSince, initWorkspace, isClean, patchApplies, patchSince, revertTo, snapshot, stageAll, tamperHits } from './workspace.mjs';
-import { LIMITS } from '../runner/sandbox.mjs';
+import { LIMITS, Sandbox } from '../runner/sandbox.mjs';
 import { bringIn, devServerUp, inspectProject, installDeps, look, startCommand, startDevServer } from '../runner/run-task.mjs';
 
 /** Caps of a public task (§2.4). Admin tasks may raise them up to ADMIN_MAX. */
@@ -41,6 +44,7 @@ const PNG_MAX = 20 * 2 ** 20;
 const JSON_MAX = 8 * 2 ** 20;
 const TRANSCRIPT_LINE_MAX = 16_384;
 const MIN_LOOK_SEC = 10; // below this, a look is not started (it could not finish)
+const MIN_CALL_MS = 20_000; // below this much time before the soft stop, no model call is started
 const VISION_TIMEOUT_MS = 180_000;
 const NETWORK = 'ring-internal → ring-proxy (allowlist)';
 const COMPACTABLE = new Set(['read_file', 'search_code', 'list_files']);
@@ -74,6 +78,14 @@ class Stopped extends Error {
   constructor() {
     super('the task was stopped');
     this.name = 'Stopped';
+  }
+}
+
+/** Thrown inside a heavy step when, after waiting for its slot, too little time is left to start it. */
+class NoTime extends Error {
+  constructor() {
+    super('no time was left to measure');
+    this.name = 'NoTime';
   }
 }
 
@@ -122,12 +134,36 @@ function limitsText(l = LIMITS) {
 }
 
 /**
- * The reply's tool calls in two forms with the same ids (unique in the turn): `calls` go back to the
- * gateway in the history (arguments as a JSON string, a name made of tool-name characters, without
- * the "functions." some open models put in front); `originals` keep what the model sent, for
- * parseToolCall and its error messages.
+ * Tool-call arguments as they go back to the gateway: the text of one JSON object. Some
+ * OpenAI-compatible servers (vLLM, SGLang) parse every echoed `arguments` before they apply the chat
+ * template, so arguments the model wrote as invalid JSON (a raw newline in a string, a call cut off
+ * by the token limit) would make every later request fail with a 400. Double-encoded arguments are
+ * unwrapped, as parseToolCall does; anything that is not an object becomes '{}'.
  */
-function normalizeCalls(raw, turn) {
+function canonicalArgs(raw) {
+  let v = raw ?? {};
+  if (typeof v === 'string') {
+    try {
+      v = JSON.parse(v);
+      if (typeof v === 'string') v = JSON.parse(v);
+    } catch {
+      return '{}';
+    }
+  }
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return '{}';
+  try { return JSON.stringify(v); } catch { return '{}'; }
+}
+
+/**
+ * The reply's tool calls in two forms with the same ids (unique in the turn): `calls` go back to the
+ * gateway in the history (arguments as the text of a JSON object, a name made of tool-name
+ * characters, without the "functions." some open models put in front); `originals` keep what the
+ * model sent, for parseToolCall and its error messages.
+ * @param {unknown} raw  message.tool_calls as the gateway returned it
+ * @param {number} turn
+ * @returns {{calls: object[], originals: object[]}}
+ */
+export function normalizeCalls(raw, turn) {
   const calls = [];
   const originals = [];
   if (!Array.isArray(raw)) return { calls, originals };
@@ -137,7 +173,7 @@ function normalizeCalls(raw, turn) {
     if (!id || seen.has(id)) id = `call_ring_${turn}_${i}`;
     seen.add(id);
     const fn = c?.function ?? {};
-    const args = typeof fn.arguments === 'string' ? fn.arguments : JSON.stringify(fn.arguments ?? {});
+    const args = canonicalArgs(fn.arguments);
     const given = typeof fn.name === 'string' ? fn.name.trim().replace(/^functions\./, '') : '';
     calls.push({ id, type: 'function', function: { name: /^[A-Za-z0-9_-]{1,64}$/.test(given) ? given : 'unknown_tool', arguments: args } });
     originals.push({ id, type: 'function', function: { name: fn.name, arguments: fn.arguments } });
@@ -177,6 +213,20 @@ function sameNumbers(a, b) {
   const key = (r) => [num(r?.summary?.errors), num(r?.summary?.warnings), r?.baseline?.fixed?.length ?? 0, r?.baseline?.new?.length ?? 0,
     num(r?.baseline?.coverUps), num(r?.baseline?.lost)].join('/');
   return key(a) === key(b);
+}
+
+/** The screens of a run that Mantis measured: `<route>|<viewport>/<scheme>/<locale>` of every cell with status 'ok'. */
+function okCells(report) {
+  return new Set((Array.isArray(report?.cells) ? report.cells : [])
+    .filter((c) => c?.status === 'ok' && typeof c.route === 'string' && typeof c.key === 'string')
+    .map((c) => `${c.route}|${c.key}`));
+}
+
+/** "2 screens did not load or could not be measured (/settings.html mobile/light/en, …)" for the model and the log. */
+function screensText({ count, names }) {
+  const shown = names.slice(0, 3).map((k) => k.replace('|', ' ')).join(', ');
+  const more = names.length > 3 ? ', …' : '';
+  return `${count} screen${count === 1 ? '' : 's'} did not load or could not be measured${shown ? ` (${shown}${more})` : ''}`;
 }
 
 function tallyNumbers(t) {
@@ -303,8 +353,9 @@ class FixRun {
     this.task = task;
     this.deps = deps ?? {};
     this.caps = null;
-    // Set by run(): start, hard deadline, soft stop, the time a final check needs, the time kept for wrap-up.
-    this.t0 = 0; this.deadline = 0; this.soft = 0; this.finalCheckMargin = 0; this.reserveMs = 0;
+    // Set by run(): start, hard deadline, soft stop, the time a final check needs, the time kept for
+    // wrap-up, and the least time before the soft stop that a model call may start with.
+    this.t0 = 0; this.deadline = 0; this.soft = 0; this.finalCheckMargin = 0; this.reserveMs = 0; this.minCallMs = 0;
     this.ac = new AbortController();
     this.timedOut = false;
     this.hard = null;
@@ -317,11 +368,12 @@ class FixRun {
     this.phases = { sandbox: 0, clone: 0, install: 0, serve: 0, baseline: 0, model: 0, tools: 0, checks: 0, verify: 0, proof: 0, copyOut: 0, destroy: 0, vision: 0 };
     this.tally0 = snapshotTally(this.deps.tally);
     this.tallyBeforeVision = null; // set after destroy, so the receipt can tell fix calls from vision calls
-    // setup results
+    // setup results. `expected`: the R0 screens every later run must measure again (status 'ok' and a
+    // state in R0's state.json, so Mantis can compare them); a run that loses one is not accepted.
     this.src = null; this.start = null; this.serverKind = 'static files'; this.matrixArgs = null;
-    this.R0 = null; this.R0dir = null; this.r0Crashed = 0; this.noIssues = false;
-    // conversation
-    this.messages = []; this.compactable = []; this.tools = null;
+    this.R0 = null; this.R0dir = null; this.r0Crashed = 0; this.noIssues = false; this.expected = new Set(); this.r0State = null;
+    // conversation. `seenCompactable`: how many compactable tool results the model has already been sent.
+    this.messages = []; this.compactable = []; this.seenCompactable = 0; this.tools = null;
     this.turns = 0; this.turnsSinceCheck = 0; this.noToolStreak = 0; this.overBudget = false; this.forcedChoiceRefused = false;
     this.toolCalls = 0; this.invalidCalls = 0; this.toolErrors = 0;
     this.summary = ''; this.stopReason = null;
@@ -329,7 +381,7 @@ class FixRun {
     this.base = null; this.upstream = null; this.accepted = null; this.revertedSinceAccept = false;
     this.checks = 0; this.checkRows = []; this.lastRunId = null; this.dirty = false;
     this.touchedAll = new Set(); this.touchedRound = new Set(); this.createdRound = new Set();
-    this.coverUpAttempts = 0; this.tamperAttempts = 0; this.reverts = 0;
+    this.coverUpAttempts = 0; this.tamperAttempts = 0; this.lostAttempts = 0; this.reverts = 0;
     // result
     this.RF = null; this.patch = ''; this.storedPatch = ''; this.patchOk = null; this.patchTruncated = false;
     this.proofPath = null; this.proof = null; this.receipt = null;
@@ -445,6 +497,7 @@ class FixRun {
     this.soft = this.deadline - Math.min(150_000, wall * 250);
     this.finalCheckMargin = Math.min(120_000, wall * 200);
     this.reserveMs = Math.min(30_000, wall * 100); // left for proof, copy-out and destroy after a look
+    this.minCallMs = Math.min(MIN_CALL_MS, wall * 50);
     if (this.deps.signal?.aborted) this.ac.abort('cancelled');
     else this.deps.signal?.addEventListener('abort', this.onCancel, { once: true });
     this.hard = setTimeout(() => {
@@ -568,9 +621,41 @@ class FixRun {
     this.lastRunId = R0.runId;
     await this.save('r0.report.json', JSON.stringify(R0.report));
     this.emit('look', lookEvent('baseline', R0));
-    this.say(`baseline R0 ${R0.runId}: ${num(s0.errors)} errors, ${num(s0.warnings)} warnings in ${num(s0.cells)} screens`);
+    // Every later run must measure these screens again; with none, nothing could ever be compared.
+    this.expected = await this.measurableCells(R0);
+    if (this.expected.size === 0) throw failure('The app could not be measured: no screen loaded at the starting point.');
+    this.say(`baseline R0 ${R0.runId}: ${num(s0.errors)} errors, ${num(s0.warnings)} warnings in ${num(s0.cells)} screens`
+      + `${this.expected.size < num(s0.cells) ? ` (${this.expected.size} of them could be measured and are compared from now on)` : ''}`);
     this.step('look', 'done', tl, `${num(s0.errors)} errors, ${num(s0.warnings)} warnings`);
     this.noIssues = num(s0.errors) + num(s0.warnings) === 0;
+  }
+
+  /** R0's screens that later runs must measure again: status 'ok', and a state Mantis can compare with (R0's state.json). */
+  async measurableCells(R0) {
+    const ok = okCells(R0.report);
+    try {
+      const state = await this.readJson(`${R0.runDir}/state.json`);
+      this.r0State = state;
+      const cells = state?.cells && typeof state.cells === 'object' ? state.cells : {};
+      return new Set([...ok].filter((k) => Object.hasOwn(cells, k)));
+    } catch (err) {
+      if (this.ac.signal.aborted) throw new Stopped();
+      this.journal(`R0 state.json not read (${firstLine(err?.message)}); every screen with status ok is expected`);
+      return ok;
+    }
+  }
+
+  /**
+   * The R0 screens that run L did not measure: a cell that is not 'ok' in it (the page failed to load,
+   * answered HTTP 400 or more, crashed, or lost its translation), or one left out of its comparison
+   * with R0. Mantis compares only the cells it could measure, so without this check an edit that
+   * breaks a whole route would look like "1 fixed · 0 new".
+   */
+  unmeasured(L) {
+    const ok = okCells(L?.report);
+    const names = [...this.expected].filter((k) => !ok.has(k));
+    const compared = num(L?.report?.baseline?.cellsCompared);
+    return { count: Math.max(names.length, this.expected.size - compared), names };
   }
 
   /** §2.1.6 and §2.2: the workspace, then turns until a stop rule fires. */
@@ -633,9 +718,20 @@ class FixRun {
     this.step('fix', 'done', tf, this.stopReason);
   }
 
-  /** §2.2 steps 9–10: one model call. Returns null when the run must stop (budget, inference). */
+  /** §2.2 steps 9–10: one model call. Returns null when the run must stop (budget, inference, time). */
   async callModel() {
     const { task, caps, deps } = this;
+    // A call may only use the time left before the soft stop, retries included. A call that started
+    // just before it (a long answer, or a queue at the gateway) would otherwise run into the hard
+    // deadline, and the run would end with no receipt although earlier checks were accepted.
+    const left = this.soft - Date.now();
+    if (left < this.minCallMs) {
+      this.stopReason = 'time';
+      this.say('too little time is left for another model call: the run stops here and keeps what was measured');
+      return null;
+    }
+    const budget = AbortSignal.timeout(left);
+    const signal = AbortSignal.any([this.ac.signal, budget]);
     // After the last check, finish is forced, unless the gateway already refused a forced tool_choice.
     let toolChoice = this.checksLeft <= 0 && !this.forcedChoiceRefused ? { type: 'function', function: { name: 'finish' } } : 'auto';
     const sampling = {};
@@ -643,19 +739,28 @@ class FixRun {
     if (Number.isInteger(task.sampling?.seed)) sampling.seed = task.sampling.seed;
     const before = tallyNumbers(deps.tally);
     const t = Date.now();
+    // The model has now been sent every tool result so far: a check may compact those (§2.3.8).
+    this.seenCompactable = this.compactable.length;
     let res;
     for (;;) {
       try {
         res = await abortable(deps.chat({
           model: task.model, messages: this.messages, tools: TOOL_SCHEMAS, toolChoice,
           maxTokens: caps.maxCompletionTokens, reasoning: caps.reasoning, ...sampling,
-          signal: this.ac.signal, tally: deps.tally, guard: deps.guard,
+          signal, timeoutMs: Math.min(300_000, left), tally: deps.tally, guard: deps.guard,
         }), this.ac.signal);
         break;
       } catch (err) {
         if (err instanceof Stopped || this.ac.signal.aborted) {
           this.phases.model += Date.now() - t;
           throw new Stopped();
+        }
+        if (budget.aborted) {
+          this.phases.model += Date.now() - t;
+          this.stopReason = 'time';
+          this.say('the model call ran into the time limit: the run stops here and keeps what was measured');
+          this.journal(`model call stopped at the soft time limit: ${firstLine(err?.message)}`);
+          return null;
         }
         // Forced tool_choice is not confirmed on this gateway (fact §0.5 #6) and the loop must not depend
         // on it: when it is refused as a bad request, ask once more with 'auto' and stop forcing it.
@@ -815,6 +920,16 @@ class FixRun {
     return this.accepted.check === 0 ? 'the start' : `check ${this.accepted.check}`;
   }
 
+  /**
+   * Whether lost controls reject a check like a cover-up does: with the gate on, for a sample
+   * project. A sample is static, so a control or heading that was visible at the start and is gone
+   * now was removed or hidden by the edit. On a live site the same signal can come from changing
+   * content, so a GitHub run only reports it (its verdict is then at best partial).
+   */
+  lostGate() {
+    return Boolean(this.task.gate) && this.task.source?.kind === 'sample';
+  }
+
   endRound() {
     this.dirty = false;
     this.touchedRound.clear();
@@ -875,14 +990,18 @@ class FixRun {
       this.journal(`check ${k}: dev server restart failed: ${firstLine(err?.message)}`);
     }
     if (!failReason) {
-      const timeoutSec = this.lookTimeoutSec();
-      if (timeoutSec < MIN_LOOK_SEC) {
-        failReason = 'no time was left to measure';
-      } else {
-        try {
-          L = await this.heavy(() => look(this.box, { ...this.matrixArgs, baseline: this.R0dir, prevRunId: this.lastRunId, timeoutSec }));
-        } catch (err) {
-          if (err instanceof Stopped || this.ac.signal.aborted) throw new Stopped();
+      try {
+        // The time limit is taken once the heavy slot is free: waiting for it can take a whole look.
+        L = await this.heavy(() => {
+          const timeoutSec = this.lookTimeoutSec();
+          if (timeoutSec < MIN_LOOK_SEC) throw new NoTime();
+          return look(this.box, { ...this.matrixArgs, baseline: this.R0dir, prevRunId: this.lastRunId, timeoutSec });
+        });
+      } catch (err) {
+        if (err instanceof Stopped || this.ac.signal.aborted) throw new Stopped();
+        if (err instanceof NoTime) {
+          failReason = err.message;
+        } else {
           failReason = lookReason(err);
           this.journal(`check ${k}: look failed (${err?.reason ?? 'error'}): ${firstLine(err?.message)}`);
         }
@@ -892,22 +1011,26 @@ class FixRun {
     if (L && !b && !failReason) failReason = 'the comparison with the starting point failed';
 
     let decision;
+    let missing = null;
     if (hits.length) decision = 'tamper';
     else if (failReason) decision = 'failed';
     else if (L.crashed && num(L.report.summary?.crashedCells) > this.r0Crashed) { decision = 'failed'; failReason = 'some screens crashed while loading'; }
+    else if ((missing = this.unmeasured(L)).count > 0) { decision = 'failed'; failReason = screensText(missing); }
     else if (num(b.coverUps) > 0) decision = this.task.gate ? 'reverted' : 'kept';
+    else if (num(b.lost) > 0 && this.lostGate()) decision = 'lost';
     else decision = 'accepted';
 
     const added = b ? this.coverUpsAdded(L) : 0;
-    if (decision === 'tamper' || decision === 'failed' || decision === 'reverted') {
+    if (decision === 'tamper' || decision === 'failed' || decision === 'reverted' || decision === 'lost') {
       const created = this.createdRound.size;
       await revertTo(this.box, this.accepted.sha);
       const clean = await isClean(this.box, this.accepted.sha);
-      this.say(`check ${k}: ${decision} · every edit since ${restoredTo} undone${created ? ` (${created} new file${created === 1 ? '' : 's'} removed)` : ''} · git diff --quiet ${this.accepted.sha.slice(0, 12)}: ${clean ? 'clean' : 'NOT clean'}`);
+      this.say(`check ${k}: ${decision}${failReason ? ` (${failReason})` : ''} · every edit since ${restoredTo} undone${created ? ` (${created} new file${created === 1 ? '' : 's'} removed)` : ''} · git diff --quiet ${this.accepted.sha.slice(0, 12)}: ${clean ? 'clean' : 'NOT clean'}`);
       if (!clean) throw new Error(`the revert to ${restoredTo} left a difference`);
       this.revertedSinceAccept = true;
       if (decision === 'tamper') this.tamperAttempts++;
       if (decision === 'reverted') { this.reverts++; this.coverUpAttempts += added; }
+      if (decision === 'lost') { this.reverts++; this.lostAttempts++; }
       await this.deps.onCheck?.({ check: k, phase: 'after', decision, box: this.box });
     } else {
       const sha = await snapshot(this.box, `check ${k}`);
@@ -919,27 +1042,35 @@ class FixRun {
 
     const ms = Date.now() - t;
     this.phases.checks += ms;
-    this.checkRows.push({ check: k, decision, line: b ? receiptLine(b) : null, runId: L?.runId ?? null, ms, forced, final });
+    this.checkRows.push({ check: k, decision, line: b ? receiptLine(b) : null, runId: L?.runId ?? null, ms, forced, final, ...(failReason ? { reason: failReason } : {}) });
     if (L) {
       await this.save(`check-${k}.report.json`, JSON.stringify(L.report));
       this.emit('look', lookEvent('check', L, k));
       this.lastRunId = L.runId;
     }
-    const coverUps = (L?.report?.issues ?? []).filter((i) => i.type === 'cover-up').slice(0, 20)
+    const issuesOf = (type) => (L?.report?.issues ?? []).filter((i) => i.type === type).slice(0, 20);
+    const coverUps = issuesOf('cover-up')
       .map((i) => ({ type: i.evidence?.was?.type ?? 'cover-up', selector: i.selector ?? null, kind: i.evidence?.kind ?? null, cells: [...(i.cells ?? [])] }));
+    const lost = decision === 'lost'
+      ? issuesOf('lost').map((i) => ({ control: i.evidence?.control ?? (Number.isFinite(i.evidence?.count) ? `${i.evidence.count} controls` : null), selector: i.selector ?? null, cells: [...(i.cells ?? [])] }))
+      : [];
     this.emit('gate', {
       check: k, decision,
       ...(decision === 'accepted' || decision === 'kept' ? {} : { restoredTo }),
       ...(coverUps.length ? { coverUps } : {}),
+      ...(lost.length ? { lost } : {}),
       ...(hits.length ? { tamperHits: hits } : {}),
       ...(decision === 'failed' ? { reason: failReason } : {}),
     });
     this.journal(`check ${k} ${decision}${b ? ` ${receiptLine(b)}` : ''}${failReason ? ` (${failReason})` : ''}`);
     this.endRound();
 
-    // §2.3.8: earlier file output the model has already seen is replaced, so the prompt stays small.
-    for (const m of this.compactable) m.content = compactedToolResult(k);
-    this.compactable = [];
+    // §2.3.8: file output the model has already been sent is replaced, so the prompt stays small.
+    // Results it has not seen yet (a forced check right after a batch) stay for its next turn.
+    const seen = Math.min(this.seenCompactable, this.compactable.length);
+    for (const m of this.compactable.slice(0, seen)) m.content = compactedToolResult(k);
+    this.compactable = this.compactable.slice(seen);
+    this.seenCompactable = 0;
 
     if (final) return '';
     let text = checkMessage({
@@ -1004,25 +1135,32 @@ class FixRun {
   async verifyLook() {
     const prev = this.accepted.look;
     const k = this.accepted.check;
-    const timeoutSec = this.lookTimeoutSec();
-    if (timeoutSec < MIN_LOOK_SEC) {
+    const tooLate = () => {
       this.say(`verify look skipped (not enough time left): the final files are what check ${k} measured`);
       return prev;
-    }
+    };
+    if (this.lookTimeoutSec() < MIN_LOOK_SEC) return tooLate();
     const t = Date.now();
     try {
       await this.ensureServer();
-      const v = await this.heavy(() => look(this.box, { ...this.matrixArgs, baseline: this.R0dir, prevRunId: this.lastRunId, timeoutSec }));
+      const v = await this.heavy(() => {
+        const timeoutSec = this.lookTimeoutSec();
+        if (timeoutSec < MIN_LOOK_SEC) throw new NoTime();
+        return look(this.box, { ...this.matrixArgs, baseline: this.R0dir, prevRunId: this.lastRunId, timeoutSec });
+      });
       this.lastRunId = v.runId;
       this.emit('look', lookEvent('verify', v));
       if (!v?.report?.baseline) { this.say(`verify look gave no comparison; using check ${k}`); return prev; }
       if (v.crashed && num(v.report.summary?.crashedCells) > this.r0Crashed) { this.say(`verify look had crashed screens; using check ${k}`); return prev; }
+      const missing = this.unmeasured(v);
+      if (missing.count > 0) { this.say(`verify look: ${screensText(missing)}; using check ${k}`); return prev; }
       this.say(sameNumbers(v.report, prev.report)
         ? `verify matches check ${k}: ${receiptLine(v.report.baseline)}`
         : `verify differs from check ${k}: ${receiptLine(v.report.baseline)} (check ${k}: ${receiptLine(prev.report.baseline)}); using the verify run`);
       return v;
     } catch (err) {
       if (err instanceof Stopped || this.ac.signal.aborted) throw new Stopped();
+      if (err instanceof NoTime) return tooLate();
       this.say(`verify look failed (${lookReason(err)}): the final files are what check ${k} measured`);
       return prev;
     } finally {
@@ -1045,19 +1183,26 @@ class FixRun {
   }
 
   async makeProof() {
-    const timeoutSec = Math.min(90, Math.floor((this.deadline - Date.now() - this.reserveMs) / 1000));
-    if (timeoutSec < 5) { this.say('proof sheet skipped: not enough time left'); return; }
+    const proofSec = () => Math.min(90, Math.floor((this.deadline - Date.now() - this.reserveMs) / 1000));
+    const skipped = () => this.say('proof sheet skipped: not enough time left');
+    if (proofSec() < 5) { skipped(); return; }
     const t = Date.now();
     try {
-      // Absolute run dirs: the latest/prev aliases only resolve against cwd/.mantis.
-      const r = await this.heavy(() => this.box.execArgs(['sh', '-c',
-        'mkdir -p /work/.ring && cd /work && exec timeout -k 5 "$1" mantis proof --before "$2" --after "$3" --out /work/.ring/proof.png',
-        'proof', String(timeoutSec), this.R0dir, this.RF.runDir], { timeoutMs: (timeoutSec + 15) * 1000 }));
+      // The time limit is taken once the heavy slot is free. Absolute run dirs: the latest/prev
+      // aliases only resolve against cwd/.mantis.
+      const r = await this.heavy(() => {
+        const timeoutSec = proofSec();
+        if (timeoutSec < 5) throw new NoTime();
+        return this.box.execArgs(['sh', '-c',
+          'mkdir -p /work/.ring && cd /work && exec timeout -k 5 "$1" mantis proof --before "$2" --after "$3" --out /work/.ring/proof.png',
+          'proof', String(timeoutSec), this.R0dir, this.RF.runDir], { timeoutMs: (timeoutSec + 15) * 1000 });
+      });
       if (r.code === 0) this.proofPath = '/work/.ring/proof.png';
       else { this.say('the proof sheet could not be made'); this.journal(`proof failed (exit ${r.code}): ${lastLine(r.stderr)}`); }
     } catch (err) {
       if (err instanceof Stopped || this.ac.signal.aborted) throw new Stopped();
-      this.journal(`proof failed: ${firstLine(err?.message)}`);
+      if (err instanceof NoTime) skipped();
+      else this.journal(`proof failed: ${firstLine(err?.message)}`);
     } finally {
       this.phases.proof += Date.now() - t;
     }
@@ -1105,7 +1250,7 @@ class FixRun {
     const t = Date.now();
     try {
       const { pickPairs } = await import('./vision.mjs');
-      const r0State = await this.readJson(`${this.R0dir}/state.json`);
+      const r0State = this.r0State ?? await this.readJson(`${this.R0dir}/state.json`);
       const rfState = await this.readJson(`${this.RF.runDir}/state.json`);
       await this.save('r0.state.json', JSON.stringify(r0State));
       await this.save('rf.state.json', JSON.stringify(rfState));
@@ -1173,8 +1318,18 @@ class FixRun {
   async destroyAndConfirm() {
     const t = Date.now();
     let gone = false;
+    const isGone = async () => {
+      try { return (await this.box.gone()) === true; } catch (err) { this.journal(`gone check failed: ${firstLine(err?.message)}`); return false; }
+    };
     try { await this.box.destroy(); } catch (err) { this.journal(`destroy failed: ${firstLine(err?.message)}`); }
-    try { gone = (await this.box.gone()) === true; } catch (err) { this.journal(`gone check failed: ${firstLine(err?.message)}`); }
+    gone = await isGone();
+    if (!gone) {
+      // One more try, by name and then by this task's own label (never another task's or a self-test's
+      // container), so a sandbox does not stay up until the app restarts.
+      try { await this.box.destroy(); } catch (err) { this.journal(`destroy retry failed: ${firstLine(err?.message)}`); }
+      try { await Sandbox.removeAll(`mantis-ring.task=${this.task.id}`); } catch (err) { this.journal(`removal by label failed: ${firstLine(err?.message)}`); }
+      gone = await isGone();
+    }
     this.phases.destroy += Date.now() - t;
     this.cleanedUp = true;
     this.containment = {
@@ -1198,8 +1353,8 @@ class FixRun {
     const receipt = buildReceipt({
       taskId: task.id, startedAt: this.t0, finishedAt: Date.now(),
       source: s.kind === 'github' ? { kind: 'github', name: `${s.owner}/${s.name}`, commit: this.src?.commit ?? null } : { kind: 'sample', name: s.name, commit: null },
-      matrix: task.matrix, r0Report: this.R0.report, rfReport: this.RF?.report ?? null,
-      gate: { enabled: Boolean(task.gate), coverUpAttempts: this.coverUpAttempts, tamperAttempts: this.tamperAttempts, reverts: this.reverts },
+      matrix: task.matrix, r0Report: this.R0.report, rfReport: this.RF?.report ?? null, cellsExpected: this.expected.size,
+      gate: { enabled: Boolean(task.gate), coverUpAttempts: this.coverUpAttempts, tamperAttempts: this.tamperAttempts, lostAttempts: this.lostAttempts, reverts: this.reverts },
       checks: this.checkRows, stopReason: this.stopReason,
       models, tokens: { prompt: delta.promptTokens, completion: delta.completionTokens, reasoning: delta.reasoningTokens }, usd: delta.usd,
       turns: this.turns, toolCalls: this.toolCalls, invalidToolCalls: this.invalidCalls, toolErrors: this.toolErrors,
