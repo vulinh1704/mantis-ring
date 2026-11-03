@@ -2,6 +2,8 @@
 // Containment checks for the task sandbox. Each check runs against a fresh container and prints
 // PASS or FAIL. These are the "blast radius" claims made in the README, measured.
 // Usage: node test/containment.mjs   (after scripts/setup.sh; RING_RUNTIME=runsc runs the sandboxes in gVisor)
+// At exit it writes ~/.ring/selftest/containment.json, the result the app shows on /status.
+import { mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -14,11 +16,33 @@ const gone = async (name) => (await run('docker', ['ps', '-aq', '--filter', `nam
 const runtime = process.env.RING_RUNTIME || undefined;
 console.log(`runtime: ${runtime ?? 'docker default'}`);
 
+// The result file for /status, written at exit. A suite that crashes part-way gets one failed check
+// more, so a partial run never reads as a full pass. `runtime` is what Docker reports for the sandbox.
+let sandboxRuntime = null;
+let finished = false;
+process.on('exit', () => {
+  const checks = results.map(({ name, pass }) => ({ name, pass }));
+  if (!finished) checks.push({ name: 'the suite ran to the end', pass: false });
+  const file = path.join(os.homedir(), '.ring', 'selftest', 'containment.json');
+  try {
+    mkdirSync(path.dirname(file), { recursive: true });
+    const data = { suite: 'containment', runtime: sandboxRuntime ?? runtime ?? null, passed: checks.filter((c) => c.pass).length, total: checks.length, at: new Date().toISOString(), checks };
+    writeFileSync(`${file}.tmp`, `${JSON.stringify(data, null, 2)}\n`);
+    renameSync(`${file}.tmp`, file);
+  } catch (err) {
+    console.error(`could not write ${file}: ${err.message}`);
+  }
+});
+// Stopped from outside (the app's 20-minute self-test limit, Ctrl-C): exit through the handler above,
+// so the result file records a failed run instead of keeping the previous one.
+for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => process.exit(1));
+
 // A secret on the host that must never reach the sandbox.
 process.env.RING_FAKE_API_KEY = 'sk-should-never-leak';
 
 const box = await Sandbox.create({ runtime });
 try {
+  sandboxRuntime = await box.runtimeName().catch(() => null);
   const env = await box.exec('env');
   const leaked = env.stdout.split('\n').filter((l) => /KEY|TOKEN|SECRET|PASSWORD/i.test(l));
   check('no secrets in the sandbox environment', leaked.length === 0 && !env.stdout.includes('sk-should-never-leak'), leaked.join(', ') || 'only proxy and path variables');
@@ -93,4 +117,5 @@ check('its container is destroyed too', hung.destroyed && await gone(hung.sandbo
 
 const failed = results.filter((r) => !r.pass);
 console.log(`\n${results.length - failed.length}/${results.length} containment checks passed`);
+finished = true;
 process.exit(failed.length ? 1 : 0);
