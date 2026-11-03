@@ -50,9 +50,17 @@ process.on('exit', () => {
     console.error(`could not write ${file}: ${err.message}`);
   }
 });
-// Stopped from outside (the app's 20-minute self-test limit, Ctrl-C): exit through the handler above,
-// so the result file records a failed run instead of keeping the previous one.
-for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => process.exit(1));
+// Stopped from outside (the app's 20-minute self-test limit, Ctrl-C, a dropped SSH session): the
+// sandboxes this run made go first, with their networks (8 s at most), then exit through the handler
+// above, so the result file records a failed run instead of keeping the previous one.
+let stopping = false;
+for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
+  process.on(sig, () => {
+    if (stopping) return;
+    stopping = true;
+    Sandbox.destroyLive().catch(() => {}).finally(() => process.exit(1));
+  });
+}
 
 // Secrets on the host that must never reach the sandbox: one in this process's environment (the
 // docker CLI inherits it) and one in a file outside the fixture. A canary file checks the host is untouched.

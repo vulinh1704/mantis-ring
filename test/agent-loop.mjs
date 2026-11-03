@@ -2,7 +2,8 @@
 // Tests for Ring's agent loop and the pieces under it, driven by a fake model (test/fake-gateway.mjs),
 // so no token is ever spent. `--unit` runs the checks that need no Docker (build spec §6.1, U1-U9):
 // path rules, tool-call parsing, the receipt line and verdicts, the check messages, the tamper guard,
-// chat() against the fake gateway, run() with UTF-8 output, and the PNG helpers once they exist.
+// chat() against the fake gateway, run() with UTF-8 output, and the PNG helpers once they exist;
+// U11 drives the sandbox's own network (create, destroy, clean-up) against a fake docker.
 // Without flags it also runs the sandbox scenarios (§6.2, S1-S10) on the Lumen sample with a one-cell
 // matrix: an honest fix, a cover-up with the gate on and off, a measurement tamper, paths out of the
 // project, every cap (the soft stop of a model call included), malformed tool-call arguments, an
@@ -12,7 +13,7 @@
 // Usage: node test/agent-loop.mjs [--unit] [--only U7,S2] [--verbose]
 //        (the scenarios need Docker and scripts/setup.sh; RING_RUNTIME=runsc runs them in gVisor)
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -589,6 +590,135 @@ async function u10() {
   }
 }
 
+/**
+ * The sandbox's own network, against test/fake-docker.mjs: a `docker` shim first on PATH that plays
+ * the commands over a state file, so every failure path can be forced without Docker. If the shim
+ * does not answer as the fake, nothing runs: create() must never reach the real docker from here.
+ */
+async function u11() {
+  const sandbox = await load('../runner/sandbox.mjs');
+  if (!sandbox) return;
+  const { Sandbox, TASK_LABEL, run } = sandbox;
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'ring-fake-docker-'));
+  const stateFile = path.join(dir, 'state.json');
+  const q = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+  writeFileSync(path.join(dir, 'docker'), `#!/bin/sh\nexec ${q(process.execPath)} ${q(fileURLToPath(new URL('./fake-docker.mjs', import.meta.url)))} "$@"\n`, { mode: 0o755 });
+  const state = () => JSON.parse(readFileSync(stateFile, 'utf8'));
+  const save = (s) => writeFileSync(stateFile, JSON.stringify(s));
+  const failNext = (op, n) => { const s = state(); s.fail[op] = n; save(s); };
+  const fresh = () => save({ seq: 0, proxy: true, containers: {}, networks: {}, fail: {}, log: [] });
+  const taskNets = (s) => Object.keys(s.networks).filter((n) => n.startsWith('ring-task-') && n !== 'ring-task-ffffffff');
+  const rejection = (p) => p.then(() => null, (e) => e);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${dir}:${oldPath ?? ''}`;
+  process.env.DOCKER_FAKE_STATE = stateFile;
+  try {
+    fresh();
+    const ping = await run('docker', ['fake-docker-ping'], { timeoutMs: 15_000 });
+    if (ping.code !== 0 || ping.stdout.trim() !== 'fake docker') {
+      check('U11 the fake docker answers in place of the real one', false, `exit ${ping.code}: ${oneLine(ping.stdout || ping.stderr)}`);
+      return;
+    }
+
+    const a = await Sandbox.create({ labels: { 'mantis-ring.owner': 'app', 'mantis-ring.task': 't_u11a' } });
+    let s = state();
+    const na = s.networks[a.network];
+    const ca = s.containers[a.name];
+    const at = (log, prefix) => log.findIndex((l) => l.startsWith(prefix));
+    const made = [at(s.log, `network create --internal --label ${TASK_LABEL}`), at(s.log, `network connect ${a.network} ring-proxy`), at(s.log, `run -d --name ${a.name}`)];
+    check('U11 create(): the sandbox gets its own internal network ring-task-<id>, labelled like it, with ring-proxy on it and in its /etc/hosts',
+      a.network === `ring-task-${a.name.slice('ring-'.length)}` && na?.internal === true && na.labels['mantis-ring'] === 'task'
+        && na.labels['mantis-ring.sandbox'] === a.name && na.labels['mantis-ring.owner'] === 'app' && na.labels['mantis-ring.task'] === 't_u11a'
+        && Boolean(na.members['ring-proxy']) && ca?.network === a.network && ca.addHost.includes(`ring-proxy:${na.members['ring-proxy']}`)
+        && made[0] >= 0 && made[0] < made[1] && made[1] < made[2],
+      `${a.name} on ${a.network}; ring-proxy ${na?.members?.['ring-proxy']}; --add-host ${ca?.addHost?.join(',')}`);
+
+    const b = await Sandbox.create({ labels: { 'mantis-ring.owner': 'app', 'mantis-ring.task': 't_u11b' } });
+    s = state();
+    check('U11 a second sandbox gets a second network: ring-proxy is on both, each container on its own only',
+      b.network !== a.network && Boolean(s.networks[a.network]?.members['ring-proxy']) && Boolean(s.networks[b.network]?.members['ring-proxy'])
+        && !s.networks[a.network].members[b.name] && !s.networks[b.network].members[a.name],
+      `${a.network}: ${Object.keys(s.networks[a.network]?.members ?? {}).join(', ')}; ${b.network}: ${Object.keys(s.networks[b.network]?.members ?? {}).join(', ')}`);
+
+    const from = state().log.length;
+    await a.destroy();
+    s = state();
+    const steps = s.log.slice(from);
+    const order = [at(steps, `rm -f ${a.name}`), at(steps, `network disconnect --force ${a.network} ring-proxy`), at(steps, `network rm ${a.network}`)];
+    check('U11 destroy(): the container goes, then ring-proxy leaves the network, then the network goes; the other sandbox keeps its own',
+      !s.containers[a.name] && !s.networks[a.network] && order[0] >= 0 && order[0] < order[1] && order[1] < order[2]
+        && Boolean(s.networks[b.network]?.members[b.name]) && Boolean(s.networks[b.network]?.members['ring-proxy'])
+        && await a.gone() && await a.networkGone(),
+      steps.join(' ; '));
+
+    failNext('run', 1);
+    const runErr = await rejection(Sandbox.create({}));
+    s = state();
+    const after = { containers: Object.keys(s.containers).filter((n) => n !== b.name), networks: taskNets(s).filter((n) => n !== b.network) };
+    check('U11 a docker run that fails leaves no container and no network behind',
+      /docker run failed/.test(runErr?.message ?? '') && after.containers.length === 0 && after.networks.length === 0,
+      `${oneLine(runErr?.message ?? 'create() did not fail')}; left: ${[...after.containers, ...after.networks].join(' ') || 'nothing'}`);
+
+    failNext('network-connect', 1);
+    const joinErr = await rejection(Sandbox.create({}));
+    s = state();
+    const left = taskNets(s).filter((n) => n !== b.network);
+    check('U11 a proxy that cannot join stops the start, and the new network is removed',
+      /could not join/.test(joinErr?.message ?? '') && left.length === 0 && Object.keys(s.containers).length === 1,
+      `${oneLine(joinErr?.message ?? 'create() did not fail')}; left: ${left.join(' ') || 'nothing'}`);
+
+    failNext('network-rm', 1);
+    await b.destroy();
+    s = state();
+    const onceOk = !s.networks[b.network] && !s.containers[b.name];
+    const c = await Sandbox.create({});
+    failNext('network-rm', 99);
+    const stuck = await rejection(c.destroy());
+    s = state();
+    const stuckOk = /was not removed/.test(stuck?.message ?? '') && !s.containers[c.name] && Boolean(s.networks[c.network]);
+    failNext('network-rm', 0);
+    await c.destroy();
+    const laterOk = !state().networks[c.network];
+    check('U11 destroy() tries a network again that does not go at once; one that never goes makes it reject, and the next destroy() removes it',
+      onceOk && stuckOk && laterOk, `once: ${onceOk}; stuck: ${oneLine(stuck?.message ?? 'destroy() did not reject')}; next destroy(): ${laterOk ? 'removed' : 'still there'}`);
+
+    fresh();
+    const live = await Sandbox.create({ labels: { 'mantis-ring.owner': 'app' } });
+    const old = await Sandbox.create({ labels: { 'mantis-ring.owner': 'app' } });
+    const young = await Sandbox.create({ labels: { 'mantis-ring.owner': 'app' } });
+    // As after a crash: two containers are gone and their networks stay, one of them an hour old.
+    // ring-task-ffffffff has no label, so it is not Mantis Ring's.
+    s = state();
+    for (const box of [old, young]) {
+      delete s.networks[box.network].members[box.name];
+      delete s.containers[box.name];
+    }
+    s.networks[old.network].created = new Date(Date.now() - 3_600_000).toISOString();
+    s.networks['ring-task-ffffffff'] = { id: 'net999', internal: true, labels: {}, created: new Date(Date.now() - 3_600_000).toISOString(), subnet: 99, members: {} };
+    save(s);
+    const swept = await Sandbox.removeNetworks(TASK_LABEL, { minAgeMs: 10 * 60_000 });
+    s = state();
+    const sweepOk = swept === 1 && !s.networks[old.network] && Boolean(s.networks[young.network]) && Boolean(s.networks[live.network]) && Boolean(s.networks['ring-task-ffffffff']);
+    const all = await Sandbox.removeAll('mantis-ring.owner=app');
+    s = state();
+    const allOk = all?.containers === 1 && all?.networks === 2 && !s.containers[live.name] && taskNets(s).length === 0 && Boolean(s.networks['ring-task-ffffffff']);
+    check('U11 removeNetworks() takes only stale sandbox networks (not one a sandbox runs on, not a young one, not one without the label); removeAll() takes the containers, then their networks',
+      sweepOk && allOk, `sweep removed ${swept}; removeAll ${JSON.stringify(all)}; left: ${Object.keys(s.networks).join(' ') || 'nothing'}`);
+
+    const x = await Sandbox.create({});
+    const y = await Sandbox.create({});
+    await Sandbox.destroyLive(15_000);
+    s = state();
+    check('U11 destroyLive() (a test stopped by a signal) removes every sandbox it made and has not destroyed, with its network',
+      Object.keys(s.containers).length === 0 && taskNets(s).length === 0 && !s.networks[x.network] && !s.networks[y.network],
+      `left: ${[...Object.keys(s.containers), ...taskNets(s)].join(' ') || 'nothing'}`);
+  } finally {
+    process.env.PATH = oldPath;
+    delete process.env.DOCKER_FAKE_STATE;
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Sandbox scenarios (Docker; runc locally, runsc on the VM)
 // ---------------------------------------------------------------------------------------------
@@ -1068,6 +1198,13 @@ async function scenarios() {
       : image.code !== 0 ? 'no mantis-ring/sandbox image: run scripts/setup.sh'
         : proxy.stdout.trim() !== 'true' ? 'ring-proxy is not running: run scripts/setup.sh' : `docker ${docker.stdout.trim()}, runtime ${RUNTIME_NAME}`);
   if (!ready) return;
+  // Sandbox networks left by an earlier run that was killed (Mantis Ring's own, no sandbox on them, older than 10 min).
+  try {
+    const stale = await sandbox.Sandbox.removeNetworks(sandbox.TASK_LABEL, { minAgeMs: sandbox.STALE_NETWORK_MS });
+    if (stale) console.log(`removed ${stale} stale sandbox network(s)`);
+  } catch (err) {
+    console.log(`note: stale sandbox networks were not removed: ${oneLine(err.message)}`);
+  }
 
   for (const s of picked) {
     console.log(`\n# ${s.id}: ${s.title}`);
@@ -1091,21 +1228,26 @@ async function scenarios() {
     check(`${s.id} ${s.title}`, failed.length === 0, failed.length ? `${why}failed: ${failed.join('; ')} | ${status}` : status);
     if (failed.length && !args.verbose) for (const line of sc.logs.slice(-15)) console.log(`      ${oneLine(line)}`);
 
-    // S8 after every scenario: the box is gone (by label and by name), no key anywhere, a clean protocol.
+    // S8 after every scenario: the box and its own network are gone (by label and by name), no key
+    // anywhere, a clean protocol.
     const byLabel = (await sandbox.run('docker', ['ps', '-aq', '--filter', `label=mantis-ring.task=${sc.task.id}`])).stdout.trim();
     const byName = sc.box ? (await sandbox.run('docker', ['ps', '-aq', '--filter', `name=^${sc.box.name}$`])).stdout.trim() : '';
+    const netByLabel = (await sandbox.run('docker', ['network', 'ls', '--filter', `label=mantis-ring.task=${sc.task.id}`, '--format', '{{.Name}}'])).stdout.trim();
+    const netByName = sc.box?.network && !(await sc.box.networkGone()) ? sc.box.network : '';
     const keyIn = [...sc.files].filter(([, b]) => b.includes(FAKE_KEY)).map(([n]) => n);
     if (JSON.stringify(sc.events).includes(FAKE_KEY)) keyIn.push('events');
     if (sc.logs.join('\n').includes(FAKE_KEY)) keyIn.push('log');
     const problems = sc.chats.flatMap((q) => q.problems.map((p) => `request ${q.n}: ${p}`));
     const echoed = sc.chats.filter((q) => q.body?.messages?.some((m) => m?.role === 'assistant' && 'reasoning' in m)).length;
     const leftovers = [...new Set([...byLabel.split(/\s+/), ...byName.split(/\s+/)].filter(Boolean))];
-    check(`S8 after ${s.id}: container gone, no key in files/events/log, valid chat history`,
-      leftovers.length === 0 && keyIn.length === 0 && problems.length === 0 && echoed === 0 && sc.badNames.length === 0,
-      [leftovers.length ? `still there: ${leftovers.join(' ')}` : `${sc.box?.name ?? 'no box'} gone`,
+    const netsLeft = [...new Set([...netByLabel.split(/\s+/), netByName].filter(Boolean))];
+    check(`S8 after ${s.id}: container and its network gone, no key in files/events/log, valid chat history`,
+      leftovers.length === 0 && netsLeft.length === 0 && keyIn.length === 0 && problems.length === 0 && echoed === 0 && sc.badNames.length === 0,
+      [leftovers.length || netsLeft.length ? `still there: ${[...leftovers, ...netsLeft].join(' ')}` : `${sc.box?.name ?? 'no box'} and ${sc.box?.network ?? 'no network'} gone`,
         keyIn.length ? `key found in ${keyIn.join(', ')}` : '', problems.length ? problems.slice(0, 2).join('; ') : '',
         echoed ? `${echoed} requests echoed reasoning` : '', sc.badNames.length ? `bad store names: ${sc.badNames.join(', ')}` : ''].filter(Boolean).join('; '));
     if (leftovers.length) await sandbox.run('docker', ['rm', '-f', ...leftovers]);
+    if (leftovers.length || netsLeft.length) await sandbox.Sandbox.removeAll(`mantis-ring.task=${sc.task.id}`).catch(() => {});
   }
 }
 
@@ -1132,7 +1274,16 @@ process.on('exit', () => {
     console.error(`could not write ${file}: ${err.message}`);
   }
 });
-for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => process.exit(1));
+// Stopped from outside (the app's 20-minute self-test limit, Ctrl-C, a dropped SSH session): the
+// sandboxes this run made go first, with their networks (8 s at most), then the handler above.
+let stopping = false;
+for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
+  process.on(sig, () => {
+    if (stopping) return;
+    stopping = true;
+    Promise.resolve(loaded.get('../runner/sandbox.mjs')?.Sandbox?.destroyLive?.()).catch(() => {}).finally(() => process.exit(1));
+  });
+}
 
 let exitCode = 1;
 try {
@@ -1147,6 +1298,7 @@ try {
   await group('U8', u8);
   await group('U9', u9);
   await group('U10', u10);
+  await group('U11', u11);
   if (!args.unit) await scenarios();
 
   const failed = results.filter((r) => !r.pass);
