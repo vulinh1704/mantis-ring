@@ -481,9 +481,32 @@ const ROUTE = /^\/[A-Za-z0-9._~!$&'()*+;=:@%/-]{0,100}$/;
 const LABEL = /^[A-Za-z0-9 ._:+-]{1,80}$/;
 const ADMIN_KEYS = new Set(['sample', 'repo', 'routes', 'viewports', 'schemes', 'locales', 'model', 'visionModel', 'gate', 'caps', 'sampling', 'label', 'priority']);
 export const SAY_BAD_REPO = 'Only public repositories on github.com are supported, written as https://github.com/owner/name.';
+export const SAY_REPO_PAGE = "Give the repository's own address, https://github.com/owner/name, not a link to a branch, folder, file or other page in it.";
 export const SAY_BAD_MATRIX = 'Routes must be paths like /pricing (up to 3); languages must come from the list.';
+// A link to a page inside a repository (a branch, folder, file, pull request, …) rather than to the repository.
+const REPO_PAGE = /^https:\/\/github\.com\/[^/]+\/[^/]+\/(?:tree|blob|raw|commit|commits|pull|pulls|issues|releases|tags|wiki|actions|compare|archive|discussions|security|pulse|graphs|settings)(?:\/|$)/i;
 
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+/**
+ * The owner and name of a GitHub repository from an address as people paste it. Spaces around it,
+ * http://, www., no scheme at all, a trailing slash or .git, and a #fragment or ?query (#readme,
+ * ?tab=…) are accepted; the rest must match REPO (BUILD-SPEC §4.6). The clone URL is rebuilt from the
+ * two parts later, so nothing else of what was typed is ever used.
+ * @param {unknown} input
+ * @returns {{owner: string, name: string}}
+ * @throws {TaskInputError} with SAY_REPO_PAGE for a link to a page inside a repository, else SAY_BAD_REPO
+ */
+export function repoFromInput(input) {
+  if (typeof input !== 'string' || input.length > 300) throw new TaskInputError(SAY_BAD_REPO);
+  const plain = /^(?:https?:\/\/)?(?:www\.)?github\.com(\/[^?#]*)?(?:[?#][\s\S]*)?$/i.exec(input.trim());
+  if (!plain) throw new TaskInputError(SAY_BAD_REPO);
+  const url = `https://github.com${plain[1] ?? ''}`;
+  if (REPO_PAGE.test(url)) throw new TaskInputError(SAY_REPO_PAGE);
+  const m = REPO.exec(url);
+  if (!m || m[2] === '.' || m[2] === '..') throw new TaskInputError(SAY_BAD_REPO);
+  return { owner: m[1], name: m[2] };
+}
 
 /** A list given as an array of strings or a comma-separated string; null when absent. */
 function listOf(v) {
@@ -523,10 +546,9 @@ export function taskFromBody(body, { admin = false, cfg }) {
     source = { kind: 'sample', name: body.sample, label: sample.label };
     matrix = { routes: [...sample.routes], viewports: [...sample.viewports], schemes: [...sample.schemes], locales: [...sample.locales] };
   } else {
-    const m = typeof body.repo === 'string' ? REPO.exec(body.repo.trim()) : null;
-    if (!m || m[2] === '.' || m[2] === '..') throw new TaskInputError(SAY_BAD_REPO);
+    const { owner, name } = repoFromInput(body.repo);
     // The host never fetches this URL: the clone runs inside the sandbox, from a URL rebuilt out of these parts.
-    source = { kind: 'github', owner: m[1], name: m[2], label: `${m[1]}/${m[2]}` };
+    source = { kind: 'github', owner, name, label: `${owner}/${name}` };
     matrix = { routes: ['/'], viewports: ['mobile', 'desktop'], schemes: ['light', 'dark'], locales: ['en'] };
   }
 
