@@ -8,7 +8,7 @@
 #
 # Usage: scripts/ring.sh <command> [args]
 #   status                    /status.json
-#   health                    /admin/health (running and queued tasks, Docker, proxy, sandboxes)
+#   health                    /admin/health (running and queued tasks, Docker, proxy, sandboxes, networks)
 #   probe '<json>'            POST /admin/probe  {"models":[...],"vision":[...]}
 #   run '<json>'              POST /admin/tasks  prints the id, the position and the owner link
 #   watch <id>                live events (SSE) until the task is done; Ctrl-C to stop

@@ -12,7 +12,7 @@
 # Usage: scripts/deploy.sh [--dirty] [--force] [--selftest]
 #   --dirty     deploy uncommitted changes too (app/VERSION.json then says dirty: true)
 #   --force     restart even while a task or a self-test runs, or when the VM's queue cannot be read
-#   --selftest  afterwards, with no task running, run ring-selftest (13/13 containment, 17/17 scenes)
+#   --selftest  afterwards, with no task running, run ring-selftest (containment and scenes; every check must pass)
 # Environment, for tests only: RING_SSH, RING_RSYNC (programs to use instead of ssh and rsync; they
 # must be executable), RING_HOST, RING_URL. With RING_TEST=1 the script refuses to run unless both
 # programs are test stand-ins and the host is not the real VM, so a broken fake can never fall
