@@ -62,6 +62,14 @@ The loop follows the routine that the `mantis-fix` skill already describes (fix,
 - `pre-event-final` (signed) is on the last commit before 22:00 ICT on 3 Nov. That is where the work before the event ends. The commits between `kickoff` and `pre-event-final` have no AI in them: no model calls, prompts or tool schemas.
 - Every line of Ring's agent is written after 22:00 ICT on 3 Nov.
 
+## Known limits
+
+- **A hostile repository can game its own receipt.** A GitHub repository's code runs as the same user as Mantis inside its sandbox, so its dev server could show the checker a different page, or rewrite Mantis's run folder. Receipts for GitHub repositories therefore say "measured inside the repo's own sandbox", not "verified", and only runs on the built-in sample are ever published as the latest verified run.
+- **The tamper guard is a list of words.** A check is rolled back when an edit mentions the checker (`data-mantis…`, `mantis`), headless-browser or webdriver checks, user-agent sniffing, or the usual ways to hide such a word (split strings, `atob`, character codes, `\x`/`\u` escapes). A model could still find a spelling the list misses. The real fix belongs in Mantis: a look option that ignores page-supplied `data-mantis-ignore` and counts ignored elements per screen.
+- **Approval.** The owner link carries the token that approves a run, and the operator who starts a run through the admin channel sees it. The admin channel itself can never approve, but only an approval passphrase set on the server (`RING_APPROVE_PASSPHRASE_SHA256` in the service's environment) proves that a person approved. Without one, the published page says "Approved with the owner link", not "by a human".
+- **Lost controls on live sites.** On the sample, a check that makes a visible control or heading disappear is rolled back like a cover-up. On a GitHub repository it only lowers the verdict to partial, because live content can come and go between two measurements.
+- **The diff is public before approval.** Anyone with a run's address can read its diff on the run page; approval gates the patch file. The demo never applies a patch anywhere.
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
