@@ -79,7 +79,8 @@ export function verdictOf(receipt) {
  * The publish bar (§3.3): a pass (recomputed from the counts, so a stored verdict cannot vouch for
  * itself), with no lost control and every screen compared, on a sample project, in a sandbox
  * confirmed destroyed, labelled REAL RUN (gVisor on the VM and the real Vultr endpoint). A TEST RUN
- * is never publishable, and neither is a SEEDED run, where a script played the model.
+ * is never publishable, and neither is a SEEDED run, where a script played the model, nor a run of
+ * an admin-only sample (source.publicSample false: the app sets it from its list of samples).
  * @param {object} receipt
  * @returns {boolean}
  */
@@ -87,6 +88,7 @@ export function isPublishable(receipt) {
   const stored = typeof receipt?.verdict === 'string' ? receipt.verdict : null;
   return verdictOf(receipt) === 'pass' && (stored === null || stored === 'pass')
     && receipt?.source?.kind === 'sample'
+    && receipt.source.publicSample !== false
     && receipt?.containment?.destroyed === true
     && !receipt?.seeded
     && typeof receipt?.label === 'string' && receipt.label.startsWith('REAL RUN');
@@ -116,7 +118,7 @@ function runLabel(inferenceUrl, runtime, startedAt, seeded) {
  * at its starting point and every count is zero.
  * @param {{
  *   taskId: string, startedAt: number|string, finishedAt: number|string,
- *   source: {kind: 'sample'|'github', name: string, commit: string|null},
+ *   source: {kind: 'sample'|'github', name: string, commit: string|null, publicSample?: boolean},
  *   matrix: {routes: string[], viewports: string[], schemes: string[], locales: string[]},
  *   r0Report: object, rfReport: object|null, cellsExpected?: number,
  *   gate: {enabled: boolean, coverUpAttempts: number, tamperAttempts: number, lostAttempts?: number, reverts: number},
@@ -248,7 +250,7 @@ export function receiptMarkdown(receipt) {
   out.push('Final run re-measured by Mantis (no LLM) and compared with the baseline run R0.', '');
   if (r.trust === 'repo-sandbox') out.push(`Note: ${TRUST_NOTES['repo-sandbox']}`, '');
   out.push(`- Verdict: **${r.verdict ?? verdictOf(r)}** · publishable: ${r.publishable ? 'yes' : 'no'} · stop reason: ${r.stopReason ?? '—'}`);
-  out.push(`- Source: ${r.source?.kind ?? '—'} ${code(r.source?.name ?? '—')}${r.source?.commit ? ` at ${code(r.source.commit)}` : ''}`);
+  out.push(`- Source: ${r.source?.kind ?? '—'} ${code(r.source?.name ?? '—')}${r.source?.commit ? ` at ${code(r.source.commit)}` : ''}${r.source?.publicSample === false ? ' (an admin-only sample, never published)' : ''}`);
   out.push(`- Matrix: ${r.matrix?.cells ?? 0} screens · routes ${(r.matrix?.routes ?? []).map(code).join(', ') || '—'} · ${(r.matrix?.viewports ?? []).join(', ')} · ${(r.matrix?.schemes ?? []).join(', ')} · ${(r.matrix?.locales ?? []).join(', ')}`);
   out.push(`- Started ${r.startedAt ?? '—'} · finished ${r.finishedAt ?? '—'}`, '');
 

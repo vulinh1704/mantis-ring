@@ -161,7 +161,8 @@ p { margin: 0 0 12px; }
 .task-head h1 { font-size: clamp(1.5rem, 4vw, 1.9rem); letter-spacing: -0.01em; }
 .task-head p { margin: 6px 0 0; }
 .run-chips { margin-top: 10px; }
-/* A seeded run's label: top right, and it stays in view while the page scrolls (the whole scene). */
+/* A seeded run's label: top right, and it stays in view while the page scrolls (the whole scene),
+   at every width: on a narrow screen it spans the page and takes less room, but it stays sticky. */
 .seeded-tag {
   position: sticky; top: 10px; z-index: 5;
   width: fit-content; max-width: min(100%, 440px); margin: 0 0 12px auto; padding: 8px 12px;
@@ -169,7 +170,7 @@ p { margin: 0 0 12px; }
   font: 650 0.88rem/1.4 var(--sans); box-shadow: var(--shadow);
 }
 @media (max-width: 720px) {
-  .seeded-tag { position: static; max-width: 100%; }
+  .seeded-tag { top: 6px; max-width: 100%; padding: 6px 10px; font-size: 0.8rem; }
 }
 
 .stepbar {

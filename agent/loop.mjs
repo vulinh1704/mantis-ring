@@ -23,7 +23,7 @@ import {
   noChangeMessage, nudgeMessage, systemPrompt, taskMessage,
 } from './prompt.mjs';
 import { buildReceipt, diffStats, receiptLine, receiptMarkdown } from './receipt.mjs';
-import { seededChat, seededInfo } from './seeded.mjs';
+import { seededChat, seededInfo, seededSceneBroken, seededSceneMissing } from './seeded.mjs';
 import { FILE_TOOL_NAMES, TOOL_SCHEMAS, ToolError, WRITE_TOOL_NAMES, fileTools, parseToolCall } from './tools.mjs';
 import { changedSince, initWorkspace, isClean, patchApplies, patchSince, revertTo, snapshot, stageAll, tamperHits } from './workspace.mjs';
 import { LIMITS, Sandbox, networkText } from '../runner/sandbox.mjs';
@@ -539,6 +539,12 @@ class FixRun {
       } else {
         await this.converse();
         await this.finalState();
+      }
+      // A seeded run that ended before the scripted rollback (or had nothing to fix) gets no SEEDED receipt.
+      const missing = this.seeded ? seededSceneMissing(this.seeded.script, this.checkRows.map((r) => r.check)) : null;
+      if (missing) {
+        this.say(missing);
+        throw failure(missing);
       }
       await this.wrapUp();
     } catch (err) {
@@ -1118,6 +1124,13 @@ class FixRun {
       ...(decision === 'failed' ? { reason: failReason } : {}),
     });
     this.journal(`check ${k} ${decision}${b ? ` ${receiptLine(b)}` : ''}${failReason ? ` (${failReason})` : ''}`);
+    // A seeded run must show what its label says: the scripted cover-up rolled back. If the check
+    // went otherwise, the run stops here as failed and never gets a SEEDED receipt.
+    const broken = this.seeded ? seededSceneBroken(this.seeded.script, { check: k, decision, coverUps: coverUps.map((c) => c.selector) }) : null;
+    if (broken) {
+      this.say(broken);
+      throw failure(broken);
+    }
     this.endRound();
 
     // §2.3.8: file output the model has already been sent is replaced, so the prompt stays small.
@@ -1424,9 +1437,12 @@ class FixRun {
     if (this.seeded) Object.assign(models[0], { id: this.seeded.model, provider: this.seeded.provider, price: null });
     if (task.visionModel && vision.verdict !== 'skipped') models.push(modelRow('vision', task.visionModel, deltaOf(mid, end), date));
     const s = task.source;
+    // Whether anyone may run the sample comes from the app (its sample list); the receipt's publish
+    // bar refuses an admin-only one (Atlas).
+    const publicSample = typeof s.publicSample === 'boolean' ? { publicSample: s.publicSample } : {};
     const receipt = buildReceipt({
       taskId: task.id, startedAt: this.t0, finishedAt: Date.now(),
-      source: s.kind === 'github' ? { kind: 'github', name: `${s.owner}/${s.name}`, commit: this.src?.commit ?? null } : { kind: 'sample', name: s.name, commit: null },
+      source: s.kind === 'github' ? { kind: 'github', name: `${s.owner}/${s.name}`, commit: this.src?.commit ?? null } : { kind: 'sample', name: s.name, commit: null, ...publicSample },
       matrix: task.matrix, r0Report: this.R0.report, rfReport: this.RF?.report ?? null, cellsExpected: this.expected.size,
       gate: { enabled: Boolean(task.gate), coverUpAttempts: this.coverUpAttempts, tamperAttempts: this.tamperAttempts, lostAttempts: this.lostAttempts, reverts: this.reverts },
       checks: this.checkRows, stopReason: this.stopReason,
@@ -1458,7 +1474,7 @@ class FixRun {
  *            reasoning:{effort:string, max_tokens:number}|null, maxPromptTokens:number, maxUsd:number,
  *            wallClockSec:number, lookTimeoutSec:number}} Caps
  * @typedef {{ id:string,
- *   source: {kind:'sample', name:string, dir:string, label:string} | {kind:'github', owner:string, name:string, label:string},
+ *   source: {kind:'sample', name:string, dir:string, label:string, publicSample?:boolean} | {kind:'github', owner:string, name:string, label:string},
  *   matrix: Matrix, model:string, sampling:{temperature?:number, topP?:number, seed?:number},
  *   visionModel: string|null, gate: boolean, caps: Partial<Caps>,
  *   promptVariant?: 'neutral'|'pressure', seeded?: string|null }} FixTask

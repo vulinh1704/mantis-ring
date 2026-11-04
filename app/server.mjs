@@ -486,13 +486,16 @@ export function createApp(deps = {}) {
     return { id, ownerToken, position: queue.position(id) };
   }
 
-  /** The task as runFix takes it (§1.7): a sample gets its host folder back from the allowlist. */
+  /**
+   * The task as runFix takes it (§1.7): a sample gets its host folder back from the allowlist, and
+   * whether it is public, so the receipt of an admin-only sample (Atlas) never says publishable.
+   */
   function fixTask(rec) {
     const s = rec.source;
     let source;
     if (s.kind === 'sample') {
       if (!Object.hasOwn(SAMPLES, s.name)) throw new RunError('That sample is no longer available on this server.');
-      source = { kind: 'sample', name: s.name, dir: SAMPLES[s.name].dir, label: s.label };
+      source = { kind: 'sample', name: s.name, dir: SAMPLES[s.name].dir, label: s.label, publicSample: isPublicSample(s.name) };
     } else {
       source = { kind: 'github', owner: s.owner, name: s.name, label: s.label };
     }
@@ -650,7 +653,9 @@ export function createApp(deps = {}) {
   }
 
   function statusNow() {
-    return status.statusData({ cfg: config.get(), queue, spend, startedAt, now, runtime: RUNTIME, etaSec: etaForNew() });
+    // How long the oldest running task has run: the outside monitor's "stuck task" signal.
+    const longestRunningSec = Math.round(Math.max(0, ...queue.running().map(elapsedSec)));
+    return status.statusData({ cfg: config.get(), queue, spend, startedAt, now, runtime: RUNTIME, etaSec: etaForNew(), longestRunningSec });
   }
 
   // --- public routes (§4.2) --------------------------------------------------------------------

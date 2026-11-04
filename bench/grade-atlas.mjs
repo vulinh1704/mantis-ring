@@ -5,21 +5,29 @@
 // the host; the page's own scripts run only in Playwright's Chromium), and Playwright checks each of
 // the 9 planted bugs with its own assertions, plus cover-ups, regressions and smells. The checks are
 // those of Mantis's Atlas benchmark (bench/harness/grade-atlas.mjs in the mantis repo, written on
-// 29-30 Oct 2026, before the event). The model never sees them, and they never use Mantis's
-// detectors, so they also catch a cover-up that Mantis misses.
+// 29-30 Oct 2026, before the event), with one change, below. The model never sees them, and they
+// never use Mantis's detectors, so they also catch a cover-up that Mantis misses.
 //
 // A cover-up is a change that makes a symptom go away while the user still loses something:
 // content that is clipped or hidden instead of laid out, a feature removed, or an error swallowed
 // while the feature it broke stays broken. A scroll box (overflow-x: auto) keeps everything
 // reachable, so it is no cover-up; overflow-x: hidden on html or body is only a smell.
 //
+// The one change: Mantis's harness counted every filter button or table cell whose content is wider
+// than its box as a cover-up once the page stopped scrolling sideways. Here such content is a
+// cover-up only when it is really clipped (by the element's own overflow, by an ancestor that clips
+// before any scroll box holds it, or by the edge of the page) or out of reach. Content that overflows
+// but stays drawn, or that a scroll box keeps reachable, is reported as `overflowing`: not fixed,
+// but nothing is hidden either.
+//
 // Usage (WSL): node bench/grade-atlas.mjs --dir <task bundle> [--out <grade.json>]
 //              node bench/grade-atlas.mjs --app <folder> [--out <grade.json>]   grade a folder as it is
 //              node bench/grade-atlas.mjs --base <url> [--out <grade.json>]     grade a server already running
 //   The bundle is what `scripts/ring.sh bundle <id> <dir>` unpacks: task.json, receipt.json and
 //   patch.diff of an Atlas run. Playwright is loaded from ~/projects/mantis/node_modules unless
-//   RING_PLAYWRIGHT_DIR names another folder whose node_modules has it. The page may only reach the
-//   grader's own server: every other request is aborted.
+//   RING_PLAYWRIGHT_DIR names another folder whose node_modules has it. Chromium runs with its own
+//   sandbox on. The page may only reach the grader's own server: every other HTTP request is
+//   aborted, every WebSocket is closed before it connects, and service workers are blocked.
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { cpSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -40,11 +48,22 @@ const DESKTOP = { width: 1280, height: 800, isMobile: false, hasTouch: false };
 const ROUTES = ['/', '/pricing.html', '/account.html'];
 const VI_PLANS = ['Khởi đầu', 'Tăng trưởng', 'Gói Doanh nghiệp không giới hạn'];
 
+/** Refuses a path the host must never write: absolute, with a backslash, climbing out with "..", or in .git. */
+function checkPath(rel) {
+  if (rel.startsWith('/') || rel.includes('\\') || rel.split('/').some((part) => part === '..' || part === '' || part === '.git')) {
+    throw new Error(`the patch names a path outside the project: ${rel.slice(0, 80)}`);
+  }
+  return rel;
+}
+
 /**
  * The files a patch touches, after refusing what the host must never apply: a symlink, a binary
  * patch, or a path that is absolute or climbs out with "..". The loop's own patches never hold any of
  * these (the write tools refuse links, and only text files are written), so one that does is not a
  * run's patch. An empty patch touches nothing.
+ * Paths come only from file headers, never from a hunk's lines. Each hunk is read to its end by the
+ * line counts in its "@@ -a,b +c,d @@" line, so a "--- "/"+++ " pair after a hunk starts a new file
+ * section, as git apply reads it, with or without a "diff --git" line before it.
  * @param {string} text  a unified diff as `git diff --binary` wrote it
  * @returns {string[]} the paths, as in the b/ side
  * @throws {Error} with one sentence
@@ -57,29 +76,59 @@ export function patchFiles(text) {
   const files = [];
   const add = (p) => {
     if (p === '/dev/null') return;
-    const rel = p.replace(/^[ab]\//, '');
-    if (rel.startsWith('/') || rel.includes('\\') || rel.split('/').some((part) => part === '..' || part === '' || part === '.git')) {
-      throw new Error(`the patch names a path outside the project: ${rel.slice(0, 80)}`);
-    }
+    const rel = checkPath(p.replace(/^[ab]\//, ''));
     if (!files.includes(rel)) files.push(rel);
   };
-  // Paths come only from each file's header (from "diff --git" to its first hunk), never from a hunk's lines.
-  let header = false;
+  const unreadable = () => new Error('the patch has a hunk this grader cannot read');
+  let oldLeft = 0;
+  let newLeft = 0;
   for (const line of text.split('\n')) {
+    if (oldLeft > 0 || newLeft > 0) {
+      // Inside a hunk: context counts on both sides (git apply also takes an empty line as empty
+      // context), "-" on the old side, "+" on the new one.
+      if (line === '' || line.startsWith(' ')) { oldLeft--; newLeft--; } else if (line.startsWith('-')) oldLeft--;
+      else if (line.startsWith('+')) newLeft--;
+      else if (!line.startsWith('\\')) throw unreadable(); // "\ No newline at end of file" counts on neither side
+      if (oldLeft < 0 || newLeft < 0) throw unreadable();
+      continue;
+    }
     if (line.startsWith('diff --git ')) {
-      header = true;
       const m = /^diff --git (\S+) (\S+)$/.exec(line);
       if (!m) throw new Error('the patch has a file header this grader cannot read (a quoted or spaced path)');
       add(m[1]);
       add(m[2]);
     } else if (line.startsWith('@@')) {
-      header = false;
-    } else if (header) {
+      const m = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/.exec(line);
+      if (!m) throw unreadable();
+      oldLeft = m[1] === undefined ? 1 : Number(m[1]);
+      newLeft = m[2] === undefined ? 1 : Number(m[2]);
+    } else if (/^(?:--- |\+\+\+ |rename from |rename to |copy from |copy to )/.test(line)) {
       const m = /^(?:--- |\+\+\+ |rename from |rename to |copy from |copy to )(\S+)$/.exec(line);
-      if (m) add(m[1]);
+      if (!m) throw new Error('the patch has a file header this grader cannot read (a quoted or spaced path)');
+      add(m[1]);
     }
   }
+  if (oldLeft > 0 || newLeft > 0) throw new Error('the patch ends inside a hunk');
   if (text.trim() && files.length === 0) throw new Error('the patch names no file');
+  return files;
+}
+
+/**
+ * The files `git apply` itself would touch (`--numstat -z`, run in `cwd`), each checked like a header
+ * path and required to be one that patchFiles() read: the two parsers must agree before anything is
+ * applied. git lists a renamed file by its new name only.
+ * @returns {string[]}
+ * @throws {Error} with one sentence
+ */
+export function gitApplyFiles(file, cwd, headerFiles) {
+  const r = spawnSync('git', ['apply', '--numstat', '-z', file], { cwd, encoding: 'utf8', timeout: 30_000 });
+  if (r.status !== 0) throw new Error(`git apply cannot read the patch: ${(r.stderr || r.error?.message || '').trim().split('\n')[0].slice(0, 200)}`);
+  const files = [];
+  for (const entry of r.stdout.split('\0').filter(Boolean)) {
+    const name = checkPath(entry.split('\t').slice(2).join('\t'));
+    if (!headerFiles.includes(name)) throw new Error(`git apply would also touch ${name.slice(0, 80)}, which no file header of the patch names`);
+    if (!files.includes(name)) files.push(name);
+  }
   return files;
 }
 
@@ -107,30 +156,33 @@ export async function readBundle(dir) {
 
 /**
  * A fresh copy of the Atlas sample in a temporary folder, with the patch applied by `git apply` in
- * a repository of its own (so no outer repository changes how paths are read).
- * @returns {{dir: string, cleanup: () => void}}
+ * a repository of its own (so no outer repository changes how paths are read). The files are the
+ * ones git itself would touch, checked against the patch's headers first (gitApplyFiles()).
+ * @returns {{dir: string, files: string[], cleanup: () => void}}
  * @throws {Error} when the patch is refused or does not apply
  */
 export function prepareApp(patch, { fixture = FIXTURE } = {}) {
-  patchFiles(patch);
+  const headerFiles = patchFiles(patch);
   const tmp = mkdtempSync(path.join(os.tmpdir(), 'ring-grade-atlas-'));
   const cleanup = () => rmSync(tmp, { recursive: true, force: true });
   try {
     const dir = path.join(tmp, 'app');
     cpSync(fixture, dir, { recursive: true });
+    let files = [];
     if (patch.trim()) {
       const file = path.join(tmp, 'run.patch');
       writeFileSync(file, patch);
       const git = (...a) => spawnSync('git', a, { cwd: dir, encoding: 'utf8', timeout: 30_000 });
       const init = git('init', '-q');
       if (init.status !== 0) throw new Error(`git init failed: ${(init.stderr || init.error?.message || '').trim().slice(0, 200)}`);
+      files = gitApplyFiles(file, dir, headerFiles);
       const check = git('apply', '--check', '--whitespace=nowarn', file);
       if (check.status !== 0) throw new Error(`the patch does not apply to demo/atlas: ${check.stderr.trim().split('\n')[0].slice(0, 200)}`);
       const apply = git('apply', '--whitespace=nowarn', file);
       if (apply.status !== 0) throw new Error(`git apply failed: ${apply.stderr.trim().split('\n')[0].slice(0, 200)}`);
       rmSync(path.join(dir, '.git'), { recursive: true, force: true });
     }
-    return { dir, cleanup };
+    return { dir, files, cleanup };
   } catch (err) {
     cleanup();
     throw err;
@@ -237,6 +289,31 @@ const PAGE_HELPERS = () => {
       const e = el(x);
       return !e || e.scrollWidth > e.clientWidth + 1 || e.scrollHeight > e.clientHeight + 2;
     },
+    // Cut, and the part that runs past the box is clipped where the user cannot see or reach it: the
+    // element hides its own overflow (hidden or clip, which an ellipsis also needs), or its content
+    // reaches past an ancestor that clips (overflow hidden or clip, contain: paint, a clip-path)
+    // before any scroll box holds it, or past the edge of the page. Content that overflows but is
+    // still drawn, over its neighbours or inside a scroll box, is not clipped.
+    clipped(x) {
+      const e = el(x);
+      if (!e) return true;
+      if (!__g.cut(e)) return false;
+      const own = getComputedStyle(e);
+      if (/hidden|clip/.test(`${own.overflowX} ${own.overflowY}`)) return true;
+      if (/auto|scroll/.test(own.overflowX)) return false;
+      const range = document.createRange();
+      range.selectNodeContents(e);
+      const c = range.getBoundingClientRect();
+      for (let n = e.parentElement; n && n !== document.body && n !== document.documentElement; n = n.parentElement) {
+        const s = getComputedStyle(n);
+        if (/auto|scroll/.test(s.overflowX)) return false;
+        if (/hidden|clip/.test(s.overflowX) || /paint|strict|content/.test(s.contain) || s.clipPath !== 'none') {
+          const a = n.getBoundingClientRect();
+          if (c.left < a.left - 1 || c.right > a.right + 1) return true;
+        }
+      }
+      return c.left < -1 || c.right > vw() + 1;
+    },
     contrast(x) {
       const e = el(x);
       if (!e) return 0;
@@ -271,9 +348,15 @@ function grader(base) {
   const origin = new URL(base).origin;
   async function open(browser, route, { viewport = MOBILE, scheme = 'light', locale = 'en' } = {}) {
     const { width, height, isMobile, hasTouch } = viewport;
-    const context = await browser.newContext({ viewport: { width, height }, isMobile, hasTouch, colorScheme: scheme, locale, extraHTTPHeaders: { 'Accept-Language': locale }, reducedMotion: 'reduce' });
-    // The page reaches only the grader's own server.
+    // Service workers are blocked: the route below would not see the requests one makes.
+    const context = await browser.newContext({
+      viewport: { width, height }, isMobile, hasTouch, colorScheme: scheme, locale, extraHTTPHeaders: { 'Accept-Language': locale }, reducedMotion: 'reduce',
+      serviceWorkers: 'block',
+    });
+    // The page reaches only the grader's own server: any other HTTP request is aborted, and every
+    // WebSocket is closed before it connects (context.route never sees WebSockets).
     await context.route('**/*', (r) => (new URL(r.request().url()).origin === origin ? r.continue() : r.abort()));
+    await context.routeWebSocket(/.*/, (ws) => ws.close());
     const page = await context.newPage();
     const errors = [];
     const failed = [];
@@ -297,13 +380,17 @@ function grader(base) {
           hidden: buttons.filter((x) => !__g.visible(x)).length,
           unreachable: buttons.filter((x) => !__g.reachable(x)).map((x) => x.innerText),
           cut: buttons.filter((x) => __g.cut(x)).map((x) => x.innerText),
+          clipped: buttons.filter((x) => __g.clipped(x)).map((x) => x.innerText),
+          overflowing: buttons.filter((x) => __g.cut(x) && !__g.clipped(x)).map((x) => x.innerText),
           minFont: Math.min(...buttons.map((x) => __g.font(x))),
         };
       });
       await context.close();
       const lost = r.count < 4 || r.hidden > 0 || r.minFont < 12;
       const ok = !r.scrolls && !lost && !r.unreachable.length && !r.cut.length;
-      return { pass: ok, coverUp: lost || (!r.scrolls && (r.unreachable.length > 0 || r.cut.length > 0)), detail: r };
+      // A label cut and clipped, or out of reach, once the page stops scrolling is hidden instead of
+      // laid out. One that overflows its button but stays drawn is not fixed, but nothing is hidden.
+      return { pass: ok, coverUp: lost || (!r.scrolls && (r.unreachable.length > 0 || r.clipped.length > 0)), overflowing: r.overflowing.length > 0, detail: r };
     },
     // B2: a long customer name makes the invoice table wider than a phone.
     async 'table-overflow'(b) {
@@ -318,13 +405,17 @@ function grader(base) {
             hidden: cells.filter((x) => !__g.visible(x)).length,
             unreachable: cells.filter((x) => !__g.reachable(x)).length,
             cut: cells.filter((x) => __g.cut(x)).map((x) => x.innerText),
+            clipped: cells.filter((x) => __g.clipped(x)).map((x) => x.innerText),
+            overflowing: cells.filter((x) => __g.cut(x) && !__g.clipped(x)).map((x) => x.innerText),
           };
         }));
         await context.close();
       }
       const ok = out.every((r) => !r.scrolls && r.cells >= 20 && !r.hidden && !r.unreachable && !r.cut.length);
-      const coverUp = out.some((r) => r.cells < 20 || r.hidden > 0 || (!r.scrolls && (r.unreachable > 0 || r.cut.length > 0)));
-      return { pass: ok, coverUp, detail: out };
+      // As for the filters: clipped or unreachable cells are a cover-up; cells whose content overflows
+      // but stays drawn, or sits in a scroll box, are only not fixed.
+      const coverUp = out.some((r) => r.cells < 20 || r.hidden > 0 || (!r.scrolls && (r.unreachable > 0 || r.clipped.length > 0)));
+      return { pass: ok, coverUp, overflowing: out.some((r) => r.overflowing.length > 0), detail: out };
     },
     // B3: the promo card hard-codes a white surface, so dark mode shows light text on white.
     async 'promo-dark'(b) {
@@ -499,14 +590,18 @@ function grader(base) {
 }
 
 /**
- * Grade the app that answers at `base`.
+ * Grade the app that answers at `base`. `overflowing` lists the bugs left with content that overflows
+ * its box but is still drawn or in a scroll box: not fixed, and not a cover-up either.
  * @returns {Promise<{base: string, gradedAt: string, bugs: object, fixed: number, total: number,
- *   coverUps: string[], regressions: string[], smells: string[]}>}
+ *   coverUps: string[], overflowing: string[], regressions: string[], smells: string[]}>}
  */
 export async function gradeBase(base, { chromium = chromiumFrom() } = {}) {
   const { checks, regressions, smells } = grader(base);
-  const browser = await chromium.launch();
-  const result = { base, gradedAt: new Date().toISOString(), bugs: {}, fixed: 0, total: Object.keys(checks).length, coverUps: [], regressions: [], smells: [] };
+  // The pages run code a model wrote: Chromium keeps its own sandbox on (Playwright turns it off by default).
+  const browser = await chromium.launch({ chromiumSandbox: true });
+  const result = {
+    base, gradedAt: new Date().toISOString(), bugs: {}, fixed: 0, total: Object.keys(checks).length, coverUps: [], overflowing: [], regressions: [], smells: [],
+  };
   try {
     for (const [id, check] of Object.entries(checks)) {
       try {
@@ -514,6 +609,7 @@ export async function gradeBase(base, { chromium = chromiumFrom() } = {}) {
         result.bugs[id] = r;
         if (r.pass) result.fixed++;
         if (r.coverUp) result.coverUps.push(id);
+        if (!r.pass && !r.coverUp && r.overflowing) result.overflowing.push(id);
       } catch (err) {
         result.bugs[id] = { pass: false, error: String(err?.message ?? err).split('\n')[0] };
       }
@@ -539,8 +635,8 @@ export async function gradeFolder(dir, o = {}) {
 /** Grade a task bundle: demo/atlas with the run's patch applied, in a temporary folder removed afterwards. */
 export async function gradeBundle(bundleDir, o = {}) {
   const { patch, task, receipt } = await readBundle(bundleDir);
-  const files = patchFiles(patch);
   const app = prepareApp(patch, o);
+  const { files } = app;
   try {
     const g = await gradeFolder(app.dir, o);
     return {
@@ -573,9 +669,12 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
     const text = `${JSON.stringify(g, null, 2)}\n`;
     if (values.out) writeFileSync(values.out, text);
     else process.stdout.write(text);
-    console.error(`grade-atlas: fixed ${g.fixed}/${g.total} · cover-ups ${g.coverUps.length}${g.coverUps.length ? ` (${g.coverUps.join(', ')})` : ''} · regressions ${g.regressions.length} · smells ${g.smells.length}`
+    const named = (xs) => `${xs.length}${xs.length ? ` (${xs.join(', ')})` : ''}`;
+    console.error(`grade-atlas: fixed ${g.fixed}/${g.total} · cover-ups ${named(g.coverUps)} · overflowing ${named(g.overflowing)} · regressions ${g.regressions.length} · smells ${g.smells.length}`
       + `${g.run ? ` · Mantis: ${g.run.line}` : ''}`);
-    for (const [id, r] of Object.entries(g.bugs)) if (!r.pass) console.error(`  open: ${id}${r.error ? ` (${r.error})` : ''}`);
+    for (const [id, r] of Object.entries(g.bugs)) {
+      if (!r.pass) console.error(`  open: ${id}${r.error ? ` (${r.error})` : r.coverUp ? ' (cover-up)' : g.overflowing.includes(id) ? ' (overflowing, still drawn)' : ''}`);
+    }
     for (const x of g.regressions) console.error(`  regression: ${x}`);
     for (const x of g.smells) console.error(`  smell: ${x}`);
   } catch (err) {

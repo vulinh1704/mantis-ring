@@ -148,12 +148,14 @@ function spendSummary(spend, cfg) {
 }
 
 /**
- * Everything /status shows (§4.7).
+ * Everything /status shows (§4.7). queue.longestRunningSec is how long the task that has run longest
+ * has been running (0 when none runs): a monitor outside the VM can tell a stuck task from a busy
+ * queue that runs many short tasks back to back.
  * @param {{cfg:object, queue:{running():string[], queued():string[], maxRunning:number}, spend:object|null,
- *          startedAt:number, now?:() => number, runtime?:string, etaSec?:number|null}} ctx
+ *          startedAt:number, now?:() => number, runtime?:string, etaSec?:number|null, longestRunningSec?:number}} ctx
  */
 export async function statusData(ctx) {
-  const { cfg, queue, spend, startedAt, now = Date.now, runtime, etaSec = null } = ctx;
+  const { cfg, queue, spend, startedAt, now = Date.now, runtime, etaSec = null, longestRunningSec = 0 } = ctx;
   const [rt, proxy, inference] = await Promise.all([runtimeInfo(), proxyInfo(), inferenceInfo()]);
   const configured = runtime || 'runc';
   const available = rt.docker && (configured === 'runc' || rt.runtimes.includes(configured));
@@ -165,7 +167,7 @@ export async function statusData(ctx) {
     inference: { provider: PROVIDER, ...inference, fixModel: cfg.fixModel, visionModel: cfg.visionModel },
     selftest,
     spend: spendSummary(spend, cfg),
-    queue: { running: queue.running().length, queued: queue.queued().length, maxRunning: queue.maxRunning, etaSec },
+    queue: { running: queue.running().length, queued: queue.queued().length, maxRunning: queue.maxRunning, etaSec, longestRunningSec },
     latest: readLatest(),
     publicSampleRuns: cfg.publicSampleRuns === true,
     publicGithubRuns: cfg.publicGithubRuns === true,

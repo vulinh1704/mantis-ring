@@ -484,7 +484,7 @@ const LABEL = /^[A-Za-z0-9 ._:+-]{1,80}$/;
 const ADMIN_KEYS = new Set(['sample', 'repo', 'routes', 'viewports', 'schemes', 'locales', 'model', 'visionModel', 'gate', 'caps', 'sampling', 'label', 'priority', 'promptVariant', 'seeded']);
 /** The answer to a sample that does not exist, and to an admin-only sample asked for by a public request. */
 export const SAY_NO_SAMPLE = 'That sample does not exist. Pick one from the list.';
-export const SAY_SEEDED_ALONE = 'A seeded run uses the scripted stand-in with the gate on, no vision model and the neutral task message: leave out model, visionModel, gate, promptVariant and sampling.';
+export const SAY_SEEDED_ALONE = "A seeded run plays one fixed scene: the scripted stand-in on all of its sample's screens, with the default caps, the gate on, no vision model and the neutral task message. Leave out model, visionModel, gate, promptVariant, sampling, routes, locales, viewports, schemes and caps.";
 export const SAY_BAD_REPO = 'Only public repositories on github.com are supported, written as https://github.com/owner/name.';
 export const SAY_REPO_PAGE = "Give the repository's own address, https://github.com/owner/name, not a link to a branch, folder, file or other page in it.";
 export const SAY_BAD_MATRIX = 'Routes must be paths like /pricing (up to 3); languages must come from the list.';
@@ -535,8 +535,10 @@ function pick(v, allowed, max, sentence) {
  * public task always has the gate on and the neutral task message, whatever else the body says.
  * An admin-only sample (Atlas) does not exist for a public body: it gets the unknown-sample sentence.
  * An admin body may ask for a seeded run ({"seeded": "cover-up"}, agent/seeded.mjs): a scripted
- * stand-in instead of a model, on its script's sample, with the gate on, no vision model and the
- * neutral task message; a body that also names one of those is refused rather than half obeyed.
+ * stand-in instead of a model, on all of its script's sample's screens, with the default caps, the
+ * gate on, no vision model and the neutral task message. A body that also names one of those is
+ * refused rather than half obeyed: a narrower matrix or other caps could keep the scripted cover-up
+ * from being measured and rolled back, while the run would still carry the SEEDED label.
  * @returns {{source:object, matrix:object, model:string, sampling:object, visionModel:string|null,
  *            gate:boolean, caps:object, label:string|null, priority:boolean, promptVariant:'neutral'|'pressure',
  *            seeded:{script:string, label:string, model:string, note:string}|null}}
@@ -592,7 +594,9 @@ export function taskFromBody(body, { admin = false, cfg }) {
     if (source.kind !== 'sample' || source.name !== info.sample) throw new TaskInputError(`A seeded run plays its script on the ${info.sample} sample only.`);
     const given = (k) => body[k] !== undefined && body[k] !== null;
     if (given('model') || (given('visionModel') && body.visionModel !== false) || (given('gate') && body.gate !== true)
-      || (given('promptVariant') && body.promptVariant !== 'neutral') || given('sampling')) throw new TaskInputError(SAY_SEEDED_ALONE);
+      || (given('promptVariant') && body.promptVariant !== 'neutral') || ['sampling', 'routes', 'locales', 'viewports', 'schemes', 'caps'].some(given)) {
+      throw new TaskInputError(SAY_SEEDED_ALONE);
+    }
     seeded = { script: info.script, label: info.label, model: info.model, note: info.note };
   }
 

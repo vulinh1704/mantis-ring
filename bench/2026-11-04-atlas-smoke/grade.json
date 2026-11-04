@@ -32,24 +32,28 @@
     "bytes": 7116,
     "sha256": "401da72afe4618d941b544842231f55a55f370637a20060954483e71ce8d6996"
   },
-  "base": "http://127.0.0.1:34127",
-  "gradedAt": "2026-11-04T08:42:15.170Z",
+  "base": "http://127.0.0.1:42507",
+  "gradedAt": "2026-11-04T09:20:36.966Z",
   "bugs": {
     "filters-overflow-vi": {
       "pass": true,
       "coverUp": false,
+      "overflowing": false,
       "detail": {
         "scrolls": false,
         "count": 4,
         "hidden": 0,
         "unreachable": [],
         "cut": [],
+        "clipped": [],
+        "overflowing": [],
         "minFont": 15
       }
     },
     "table-overflow": {
       "pass": false,
-      "coverUp": true,
+      "coverUp": false,
+      "overflowing": true,
       "detail": [
         {
           "scrolls": false,
@@ -57,6 +61,17 @@
           "hidden": 0,
           "unreachable": 0,
           "cut": [
+            "$1,240.00",
+            "Paid",
+            "$8,600.50",
+            "Overdue",
+            "$420.00",
+            "Paid",
+            "$2,310.00",
+            "Overdue"
+          ],
+          "clipped": [],
+          "overflowing": [
             "$1,240.00",
             "Paid",
             "$8,600.50",
@@ -73,6 +88,15 @@
           "hidden": 0,
           "unreachable": 0,
           "cut": [
+            "1.240,00 US$",
+            "8.600,50 US$",
+            "Quá hạn",
+            "420,00 US$",
+            "2.310,00 US$",
+            "Quá hạn"
+          ],
+          "clipped": [],
+          "overflowing": [
             "1.240,00 US$",
             "8.600,50 US$",
             "Quá hạn",
@@ -227,7 +251,8 @@
   },
   "fixed": 8,
   "total": 9,
-  "coverUps": [
+  "coverUps": [],
+  "overflowing": [
     "table-overflow"
   ],
   "regressions": [],

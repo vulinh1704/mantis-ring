@@ -361,6 +361,11 @@ try {
     atlas.status === 202 && atlasSeen?.source?.kind === 'sample' && atlasSeen.source.name === 'atlas' && /\/demo\/atlas\/$/.test(atlasSeen.source.dir ?? '')
       && JSON.stringify(atlasSeen.matrix.routes) === '["/","/pricing.html","/account.html"]' && atlasCells === 24 && atlasSeen.gate === true && atlasSeen.model === config.get().fixModel,
     `${atlas.status} ${oneLine(atlas.json?.error)}; ${atlasSeen?.source?.dir}; ${atlasCells} screens`);
+  // The loop learns whether the sample is public, so an Atlas receipt never says publishable.
+  const lumenSeen = fake.seen.find((t) => t.source?.kind === 'sample' && t.source.name === 'lumen');
+  check('the loop gets source.publicSample: false for Atlas, true for Lumen',
+    atlasSeen?.source?.publicSample === false && lumenSeen?.source?.publicSample === true,
+    `atlas ${atlasSeen?.source?.publicSample}, lumen ${lumenSeen?.source?.publicSample}`);
   check('/api/config lists only the public sample: Lumen, never Atlas', cfg.json?.samples?.length === 1 && cfg.json.samples[0].id === 'lumen' && !cfg.text.includes('atlas'),
     JSON.stringify(cfg.json?.samples ?? null));
   const sayNoSample = (body) => { try { tasksMod.taskFromBody(body, { admin: false, cfg: config.get() }); return 'accepted'; } catch (err) { return err.message; } };
@@ -385,16 +390,28 @@ try {
     model: { sample: 'lumen', seeded: 'cover-up', model: 'glm-5.3' }, vision: { sample: 'lumen', seeded: 'cover-up', visionModel: 'qwen3.8-27b' },
     pressure: { sample: 'lumen', seeded: 'cover-up', promptVariant: 'pressure' }, sampling: { sample: 'lumen', seeded: 'cover-up', sampling: { seed: 8 } },
     'unknown script': { sample: 'lumen', seeded: 'magic' }, 'not a string': { sample: 'lumen', seeded: true },
+    // A narrower matrix or other caps could keep the scripted cover-up from being measured and rolled back.
+    routes: { sample: 'lumen', seeded: 'cover-up', routes: ['/settings.html'] }, locales: { sample: 'lumen', seeded: 'cover-up', locales: ['vi'] },
+    viewports: { sample: 'lumen', seeded: 'cover-up', viewports: ['desktop'] }, schemes: { sample: 'lumen', seeded: 'cover-up', schemes: ['dark'] },
+    caps: { sample: 'lumen', seeded: 'cover-up', caps: { maxChecks: 1 } },
   };
   const sceneCodes = {};
   for (const [k, body] of Object.entries(sceneRefusals)) sceneCodes[k] = (await admin('POST', '/admin/tasks', { body })).status;
-  check('a seeded task is refused (400) on Atlas or a repository, and with the gate off, a model, a vision model, the pressure message, sampling or an unknown script',
+  check('a seeded task is refused (400) on Atlas or a repository, and with the gate off, a model, a vision model, the pressure message, sampling, routes, locales, viewports, schemes, caps or an unknown script',
     Object.values(sceneCodes).every((c) => c === 400), Object.entries(sceneCodes).map(([k, c]) => `${k} ${c}`).join(', '));
   const appJsNow = (await visitor('203.0.113.1', 'GET', '/app.js')).text;
-  check('the run page shows the seeded label at the top right from the record, and the stand-in as its model chip',
-    /<p id="t-seeded" class="seeded-tag"[^>]*hidden><\/p>/.test(home.text) && /<ul id="t-chips"/.test(home.text)
-      && /tag\.textContent = seeded \? seeded\.label : ''/.test(appJsNow) && /el\('li', 'chip', seeded\.model/.test(appJsNow),
-    `index.html has #t-seeded: ${/id="t-seeded"/.test(home.text)}; app.js sets it from t.seeded: ${/seeded\.label/.test(appJsNow)}`);
+  const appCss = (await visitor('203.0.113.1', 'GET', '/app.css')).text;
+  // What the files say, not a rendered page: the tag's place in the markup, the code that fills it,
+  // and CSS that keeps it sticky at every width (no rule turns it static or relative).
+  const tagRules = [...appCss.matchAll(/\.seeded-tag\s*\{([^}]*)\}/g)].map((m) => m[1]);
+  check('index.html has the seeded tag first on the run page; app.js fills it and the model chip from the record; app.css keeps it sticky at every width',
+    /<main id="task"[^>]*>\s*<p id="t-seeded" class="seeded-tag"[^>]*hidden><\/p>/.test(home.text) && /<ul id="t-chips"/.test(home.text)
+      && /tag\.textContent = seeded \? seeded\.label : ''/.test(appJsNow) && /el\('li', 'chip', seeded\.model/.test(appJsNow)
+      && tagRules.length >= 1 && /position:\s*sticky/.test(tagRules[0]) && !tagRules.some((r) => /position:\s*(static|relative)/.test(r)),
+    `index.html has #t-seeded: ${/id="t-seeded"/.test(home.text)}; app.js sets it from t.seeded: ${/seeded\.label/.test(appJsNow)}; .seeded-tag rules: ${tagRules.map((r) => oneLine(r)).join(' | ')}`);
+  check("a seeded run's before-and-after images stay on its page, unlinked, and each caption repeats the label",
+    /if \(sceneLabel\) \{\s*fig\.append\(img, el\('figcaption', null, `\$\{IMAGES\[name\]\} · \$\{sceneLabel\}`\)\);/.test(appJsNow),
+    `app.js: ${/sceneLabel/.test(appJsNow) ? 'has the seeded branch' : 'no seeded branch'}`);
   if (sceneId) {
     const sb = await admin('GET', `/admin/tasks/${sceneId}/bundle`);
     const sceneTask = (() => { try { return JSON.parse(spawnSync('tar', ['-xOf', '-', './task.json'], { input: sb.buf }).stdout.toString()); } catch { return null; } })();
@@ -605,6 +622,12 @@ try {
   const second = await visitor('203.0.113.40', 'POST', '/api/tasks', { body: { sample: 'lumen' } });
   check('one run in progress per address: a second start → 429 with a sentence', first.status === 202 && second.status === 429 && plainError(second),
     `${first.status}, then ${second.status} ${oneLine(second.json?.error)}`);
+  // The outside monitor tells a stuck task from a busy queue by how long the oldest running task has run.
+  await wait(1100);
+  const busyStatus = (await visitor('203.0.113.1', 'GET', '/status.json')).json?.queue;
+  check('/status.json gives queue.longestRunningSec: 0 when idle, then the running task\'s own time (at least 1 s here)',
+    stj.json?.queue?.longestRunningSec === 0 && busyStatus?.running === 1 && Number.isInteger(busyStatus.longestRunningSec) && busyStatus.longestRunningSec >= 1 && busyStatus.longestRunningSec < 60,
+    `idle ${stj.json?.queue?.longestRunningSec}; busy ${JSON.stringify(busyStatus)}`);
   fake.mode = 'instant';
   fake.releaseAll();
   if (first.json?.id) await settle(first.json.id);

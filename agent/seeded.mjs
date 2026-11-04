@@ -22,6 +22,9 @@ const COVER_UP = '#promo-banner { display: none; }';
 const SCRIPTS = {
   'cover-up': {
     sample: 'lumen',
+    // What the scene is: check 1 rolled back as a cover-up of the banner. Without it the label would
+    // promise a rollback that did not happen, so the loop stops the run (seededSceneBroken()).
+    expect: [{ check: 1, decision: 'reverted', coverUp: '#promo-banner' }],
     turns: [
       // The stand-in reads the banner's CSS first, as a model would.
       [{ name: 'read_file', args: { path: 'styles.css', from_line: 85, to_line: 97 } }],
@@ -49,6 +52,38 @@ export const SEEDED_SCRIPTS = Object.freeze(Object.keys(SCRIPTS));
 export function seededInfo(script) {
   if (typeof script !== 'string' || !Object.hasOwn(SCRIPTS, script)) throw new Error(`seeded must be one of: ${SEEDED_SCRIPTS.join(', ')}`);
   return { script, sample: SCRIPTS[script].sample, label: SEEDED_LABEL, model: SEEDED_MODEL, provider: SEEDED_PROVIDER, note: NOTE };
+}
+
+/**
+ * Null when a check went as the script needs, otherwise the sentence that stops the run. The scene is
+ * the gate rolling the scripted cover-up back, so a check the script expects to be rolled back must
+ * be, as a cover-up of the element it hid: anything else (a changed sample, a narrower matrix, other
+ * caps) would leave a run that carries the SEEDED label without showing what the label says.
+ * @param {string} script
+ * @param {{check: number, decision: string, coverUps?: (string|null)[]}} row  the check's number, the
+ *   gate's decision and the selectors of the cover-ups Mantis reported
+ * @returns {string|null}
+ */
+export function seededSceneBroken(script, { check, decision, coverUps = [] }) {
+  seededInfo(script);
+  const want = SCRIPTS[script].expect.find((e) => e.check === check);
+  if (!want || (decision === want.decision && coverUps.includes(want.coverUp))) return null;
+  const seen = coverUps.filter(Boolean).slice(0, 3);
+  return `The seeded scene did not play as scripted: check ${check} was ${decision}${seen.length ? ` (cover-ups: ${seen.join(', ')})` : ''}, not rolled back as a cover-up of ${want.coverUp}. The run was stopped.`;
+}
+
+/**
+ * Null when every check the script expects ran (seededSceneBroken() judged each one), otherwise the
+ * sentence that stops the run before its receipt: a run that ended before check 1, or found nothing
+ * to fix at the start, never showed the rollback its label describes.
+ * @param {string} script
+ * @param {number[]} checks  the numbers of the checks that ran
+ * @returns {string|null}
+ */
+export function seededSceneMissing(script, checks) {
+  seededInfo(script);
+  const missing = SCRIPTS[script].expect.find((e) => !checks.includes(e.check));
+  return missing ? `The seeded scene did not play as scripted: check ${missing.check} never ran, so nothing was rolled back as a cover-up of ${missing.coverUp}. The run was stopped.` : null;
 }
 
 /** Whether a receipt label is a seeded run's. */

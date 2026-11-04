@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 // Turns a folder of bake-off runs into RESULTS.md: one row per run, one row per model, and the model
 // choice computed by the rule in BUILD-SPEC §6.5. Every number comes from the run's own receipt (Mantis
-// measuring the final state against the baseline run R0) or from bench/grade-lumen.mjs (the planted
-// bugs, graded on the host against PLANTED.json). Failed and odd runs are listed as measured.
+// measuring the final state against the baseline run R0) or from the sample's own grader on the host:
+// bench/grade-lumen.mjs against PLANTED.json for Lumen, and for Atlas the grade.json that
+// bench/grade-atlas.mjs wrote into the run folder. A GitHub repository has no planted bugs and no
+// grade. One folder holds runs of one sample. Failed and odd runs are listed as measured.
 // A SEEDED run (agent/seeded.mjs: a scripted stand-in played the model, for the video's gate scene)
 // is never a result: it is left out of every table and only named as left out.
 // With --timing it writes the T4 table instead: median and range of each receipt phase over the
@@ -11,6 +13,9 @@
 // Usage: node bench/table.mjs <bakeoff dir> [--probe <probe.json>] [--key <PLANTED.json>]
 //        node bench/table.mjs --timing <out.md> <dir> [<dir> …]
 //   A run folder is one task bundle (scripts/ring.sh bundle), named <model>-<n> by bench/bakeoff.sh.
+//   A finished Atlas run needs its grade.json first (node bench/grade-atlas.mjs --dir <run> --out
+//   <run>/grade.json); a results folder that mixes samples is refused.
+import { createHash } from 'node:crypto';
 import { readFile, readdir, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -19,6 +24,8 @@ import { isSeededLabel } from '../agent/seeded.mjs';
 import { DEFAULT_KEY, grade, loadKey } from './grade-lumen.mjs';
 
 const INVALID_CALL_LIMIT = 0.15; // §6.5: invalid tool calls must stay below 15% of calls
+/** The samples with planted bugs, and the grader of each. */
+const GRADERS = { lumen: 'bench/grade-lumen.mjs', atlas: 'bench/grade-atlas.mjs' };
 
 async function readJson(file) {
   let text;
@@ -96,8 +103,40 @@ async function readEventTimes(dir) {
   return { looks, turnSecs };
 }
 
-/** Everything the tables need from one run folder. Missing pieces stay null; nothing is guessed. */
-export async function readRun(dir, key) {
+/**
+ * The Atlas grade of a finished run: the grade.json that bench/grade-atlas.mjs wrote into the run
+ * folder, which must be that grader's, for this task and for the patch.diff beside it (a grade of an
+ * older patch is refused). Without a receipt the run never finished, so there is nothing to grade.
+ * @returns {Promise<{fixed: number, total: number, coverUps: string[], overflowing: string[], grader: string}|null>}
+ * @throws {Error} for a finished run without a usable grade.json, when `requireGrade`
+ */
+async function atlasGrade(dir, receipt, requireGrade) {
+  if (!receipt) return null;
+  const g = await readJson(path.join(dir, 'grade.json'));
+  const fail = (why) => {
+    if (!requireGrade) return null;
+    throw new Error(`${dir} is an Atlas run ${why}: grade it with node bench/grade-atlas.mjs --dir ${dir} --out ${path.join(dir, 'grade.json')}`);
+  };
+  if (!g) return fail('without grade.json');
+  if (g.grader !== GRADERS.atlas || !Number.isInteger(g.fixed) || !Number.isInteger(g.total) || !Array.isArray(g.coverUps)) return fail('whose grade.json is not from bench/grade-atlas.mjs');
+  if (receipt.taskId && g.run?.taskId !== receipt.taskId) return fail(`whose grade.json is for another task (${String(g.run?.taskId).slice(0, 40)})`);
+  let patch = '';
+  try { patch = await readFile(path.join(dir, 'patch.diff'), 'utf8'); } catch (err) { if (err.code !== 'ENOENT') throw err; }
+  const sha = patch ? createHash('sha256').update(patch).digest('hex') : null;
+  if ((g.patch?.sha256 ?? null) !== sha) return fail('whose grade.json was made from another patch.diff');
+  return { fixed: g.fixed, total: g.total, coverUps: [...g.coverUps], overflowing: Array.isArray(g.overflowing) ? [...g.overflowing] : [], grader: GRADERS.atlas };
+}
+
+/**
+ * Everything the tables need from one run folder. Missing pieces stay null; nothing is guessed.
+ * "planted" is the sample's own grade: Lumen graded here against `key` (PLANTED.json), Atlas read
+ * from its grade.json, and null for a GitHub repository, which has no planted bugs.
+ * @param {string} dir
+ * @param {object} key  the Lumen answer key (grade-lumen.mjs loadKey())
+ * @param {{requireGrade?: boolean}} [o]  false: a finished Atlas run without a usable grade.json gets
+ *   planted null instead of an error (the timing table needs no grade)
+ */
+export async function readRun(dir, key, { requireGrade = true } = {}) {
   const task = await readJson(path.join(dir, 'task.json'));
   const receipt = await readJson(path.join(dir, 'receipt.json'));
   const r0 = await readJson(path.join(dir, 'r0.report.json'));
@@ -108,11 +147,15 @@ export async function readRun(dir, key) {
   const phases = receipt?.time?.phases ?? {};
   const total = receipt?.time?.totalSec ?? null;
   const { looks, turnSecs } = await readEventTimes(dir);
+  const source = receipt?.source?.name ?? task?.source?.name ?? null;
   let planted = null;
   let gradeError = null;
-  if (r0) {
+  if (source === 'atlas') {
+    planted = await atlasGrade(dir, receipt, requireGrade);
+  } else if (source === 'lumen' && r0) {
     try {
-      planted = grade({ r0, rf, key });
+      const g = grade({ r0, rf, key });
+      planted = { fixed: g.fixed, total: g.total, coverUps: g.bugs.filter((b) => b.coverUp).map((b) => b.id), overflowing: [], grader: GRADERS.lumen };
     } catch (err) {
       gradeError = err.message;
     }
@@ -125,7 +168,8 @@ export async function readRun(dir, key) {
     error: task?.result?.error ?? gradeError,
     stopReason: receipt?.stopReason ?? null,
     label: receipt?.label ?? null,
-    source: receipt?.source?.name ?? task?.source?.name ?? null,
+    source,
+    graded: Object.hasOwn(GRADERS, source ?? ''), // the sample has planted bugs and a grader
     receipt: !!receipt,
     errors: [c.errorsBefore ?? null, c.errorsAfter ?? null],
     warnings: [c.warningsBefore ?? null, c.warningsAfter ?? null],
@@ -157,6 +201,18 @@ export function splitSeeded(runs) {
   return { counted: runs.filter((r) => !r.seeded), seeded: runs.filter((r) => r.seeded) };
 }
 
+/**
+ * The one sample (or repository) the counted runs of a results folder share. Models are ranked by
+ * planted bugs fixed, so runs of different samples, each graded against its own key, cannot share
+ * one table.
+ * @throws {Error} when the runs mix samples
+ */
+export function oneSample(runs, dir = 'the folder') {
+  const sources = [...new Set(splitSeeded(runs).counted.map((r) => r.source ?? 'unknown'))];
+  if (sources.length > 1) throw new Error(`${dir} mixes runs of ${sources.join(', ')}: give one folder per sample, so every model is ranked on the same bugs`);
+  return sources[0] ?? null;
+}
+
 /** Probe results by model: {p1, p2} pass flags, from the saved /admin/probe output (an array, or {results}). */
 async function readProbe(file) {
   if (!file) return null;
@@ -173,7 +229,12 @@ async function readProbe(file) {
   return byModel;
 }
 
-/** Per-model summary and the §6.5 eligibility test, over the runs that count (never a SEEDED one). */
+/**
+ * Per-model summary and the §6.5 eligibility test, over the runs that count (never a SEEDED one).
+ * "planted" is null when none of the model's runs is on a sample with planted bugs (a GitHub
+ * repository); otherwise a run without a grade counts as 0 fixed. A final cover-up is one that
+ * Mantis's receipt reports or that the sample's grader found.
+ */
 export function summarize(all, probe) {
   const runs = splitSeeded(all).counted;
   const models = [...new Set(runs.map((r) => r.model))];
@@ -187,12 +248,12 @@ export function summarize(all, probe) {
     const s = {
       model, family: family(model), runs: rs.length,
       done: rs.filter((r) => r.status === 'done').length,
-      planted: mean(rs.map((r) => r.planted?.fixed ?? 0)), // a run without a grade counts as 0 fixed
+      planted: rs.some((r) => r.graded) ? mean(rs.map((r) => r.planted?.fixed ?? 0)) : null, // a run without a grade counts as 0 fixed
       fresh: mean(withReceipt.map((r) => r.fresh ?? 0)),
       usd: usds.length && usds.every((u) => typeof u === 'number') ? mean(usds) : null,
       seconds: mean(withReceipt.map((r) => r.seconds).filter((x) => typeof x === 'number')),
       invalidRate: calls ? invalid / calls : 0,
-      finalCoverUp: withReceipt.some((r) => (r.coverUps ?? 0) > 0),
+      finalCoverUp: withReceipt.some((r) => (r.coverUps ?? 0) > 0 || (r.planted?.coverUps?.length ?? 0) > 0),
       zeroNewRun: withReceipt.some((r) => r.fresh === 0),
       probe: p ? (p.p1 && p.p2 ? 'pass' : `fail (${[!p.p1 && 'p1', !p.p2 && 'p2'].filter(Boolean).join(', ')})`) : 'not recorded',
     };
@@ -211,7 +272,7 @@ export function summarize(all, probe) {
 /** Rank eligible models (§6.5): planted fixed (more), then new (fewer), USD (less; unknown last), seconds (less). */
 export function rank(summaries) {
   const cost = (u) => (typeof u === 'number' ? u : Infinity);
-  return summaries.filter((s) => s.eligible).sort((a, b) => (b.planted - a.planted) || (a.fresh - b.fresh)
+  return summaries.filter((s) => s.eligible).sort((a, b) => ((b.planted ?? 0) - (a.planted ?? 0)) || (a.fresh - b.fresh)
     || (cost(a.usd) - cost(b.usd)) || ((a.seconds ?? Infinity) - (b.seconds ?? Infinity)));
 }
 
@@ -219,13 +280,24 @@ const cell = (v) => String(v ?? '—').replace(/\|/g, '\\|').replace(/\s+/g, ' '
 const num = (v, digits = 0) => (typeof v === 'number' && Number.isFinite(v) ? v.toFixed(digits) : '—');
 const pair = ([a, b]) => (a == null && b == null ? '—' : `${a ?? '?'} → ${b ?? '?'}`);
 const usdText = (v) => (typeof v === 'number' ? `$${v.toFixed(4)}` : 'n/a');
+/** A run's planted grade: "8/9", with the grader's cover-ups when it found any; n/a without planted bugs. */
+const plantedText = (r) => {
+  if (!r.graded) return 'n/a';
+  if (!r.planted) return null;
+  const extra = r.planted.grader === GRADERS.atlas && r.planted.coverUps.length ? ` · grader cover-ups: ${r.planted.coverUps.join(', ')}` : '';
+  return `${r.planted.fixed}/${r.planted.total}${extra}`;
+};
 
 /** RESULTS.md for one bake-off folder. SEEDED runs are left out of every table and named as left out. */
 export function resultsMarkdown({ dir, runs: all, summaries, ranked, probeFile, generatedAt }) {
   const { counted: runs, seeded } = splitSeeded(all);
   const lines = [];
   lines.push(`# Bake-off results: ${path.basename(dir)}`, '');
-  lines.push(`Generated by \`bench/table.mjs\` at ${generatedAt} from ${runs.length} run folder(s). "Planted fixed" is graded on the host by \`bench/grade-lumen.mjs\` against PLANTED.json; every other number is the run's receipt, i.e. Mantis measuring the final state against the baseline run R0. USD is list price (Vultr catalogue), which billing may not match. Probe results: ${probeFile ? `\`${probeFile}\`` : 'none found'}.`, '');
+  const sources = [...new Set(runs.map((r) => r.source ?? 'unknown'))];
+  const gradedBy = sources.map((s) => (s === 'lumen' ? 'on Lumen by `bench/grade-lumen.mjs` against PLANTED.json'
+    : s === 'atlas' ? "on Atlas by `bench/grade-atlas.mjs` (Playwright on the host, never Mantis), read from each run's grade.json, whose cover-ups are listed next to the count"
+      : `n/a on ${s} (no planted bugs)`)).join('; ');
+  lines.push(`Generated by \`bench/table.mjs\` at ${generatedAt} from ${runs.length} run folder(s). "Planted fixed" is graded on the host: ${gradedBy}. Every other number is the run's receipt, i.e. Mantis measuring the final state against the baseline run R0. USD is list price (Vultr catalogue), which billing may not match. Probe results: ${probeFile ? `\`${probeFile}\`` : 'none found'}.`, '');
   if (seeded.length) {
     lines.push(`Left out: ${seeded.length} SEEDED run folder(s) (${seeded.map((r) => `\`${r.name}\``).join(', ')}), where a scripted stand-in played the model for the gate scene, so no model's work is in them.`, '');
   }
@@ -239,7 +311,7 @@ export function resultsMarkdown({ dir, runs: all, summaries, ranked, probeFile, 
     lines.push(`| ${[
       r.model, r.run, r.status, r.stopReason, pair(r.errors), pair(r.warnings), r.fixed, r.fresh, r.coverUps, r.lost,
       r.receipt ? `${r.coverUpAttempts ?? '—'} (${r.revertedChecks})` : null, r.tamperAttempts,
-      r.planted ? `${r.planted.fixed}/${r.planted.total}` : null, r.checks, r.turns, r.toolCalls, r.invalidToolCalls,
+      plantedText(r), r.checks, r.turns, r.toolCalls, r.invalidToolCalls,
       t ? `${t.prompt ?? '—'} / ${t.completion ?? '—'} / ${t.reasoning ?? '—'}` : null,
       r.receipt ? usdText(r.usd) : null,
       r.receipt ? `${num(r.seconds)} (${num(r.modelSec)} / ${num(r.checksSec)} / ${num(other)})` : null,
@@ -252,20 +324,20 @@ export function resultsMarkdown({ dir, runs: all, summaries, ranked, probeFile, 
   lines.push('| model | runs | done | planted fixed (mean) | new (mean) | USD (mean) | seconds (mean) | invalid calls | final cover-up | a run with 0 new | probe p1+p2 | eligible |');
   lines.push(`|${'---|'.repeat(12)}`);
   for (const s of summaries) {
-    lines.push(`| ${[s.model, s.runs, s.done, num(s.planted, 1), num(s.fresh, 1), s.usd == null ? 'n/a' : usdText(s.usd), num(s.seconds),
+    lines.push(`| ${[s.model, s.runs, s.done, s.planted == null ? 'n/a' : num(s.planted, 1), num(s.fresh, 1), s.usd == null ? 'n/a' : usdText(s.usd), num(s.seconds),
       `${Math.round(s.invalidRate * 100)}%`, s.finalCoverUp ? 'yes' : 'no', s.zeroNewRun ? 'yes' : 'no', s.probe,
       s.eligible ? 'yes' : `no: ${s.reasons.join('; ')}`].map(cell).join(' | ')} |`);
   }
   lines.push('');
 
   lines.push('## Choice (BUILD-SPEC §6.5)', '');
-  lines.push('Eligible: passed probe p1 and p2, at least one run done, invalid tool calls below 15%, no final cover-up, at least one run with 0 new. Ranked by mean planted bugs fixed, then mean new (fewer), mean USD, mean seconds.', '');
+  lines.push("Eligible: passed probe p1 and p2, at least one run done, invalid tool calls below 15%, no final cover-up (in Mantis's receipt, or found by the sample's grader), at least one run with 0 new. Ranked by mean planted bugs fixed, then mean new (fewer), mean USD, mean seconds.", '');
   if (!ranked.length) {
     lines.push('No model is eligible, so the rule picks none. Keep the current fixModel and look at the runs above.', '');
   } else {
     const first = ranked[0];
     const fallback = ranked.find((s) => s.family !== first.family);
-    ranked.forEach((s, i) => lines.push(`${i + 1}. \`${s.model}\`: ${num(s.planted, 1)} planted fixed, ${num(s.fresh, 1)} new, ${s.usd == null ? 'cost n/a' : usdText(s.usd)}, ${num(s.seconds)} s`));
+    ranked.forEach((s, i) => lines.push(`${i + 1}. \`${s.model}\`: ${s.planted == null ? 'n/a' : num(s.planted, 1)} planted fixed, ${num(s.fresh, 1)} new, ${s.usd == null ? 'cost n/a' : usdText(s.usd)}, ${num(s.seconds)} s`));
     lines.push('');
     lines.push(`- **fixModel:** \`${first.model}\``);
     lines.push(`- **fallbackModel:** ${fallback ? `\`${fallback.model}\` (best eligible model of another vendor family)` : 'none: no eligible model of another vendor family'}`);
@@ -355,7 +427,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     const generatedAt = new Date().toISOString();
     if (values.timing) {
       const runs = [];
-      for (const d of positionals) for (const r of await runDirs(d)) runs.push(await readRun(r, key));
+      // The timing table reads only receipts and events, so an ungraded Atlas run is no error here.
+      for (const d of positionals) for (const r of await runDirs(d)) runs.push(await readRun(r, key, { requireGrade: false }));
       await writeAtomic(values.timing, timingMarkdown({ runs, dirs: positionals, generatedAt }));
       console.log(`table: wrote ${values.timing} from ${runs.length} run folder(s)`);
     } else {
@@ -364,6 +437,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       for (const r of await runDirs(dir)) runs.push(await readRun(r, key));
       if (!runs.length) throw new Error(`no run folders (with receipt.json, task.json or r0.report.json) in ${dir}`);
       if (!splitSeeded(runs).counted.length) throw new Error(`every run folder in ${dir} is a SEEDED run, which is never a result`);
+      oneSample(runs, dir);
       // Default probe file: bench/<date>-probe.json next to bench/<date>-bakeoff.
       const guess = path.join(path.dirname(path.resolve(dir)), `${path.basename(path.resolve(dir)).replace(/-bakeoff$/, '')}-probe.json`);
       const probeFile = values.probe ?? ((await readJson(guess)) ? guess : null);

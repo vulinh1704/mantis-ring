@@ -728,16 +728,23 @@
     if (images.length) {
       box.append(el('h3', null, 'Before and after'));
       const figs = el('div', 'figs');
+      // A seeded run's images stay on this page, under its sticky label, and each caption repeats the
+      // label: a link would open the bare image, with no label on screen.
+      const sceneLabel = seeded ? (seededOf(t) || {}).label || label : '';
       for (const name of images) {
         const src = `/api/tasks/${S.id}/files/${name}`;
         const fig = el('figure');
-        const a = link(src, '');
         const img = el('img');
         img.src = src;
-        img.alt = IMAGES[name];
+        img.alt = sceneLabel ? `${IMAGES[name]} (${sceneLabel})` : IMAGES[name];
         img.loading = 'lazy';
-        a.append(img);
-        fig.append(a, el('figcaption', null, IMAGES[name]));
+        if (sceneLabel) {
+          fig.append(img, el('figcaption', null, `${IMAGES[name]} · ${sceneLabel}`));
+        } else {
+          const a = link(src, '');
+          a.append(img);
+          fig.append(a, el('figcaption', null, IMAGES[name]));
+        }
         figs.append(fig);
       }
       box.append(figs);
