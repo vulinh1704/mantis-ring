@@ -3,18 +3,20 @@
 // createApp() with its real config, task store, queue and spend ledger in a temporary state folder,
 // and a fake runFix that finishes (or waits) on command. It checks the routes, the local-admin rule
 // D-4 (loopback peer, no X-Forwarded-For, loopback Host), D-5 (public runs closed), the per-IP and
-// queue limits, approve/patch with the owner token, and SSE replay. /status talks to
-// test/fake-gateway.mjs, never to the real inference service. Each check prints PASS or FAIL.
+// queue limits, approve/patch with the owner token, and SSE replay, and POST /admin/speech (the video's
+// voice: admin only, its text and cost caps, the ledger line) with scripts/ring.sh tts. /status and the
+// speech calls talk to test/fake-gateway.mjs, never to the real inference service. Each check prints
+// PASS or FAIL.
 // Usage: node test/app-api.mjs
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import http from 'node:http';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { FAKE_KEY, startFakeGateway } from './fake-gateway.mjs';
+import { FAKE_KEY, httpError, sleep, startFakeGateway, wavBytes } from './fake-gateway.mjs';
 
 const results = [];
 const oneLine = (s) => String(s ?? '').replace(/\s+/g, ' ').trim().slice(0, 300);
@@ -281,6 +283,11 @@ try {
     try {
       const r = await request('GET', '/admin/health', { via: { host: ip, port: side.address().port }, headers: { host: `127.0.0.1:${port}` } });
       check('A1 /admin/health from a non-loopback peer (no XFF, loopback Host) → 404', r.status === 404, `peer ${ip}: ${r.status}`);
+      const sideSpeech = await request('POST', '/admin/speech', {
+        via: { host: ip, port: side.address().port }, headers: { host: `127.0.0.1:${port}`, ...JSON_TYPE }, body: { model: 'fake-speech', input: 'Hello from outside.' },
+      });
+      check('A1 POST /admin/speech from a non-loopback peer (no XFF, loopback Host) → 404, and nothing reaches the speech service',
+        sideSpeech.status === 404 && gw.speeches().length === 0, `peer ${ip}: ${sideSpeech.status}; ${gw.speeches().length} speech requests`);
     } finally {
       await new Promise((resolve) => side.close(resolve));
     }
@@ -289,16 +296,19 @@ try {
   const listOf = (r) => (Array.isArray(r.json) ? r.json : r.json?.tasks ?? []);
   const countBefore = listOf(before).length;
   const hidden = [];
-  for (const [method, p, body] of [['GET', '/admin/config'], ['GET', '/admin/tasks'], ['GET', '/admin/spend'], ['POST', '/admin/tasks', { sample: 'lumen' }],
-    ['POST', '/admin/config', { publicSampleRuns: true, publicGithubRuns: true }], ['POST', '/admin/selftest', { suite: 'agent-loop' }], ['POST', '/admin/probe', { models: ['fake-coder'] }]]) {
+  const adminRoutes = [['GET', '/admin/config'], ['GET', '/admin/tasks'], ['GET', '/admin/spend'], ['POST', '/admin/tasks', { sample: 'lumen' }],
+    ['POST', '/admin/config', { publicSampleRuns: true, publicGithubRuns: true }], ['POST', '/admin/selftest', { suite: 'agent-loop' }], ['POST', '/admin/probe', { models: ['fake-coder'] }],
+    ['POST', '/admin/speech', { model: 'fake-speech', input: 'Hello from the internet.' }]];
+  for (const [method, p, body] of adminRoutes) {
     const r = await visitor('203.0.113.7', method, p, body === undefined ? {} : { body });
     if (r.status !== 404) hidden.push(`${method} ${p}: ${r.status}`);
   }
   const after = await admin('GET', '/admin/tasks');
   const cfgAfter = await admin('GET', '/admin/config');
-  check('A1 every /admin/* route answers 404 through Caddy and changes nothing',
-    hidden.length === 0 && listOf(after).length === countBefore && cfgAfter.json?.publicSampleRuns === false && cfgAfter.json?.publicGithubRuns === false && gw.chats().length === 0,
-    hidden.join('; ') || `7 routes hidden; tasks ${countBefore} → ${listOf(after).length}; public switches ${cfgAfter.json?.publicSampleRuns}/${cfgAfter.json?.publicGithubRuns}`);
+  check('A1 every /admin/* route answers 404 through Caddy and changes nothing (no model call, no speech call)',
+    hidden.length === 0 && listOf(after).length === countBefore && cfgAfter.json?.publicSampleRuns === false && cfgAfter.json?.publicGithubRuns === false
+      && gw.chats().length === 0 && gw.speeches().length === 0,
+    hidden.join('; ') || `${adminRoutes.length} routes hidden; tasks ${countBefore} → ${listOf(after).length}; public switches ${cfgAfter.json?.publicSampleRuns}/${cfgAfter.json?.publicGithubRuns}`);
 
   // --- A2 / D-5: public runs are closed --------------------------------------------------------------
   const closed = await visitor('203.0.113.8', 'POST', '/api/tasks', { body: { sample: 'lumen' } });
@@ -844,6 +854,114 @@ try {
     started === goodBox && goodBox.destroyed === 0 && patches[0]?.sandbox?.name === 'ring-0000fake' && patches[0]?.sandbox?.runtime === 'runsc'
       && /EIO/.test(startErr?.message ?? '') && badBox.destroyed === 1,
     `recorded ${JSON.stringify(patches[0] ?? null)}; failed start: ${oneLine(startErr?.message ?? 'no error')}, destroyed ${badBox.destroyed} time(s)`);
+  // --- POST /admin/speech: the video's voice (admin only; the A1 checks above show it hidden) -------------
+  const PASSAGE = "This is Mantis Ring: a UI-fixing agent that can't cheat, sandboxed on Vultr. Every fix is measured, not described.";
+  const speechCount = () => gw.speeches().length;
+  gw.setSpeech(null);
+  const s0 = speechCount();
+  const spoken = await admin('POST', '/admin/speech', { body: { model: 'fake-speech', input: `  ${PASSAGE}\n`, voice: 'default', format: 'wav', language: 'English' } });
+  const sentSpeech = gw.speeches().at(-1);
+  const wantSeconds = Math.ceil(PASSAGE.length / 15);
+  const spendView = await admin('GET', '/admin/spend');
+  const ledger = (await readFile(path.join(config.STATE_DIR, 'spend.jsonl'), 'utf8')).trim().split('\n').map((l) => JSON.parse(l));
+  const speechLine = ledger.filter((l) => l.kind === 'speech').at(-1);
+  const speechHeaders = Object.fromEntries(Object.entries(spoken.headers).filter(([k]) => k.startsWith('x-ring-speech')));
+  check('POST /admin/speech from loopback: the audio as the provider sent it, its seconds and cost in x-ring-speech-* headers, and one admin line of kind speech in the ledger',
+    spoken.status === 200 && spoken.headers['content-type'] === 'audio/wav' && spoken.buf.equals(wavBytes(wantSeconds)) && speechCount() === s0 + 1
+      && sentSpeech?.auth === true && sentSpeech.body?.input === PASSAGE && sentSpeech.body?.response_format === 'wav' && sentSpeech.body?.voice === 'default'
+      && speechHeaders['x-ring-speech-seconds'] === String(wantSeconds) && Math.abs(Number(speechHeaders['x-ring-speech-usd']) - wantSeconds * 0.0003) < 1e-9
+      && speechLine?.origin === 'admin' && speechLine?.model === 'fake-speech' && speechLine?.audioSeconds === wantSeconds && speechLine?.chars === PASSAGE.length
+      && spendView.json?.speech?.today?.calls === 1 && spendView.json?.speech?.maxChars === 800 && spendView.json?.speech?.callUsd === 0.05 && !spoken.buf.includes(FAKE_KEY),
+    `${spoken.status} ${spoken.headers['content-type']} ${spoken.buf.length} bytes ${oneLine(spoken.json?.error)}; ${JSON.stringify(speechHeaders)}; ledger ${JSON.stringify(speechLine)}`);
+
+  const refusals = {
+    'over 800 characters': { model: 'fake-speech', input: 'a'.repeat(801) },
+    'a chat model': { model: 'fake-coder', input: PASSAGE },
+    'an unpriced speech model': { model: 'fake-speech-unpriced', input: PASSAGE },
+    'a model outside the catalogue': { model: 'no-such-tts', input: PASSAGE },
+    'voice clone': { model: 'fake-speech', input: PASSAGE, voice: 'clone' },
+    'voice design': { model: 'fake-speech', input: PASSAGE, voice: 'design' },
+    'format pcm': { model: 'fake-speech', input: PASSAGE, format: 'pcm' },
+    'a reference clip (unknown field)': { model: 'fake-speech', input: PASSAGE, input_references: [{ type: 'input_audio' }] },
+    'speed 3': { model: 'fake-speech', input: PASSAGE, speed: 3 },
+    'a control character': { model: 'fake-speech', input: `${PASSAGE}\u0007` },
+    'empty text': { model: 'fake-speech', input: '   ' },
+  };
+  const s1 = speechCount();
+  const notRefused = [];
+  for (const [what, body] of Object.entries(refusals)) {
+    const r = await admin('POST', '/admin/speech', { body });
+    if (r.status !== 400 || !plainError(r)) notRefused.push(`${what}: ${r.status} ${oneLine(r.json?.error ?? r.text)}`);
+  }
+  const s2 = speechCount();
+  const atCap = await admin('POST', '/admin/speech', { body: { model: 'fake-speech', input: 'a'.repeat(800), format: 'mp3' } });
+  check('POST /admin/speech refuses (400, nothing sent) over 800 characters, a model that is no priced speech model, clone and design voices, pcm, unknown fields, speed 3, control characters and empty text; 800 characters pass',
+    notRefused.length === 0 && s2 === s1 && atCap.status === 200 && speechCount() === s2 + 1,
+    notRefused.join(' | ') || `${Object.keys(refusals).length} bodies refused; 800 characters: ${atCap.status} ${oneLine(atCap.json?.error)}`);
+
+  gw.setSpeech(httpError(400, `unknown voice "nobody" for key ${FAKE_KEY}`, { errorType: 'invalid_request' }));
+  const providerNo = await admin('POST', '/admin/speech', { body: { model: 'fake-speech', input: PASSAGE, voice: 'nobody' } });
+  gw.setSpeech(sleep(800));
+  const slowCall = admin('POST', '/admin/speech', { body: { model: 'fake-speech', input: PASSAGE } });
+  await wait(250);
+  const meanwhile = await admin('POST', '/admin/speech', { body: { model: 'fake-speech', input: PASSAGE } });
+  const slowDone = await slowCall;
+  gw.setSpeech(null);
+  check('POST /admin/speech: the provider refusing → 502 with its sentence and the key redacted; a second call while one runs → 429',
+    providerNo.status === 502 && plainError(providerNo) && /unknown voice/.test(providerNo.json?.error ?? '') && !providerNo.text.includes(FAKE_KEY)
+      && meanwhile.status === 429 && slowDone.status === 200,
+    `${providerNo.status} ${oneLine(providerNo.json?.error)}; meanwhile ${meanwhile.status}; the slow call ${slowDone.status}`);
+
+  const s3 = speechCount();
+  const pricey = await admin('POST', '/admin/speech', { body: { model: 'fake-speech-pricey', input: PASSAGE } });
+  // Today's speech budget, nearly used up by an earlier call the ledger knows of.
+  spend.speechGuard({ id: 'speech-app-api-fill', callUsd: 0.05, dayUsd: 0.5 }).after('fake-speech', {}, 0.49, { seconds: 1633, chars: 1 });
+  const overDay = await admin('POST', '/admin/speech', { body: { model: 'fake-speech', input: PASSAGE } });
+  check("POST /admin/speech: a call whose estimate passes $0.05, or today's $0.50 of speech, → 503 with the reason, and nothing is sent",
+    pricey.status === 503 && /\$0\.05/.test(pricey.json?.error ?? '') && overDay.status === 503 && /speech budget/.test(overDay.json?.error ?? '') && speechCount() === s3,
+    `${pricey.status} ${oneLine(pricey.json?.error)} | ${overDay.status} ${oneLine(overDay.json?.error)}`);
+
+  // scripts/ring.sh tts against stand-ins for ssh: the text file goes as JSON on stdin, the audio comes
+  // back on stdout into the out file, and the response headers (on stderr) give its cost.
+  const ttsLog = path.join(stateDir, 'fake-ssh-tts.log');
+  const ttsSsh = path.join(stateDir, 'fake-ssh-tts');
+  const ttsRefused = path.join(stateDir, 'fake-ssh-tts-refused');
+  await writeFile(ttsLog, '');
+  await writeFile(ttsSsh, `#!/bin/sh\nfor last; do :; done\nprintf '%s\\n' "$last" >> '${ttsLog}'\ncat >> '${ttsLog}'\nprintf '\\n' >> '${ttsLog}'\n`
+    + "printf 'HTTP/1.1 200 OK\\r\\ncontent-type: audio/wav\\r\\nx-ring-speech-model: chatterbox\\r\\nx-ring-speech-voice: default\\r\\nx-ring-speech-chars: 39\\r\\n"
+    + "x-ring-speech-seconds: 3\\r\\nx-ring-speech-usd: 0.00084\\r\\nx-ring-speech-usd-from: provider\\r\\nx-ring-speech-today-usd: 0.00084\\r\\n\\r\\n' >&2\nprintf 'FAKE-AUDIO'\n", { mode: 0o755 });
+  await writeFile(ttsRefused, "#!/bin/sh\ncat > /dev/null\nprintf 'HTTP/1.1 400 Bad Request\\r\\n\\r\\n' >&2\nprintf 'curl: (22) The requested URL returned error: 400\\n' >&2\n"
+    + "printf '{\"error\":\"The text has 801 characters; one call speaks at most 800.\",\"more\":\"/latest/\"}'\nexit 22\n", { mode: 0o755 });
+  const textFile = path.join(stateDir, 'passage.txt');
+  await writeFile(textFile, '﻿This is Mantis Ring:\r\n   a UI-fixing agent.\n');
+  const outDir = path.join(stateDir, 'tts-out');
+  await mkdir(outDir, { recursive: true });
+  const ringTts = (ssh, args) => spawnSync('bash', [ringSh, 'tts', ...args], {
+    encoding: 'utf8', timeout: 20_000,
+    env: { PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin', HOME: stateDir, LANG: 'C.UTF-8', RING_TEST: '1', RING_HOST: '192.0.2.1', RING_SSH: ssh },
+  });
+  const ttsOk = ringTts(ttsSsh, ['chatterbox', textFile, path.join(outDir, 'sample.wav'), 'default']);
+  const ttsSent = (await readFile(ttsLog, 'utf8')).split('\n');
+  let ttsBody = null;
+  try { ttsBody = JSON.parse(ttsSent.find((l) => l.startsWith('{')) ?? ''); } catch { ttsBody = null; }
+  const ttsAudio = await readFile(path.join(outDir, 'sample.wav'), 'utf8').catch(() => null);
+  const ttsNo = ringTts(ttsRefused, ['chatterbox', textFile, path.join(outDir, 'refused.wav')]);
+  const leftOver = (await readdir(outDir)).filter((f) => f.startsWith('refused'));
+  const ttsBad = [
+    ringTts(ttsSsh, ['chatterbox', textFile, path.join(outDir, 'x.aac')]),
+    ringTts(ttsSsh, ['chatterbox; rm -rf ~', textFile, path.join(outDir, 'x.wav')]),
+    ringTts(ttsSsh, ['chatterbox', path.join(stateDir, 'no-such-passage.txt'), path.join(outDir, 'x.wav')]),
+    ringTts(ttsSsh, ['chatterbox', textFile, path.join(outDir, 'x.wav'), 'Not A Voice']),
+  ];
+  const sshCalls = (await readFile(ttsLog, 'utf8')).split('\n').filter((l) => l.includes('/admin/speech')).length;
+  check('scripts/ring.sh tts sends the text as JSON on stdin (white space folded, in English, with the voice), writes the audio and prints its cost; a refusal leaves no file; a bad extension, model, text file or voice stops before ssh',
+    ttsOk.status === 0 && ttsBody?.model === 'chatterbox' && ttsBody?.input === 'This is Mantis Ring: a UI-fixing agent.' && ttsBody?.format === 'wav'
+      && ttsBody?.voice === 'default' && ttsBody?.language === 'English' && ttsAudio === 'FAKE-AUDIO' && /3 s of audio billed, \$0\.00084 \(provider\)/.test(ttsOk.stdout)
+      && ttsSent.some((l) => l.includes("--data-binary @- 'http://127.0.0.1:8080/admin/speech'")) && !ttsSent.some((l) => l.includes('Mantis Ring') && l.includes('curl'))
+      && ttsNo.status !== 0 && /801 characters/.test(ttsNo.stderr) && leftOver.length === 0 && ttsBad.every((r) => r.status !== 0) && sshCalls === 1,
+    `ok: exit ${ttsOk.status} ${oneLine(ttsOk.stdout)} ${oneLine(ttsOk.stderr)}; body ${JSON.stringify(ttsBody)}; refused: exit ${ttsNo.status} ${oneLine(ttsNo.stderr)}, left ${leftOver.join(' ') || 'nothing'}; `
+      + `bad: ${ttsBad.map((r) => `${r.status} ${oneLine(r.stderr)}`).join(' / ')}; ${sshCalls} call(s) reached ssh`);
+
   check('no request reached the model service', gw.chats().length === 0, `${gw.chats().length} chat requests`);
 } catch (err) {
   check('app-api tests ran to the end', false, `stopped: ${err.stack?.split('\n').slice(0, 3).join(' ') ?? err}`);

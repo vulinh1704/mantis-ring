@@ -2,8 +2,9 @@
 // The Mantis Ring web app and orchestrator: one HTTP listener on 127.0.0.1, behind Caddy (BUILD-SPEC §4).
 // Public routes serve the UI, /status, task progress over Server-Sent Events, receipts, the owner's
 // Approve and the patch download. Local-admin routes (/admin/*) start and inspect tasks, run probes and
-// self-tests, change settings and publish runs. They answer only requests from loopback that did not come
-// through Caddy and name a loopback Host (D-4), and look like any unknown path (404) to everyone else.
+// self-tests, change settings, publish runs and speak a short passage for the video's voice. They answer
+// only requests from loopback that did not come through Caddy and name a loopback Host (D-4), and look
+// like any unknown path (404) to everyone else.
 // Tasks wait in the queue, then run in their own sandbox through runFix (agent/loop.mjs).
 //
 // Usage: node app/server.mjs   (env: PORT=8080 HOST=127.0.0.1 RING_STATE_DIR RING_PUBLIC_DIR RING_RUNTIME)
@@ -15,7 +16,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { chat, newTally } from '../agent/inference.mjs';
+import { BudgetError, InferenceError, SPEECH_FORMATS, chat, loadPricing, newTally, speech, speechPriceOf } from '../agent/inference.mjs';
 import { APP_LABEL, Sandbox, childEnv } from '../runner/sandbox.mjs';
 import * as configModule from './config.mjs';
 import {
@@ -47,6 +48,11 @@ const SELFTEST_TIMEOUT_MS = 20 * 60_000;
 const STALE_SANDBOX_MS = 2 * CAP_RANGES.wallClockSec[1] * 1000;
 const PROBE_CAPS = { maxUsd: 0.25, maxPromptTokens: 400_000 };   // the whole probe costs < $0.02 (§5.3)
 const PROBE_TIMEOUT_MS = 15 * 60_000;
+// POST /admin/speech, the video's voice: one passage of at most 800 characters (about a minute of
+// speech) per call, one call at a time, built-in voices only. A call may cost at most $0.05 by speech()'s
+// upper-bound estimate, and speech at most $0.50 a UTC day, inside the admin and total caps.
+const SPEECH = Object.freeze({ maxChars: 800, callUsd: 0.05, dayUsd: 0.5, timeoutMs: 180_000, maxBytes: 16 * 2 ** 20 });
+const SPEECH_FIELDS = ['model', 'input', 'voice', 'format', 'language', 'speed', 'seed'];
 const DIFF_SHOWN_BYTES = 200 * 1024;
 // `seeded` (null, or the seeded scene's script, label and stand-in) lets the run page show its label from the start.
 const PUBLIC_KEYS = ['id', 'createdAt', 'updatedAt', 'startedAt', 'finishedAt', 'origin', 'state', 'source', 'matrix', 'model',
@@ -311,6 +317,37 @@ async function readJson(req) {
   return body;
 }
 
+/**
+ * The body of POST /admin/speech, checked: a speech model with a known price (the catalogue's, or one
+ * pinned in agent/prices.mjs), 1 to 800 characters of text without control characters (tabs and new
+ * lines aside), a built-in voice (clone and design are refused), and the audio format. Unknown fields
+ * are refused. Throws HttpError 400 with the reason.
+ */
+function speechSpec(body) {
+  const unknown = Object.keys(body).filter((k) => !SPEECH_FIELDS.includes(k));
+  if (unknown.length) throw new HttpError(400, `Unknown field${unknown.length > 1 ? 's' : ''} for speech: ${unknown.slice(0, 5).join(', ')}.`);
+  const { model, input, voice, format = 'mp3', language, speed, seed } = body;
+  if (typeof model !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}$/.test(model)) throw new HttpError(400, 'model must be the id of a speech model.');
+  if (!speechPriceOf(model)) {
+    throw new HttpError(400, `${model} is not a speech model with a known price in the catalogue, so its cost cannot be capped.`);
+  }
+  if (typeof input !== 'string' || !input.trim()) throw new HttpError(400, 'input must be the text to speak.');
+  const text = input.trim();
+  if (text.length > SPEECH.maxChars) throw new HttpError(400, `The text has ${text.length} characters; one call speaks at most ${SPEECH.maxChars}.`);
+  if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text)) throw new HttpError(400, 'The text may not contain control characters (tabs and new lines are fine).');
+  if (voice !== undefined && (typeof voice !== 'string' || !/^[a-z][a-z0-9_]{0,39}$/.test(voice))) {
+    throw new HttpError(400, 'voice must be the name of a built-in voice, such as default or aiden.');
+  }
+  if (voice === 'clone' || voice === 'design') throw new HttpError(400, 'Only built-in voices are used: clone and design are refused.');
+  if (typeof format !== 'string' || !Object.hasOwn(SPEECH_FORMATS, format)) throw new HttpError(400, `format must be one of ${Object.keys(SPEECH_FORMATS).join(', ')}.`);
+  if (language !== undefined && (typeof language !== 'string' || !/^[A-Za-z][A-Za-z -]{0,34}$/.test(language))) {
+    throw new HttpError(400, 'language must be auto, a language code such as en, or a name such as English.');
+  }
+  if (speed !== undefined && !(typeof speed === 'number' && speed >= 0.5 && speed <= 2)) throw new HttpError(400, 'speed must be a number from 0.5 to 2.');
+  if (seed !== undefined && !(Number.isInteger(seed) && seed >= 0 && seed <= 2 ** 31 - 1)) throw new HttpError(400, 'seed must be a non-negative integer.');
+  return { model, input: text, voice, format, language, speed, seed };
+}
+
 /** The owner token from x-ring-owner matches the task's stored SHA-256 (compared in constant time). */
 function ownerOk(rec, req) {
   const token = req.headers['x-ring-owner'];
@@ -366,6 +403,7 @@ export function createApp(deps = {}) {
   const announced = new Map();     // queued task -> position last sent
   const passphraseTries = new Map(); // task id -> wrong approval passphrases in this process
   let selftestNow = null;          // the suite of a self-test that waits or runs (/admin/busy)
+  let speechBusy = false;          // one speech call at a time, so its caps are checked against what is spent
   let closing = null;
 
   /** The approval passphrase's SHA-256 (lowercase hex), or null when the owner link alone approves. */
@@ -973,7 +1011,55 @@ export function createApp(deps = {}) {
 
   function adminSpend(c) {
     if (!spend) throw new HttpError(503, 'The spend ledger is not loaded.');
-    sendJson(c.res, 200, { today: spend.today(), totalUsd: spend.total(), caps: spend.caps, rows: spend.breakdown() });
+    sendJson(c.res, 200, {
+      today: spend.today(), totalUsd: spend.total(), caps: spend.caps, rows: spend.breakdown(),
+      speech: { today: spend.speechToday(), maxChars: SPEECH.maxChars, callUsd: SPEECH.callUsd, dayUsd: SPEECH.dayUsd },
+    });
+  }
+
+  /**
+   * Speak one passage for the video's voice (POST /admin/speech): the body is checked by speechSpec(),
+   * the call goes out through speech() with the key from this process's environment, and the answer
+   * is the audio itself, with what it cost in x-ring-speech-* headers. The key never leaves the VM.
+   * Refusals: 400 for the body, 429 while another speech call runs (or the provider's rate limit), 503
+   * when a cap would be passed (nothing is sent then), 502 when the provider fails.
+   */
+  async function adminSpeech(c) {
+    const body = await readJson(c.req);
+    if (closing) throw new HttpError(503, SAY.restarting);
+    if (!spend) throw new HttpError(503, 'The spend ledger is not loaded, so no model can be called.');
+    await loadPricing();
+    const spec = speechSpec(body);
+    if (speechBusy) throw new HttpError(429, 'Another speech call is running. Try again when it has finished.', { 'retry-after': '10' });
+    speechBusy = true;
+    const ac = new AbortController();
+    c.res.on('close', () => { if (!c.res.writableEnded) ac.abort('the caller left'); });
+    let out;
+    try {
+      const guard = spend.speechGuard({ id: `speech-${now()}`, callUsd: SPEECH.callUsd, dayUsd: SPEECH.dayUsd });
+      out = await speech({ ...spec, guard, signal: ac.signal, timeoutMs: SPEECH.timeoutMs, maxBytes: SPEECH.maxBytes });
+    } catch (err) {
+      if (err instanceof BudgetError) throw new HttpError(503, `Nothing was sent: ${err.message}.`);
+      if (err instanceof InferenceError) {
+        log(`speech: ${spec.model} failed: ${oneLine(err.message, 300)}`);
+        throw new HttpError(err.status === 429 ? 429 : 502, `The speech call failed: ${err.message}.`);
+      }
+      throw err;
+    } finally {
+      speechBusy = false;
+    }
+    const today = spend.speechToday();
+    log(`speech: ${spec.model}, voice ${spec.voice ?? '(the default)'}, ${spec.format}, ${spec.input.length} characters → ${out.seconds ?? '?'} s billed, `
+      + `$${out.usd ?? '?'} (${out.usdFrom}); speech today $${today.usd} of $${SPEECH.dayUsd}`);
+    if (c.res.destroyed) return;
+    c.res.writeHead(200, headers({
+      'content-type': out.contentType, 'content-length': out.audio.length, 'cache-control': 'no-store',
+      'content-disposition': `attachment; filename="speech.${out.format}"`,
+      'x-ring-speech-model': spec.model, 'x-ring-speech-voice': spec.voice ?? 'default', 'x-ring-speech-format': out.format,
+      'x-ring-speech-chars': String(spec.input.length), 'x-ring-speech-seconds': String(out.seconds ?? ''),
+      'x-ring-speech-usd': String(out.usd ?? ''), 'x-ring-speech-usd-from': out.usdFrom, 'x-ring-speech-today-usd': String(today.usd),
+    }));
+    c.res.end(out.audio);
   }
 
   /**
@@ -1072,6 +1158,7 @@ export function createApp(deps = {}) {
     ['POST', /^\/admin\/config$/, adminSetConfig],
     ['GET', /^\/admin\/spend$/, adminSpend],
     ['POST', /^\/admin\/selftest$/, adminSelftest],
+    ['POST', /^\/admin\/speech$/, adminSpeech],
   ];
 
   function dispatch(routes, c) {

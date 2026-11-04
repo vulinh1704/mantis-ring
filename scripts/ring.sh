@@ -26,6 +26,12 @@
 #   selftest <suite>          POST /admin/selftest (agent-loop | containment | scenes); streams its output
 #                             and exits with the suite's own exit code
 #   logs                      the last 300 lines of the app's journal
+#   tts <model> <text-file> <out-file> [voice]
+#                             POST /admin/speech: the VM speaks the text file in English (at most 800 characters;
+#                             white space becomes single spaces) with a priced speech model of the catalogue, such
+#                             as chatterbox or qwen3-tts-12hz-1.7b, and a built-in voice. The audio comes back into
+#                             <out-file>, whose extension picks the format (.mp3 .wav .flac .opus); the key stays on
+#                             the VM. One call costs at most $0.05 and speech at most $0.50 a day (see spend)
 # Environment, for tests only: RING_SSH (a program to use instead of ssh; it must be executable) and
 # RING_HOST. With RING_TEST=1 the script refuses the real ssh and the real VM.
 set -euo pipefail
@@ -38,7 +44,7 @@ S=("$SSH_BIN" -i ~/.ssh/vultr_ring_deploy -o IdentitiesOnly=yes -o BatchMode=yes
 APP=http://127.0.0.1:8080
 
 die() { printf 'ring.sh: %s\n' "$*" >&2; exit 1; }
-usage() { sed -n '8,30p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '8,36p' "$0" | sed 's/^# \{0,1\}//'; }
 if [ -n "${RING_SSH:-}" ] && [ ! -x "$RING_SSH" ]; then die "RING_SSH is set but is not an executable file: $RING_SSH"; fi
 if [ "${RING_TEST:-}" = 1 ]; then
   [ "$HOST_ADDR" != "$REAL_HOST" ] || die "RING_TEST=1, but the host is the real VM: set RING_HOST"
@@ -150,6 +156,43 @@ case "$cmd" in
       *) die "the self-test failed: $last" ;;
     esac ;;
   logs) "${S[@]}" 'sudo journalctl -u mantis-ring -n 300 --no-pager' ;;
+  tts)
+    { [ "$#" -ge 3 ] && [ "$#" -le 4 ]; } || die "usage: ring.sh tts <model> <text-file> <out-file> [voice]"
+    model=$1 textfile=$2 out=$3 voice=${4:-}
+    [[ $model =~ ^[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}$ ]] || die "not a model id: $model"
+    [ -z "$voice" ] || [[ $voice =~ ^[a-z][a-z0-9_]{0,39}$ ]] || die "not a voice name: $voice"
+    { [ -f "$textfile" ] && [ -r "$textfile" ]; } || die "cannot read the text file: $textfile"
+    fmt=${out##*.}
+    case "$fmt" in
+      mp3 | wav | flac | opus) ;;
+      *) die "the out file must end in .mp3, .wav, .flac or .opus: $out" ;;
+    esac
+    [ -d "$(dirname -- "$out")" ] || die "no such folder for the out file: $(dirname -- "$out")"
+    # The body, as JSON on stdin: the text with its white space folded into single spaces.
+    body=$(node -e 'const fs = require("node:fs");
+      const [model, file, format, voice] = process.argv.slice(1);
+      if (fs.statSync(file).size > 16384) { console.error("the text file is larger than 16 KB"); process.exit(1); }
+      const input = fs.readFileSync(file, "utf8").replace(/^﻿/, "").replace(/\s+/g, " ").trim();
+      const b = { model, input, format, language: "English" };
+      if (voice) b.voice = voice;
+      process.stdout.write(JSON.stringify(b));' "$model" "$textfile" "$fmt" "$voice") || die "could not read the text file: $textfile"
+    # The audio arrives on stdout, the response headers (what it cost) on stderr.
+    hdr=$(mktemp /tmp/ring-tts.XXXXXX)
+    part="$out.part"
+    trap 'rm -f "$hdr" "$part"' EXIT
+    rc=0
+    printf '%s' "$body" | "${S[@]}" "curl -sS --fail-with-body -D /dev/stderr -X POST -H 'content-type: application/json' --data-binary @- '$APP/admin/speech'" > "$part" 2> "$hdr" || rc=$?
+    if [ "$rc" != 0 ]; then
+      # The app's refusal is one JSON sentence; curl and ssh say theirs on stderr, next to the
+      # response headers, whose lines end in CR LF and are left out.
+      { head -c 2000 -- "$part"; echo; grep -v -E $'(\r$|^$)' "$hdr" || true; } >&2
+      die "no audio came back (exit $rc)"
+    fi
+    mv -f -- "$part" "$out"
+    field() { grep -i -m 1 "^$1:" "$hdr" | cut -d: -f2- | tr -d '\r' | sed 's/^ *//' || true; }
+    printf 'wrote %s (%s bytes): %s, voice %s, %s characters, %s s of audio billed, $%s (%s); speech today $%s\n' \
+      "$out" "$(wc -c < "$out" | tr -d ' ')" "$(field x-ring-speech-model)" "$(field x-ring-speech-voice)" "$(field x-ring-speech-chars)" \
+      "$(field x-ring-speech-seconds)" "$(field x-ring-speech-usd)" "$(field x-ring-speech-usd-from)" "$(field x-ring-speech-today-usd)" ;;
   '' | -h | --help | help) usage ;;
   *) usage >&2; exit 64 ;;
 esac
