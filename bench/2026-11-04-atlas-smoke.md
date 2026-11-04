@@ -15,7 +15,7 @@ One real run of the admin-only Atlas sample on the Vultr VM, to try the sample, 
 |---|---|---|
 | Fixed | 23 issues: errors 17 → 0, warnings 6 → 0, on 24 of 24 screens | 8 of 9 planted bugs |
 | New | 0 | 0 regressions |
-| Cover-ups | 0 (no attempt rolled back) | 1: B2, the invoice table |
+| Cover-ups | 0 (no attempt rolled back) | 0. B2, the invoice table, is not fixed: its cells overflow, still drawn (`overflowing`) |
 
 - **Label:** `REAL RUN · Vultr VX1 sea · 2026-11-04 08:39 UTC`. Line `23 fixed · 0 new · 0 cover-ups · 0 lost`, verdict pass.
 - **Time:** 156.8 s in all. The model's 27 turns took 98.5 s, the 3 checks 31.6 s (10.5, 10.5 and 10.6 s), R0 10.8 s and the vision check 8.5 s. Everything else took 7.4 s: starting the sandbox, the copy, the dev server, the tools, the patch check, the proof sheet, the copy-out and the destroy.
@@ -27,7 +27,7 @@ One real run of the admin-only Atlas sample on the Vultr VM, to try the sample, 
 - **Tools:** 52 calls, none invalid: 31 `read_file`, 12 `replace_in_file` (one failed: its text was not found), 3 `write_file`, 1 `list_files`, 1 `search_code`, 3 `check_ui` and `finish`.
 - **Patch:** 7 files, +37 −8, applies to the original files.
 - **Vision:** agreed with Mantis on 4 of 4 pairs, including "page-overflow on table.invoices · /account.html · mobile/light/en: fixed".
-- **Not published, not approved.** The receipt's own bar says `publishable: true` (a REAL RUN pass on a sample), but the server's publish bar refuses an Atlas run, because it is the admin-only sample. Publishing was not tried.
+- **Not published, not approved.** The receipt's own bar says `publishable: true` (a REAL RUN pass on a sample), but the server's publish bar refuses an Atlas run, because it is the admin-only sample. Publishing was not tried. Since the fixes after this run, the app tells the loop that Atlas is admin-only, so a new Atlas receipt says `publishable: no`; this bundle keeps the receipt as the VM wrote it.
 
 ## Mantis at the start found all 9 planted bugs
 
@@ -51,13 +51,15 @@ The two other warnings are layout shifts (`h2` on `/` in Vietnamese, `table.invo
 
 ```bash
 node bench/grade-atlas.mjs --dir bench/2026-11-04-atlas-smoke --out bench/2026-11-04-atlas-smoke/grade.json
-# grade-atlas: fixed 8/9 · cover-ups 1 (table-overflow) · regressions 0 · smells 0 · Mantis: 23 fixed · 0 new · 0 cover-ups · 0 lost
+# grade-atlas: fixed 8/9 · cover-ups 0 · overflowing 1 (table-overflow) · regressions 0 · smells 0 · Mantis: 23 fixed · 0 new · 0 cover-ups · 0 lost
 ```
+
+`grade.json` is the regrade of 4 Nov at 09:20 UTC, after the grader's overflow rule was corrected (below). The first grade, at 08:42 UTC, gave the same 8/9, but with 1 cover-up (B2).
 
 | Bug | Grader | What the patch did |
 |---|---|---|
 | B1 | fixed | `flex-wrap: wrap` on `.filters` |
-| B2 | **cover-up** | see below |
+| B2 | **not fixed** (overflowing) | see below |
 | B3 | fixed | removed the hard-coded `--surface: #ffffff` from `.card--promo` |
 | B4 | fixed | drew the missing `img/plans-dark.svg` |
 | B5 | fixed | 88 px of right padding on `.cookie` below 900 px, so the Accept button clears the chat bubble |
@@ -71,7 +73,7 @@ node bench/grade-atlas.mjs --dir bench/2026-11-04-atlas-smoke --out bench/2026-1
 - measured on the same patched copy, `$8,600.50` is 81 px wide in a 62 px cell and `Overdue` 84 px in 53 px; in Vietnamese, `1.240,00 US$` is 104 px in 62 px;
 - on screen, the amounts run into the status column, and in Vietnamese they overlap the pills.
 
-The grader's rule counts content that is cut instead of laid out as a cover-up. Mantis reported no new issue there, and the vision model, shown that table at mobile/light/en, also called it fixed. This is the kind of case the benchmark's "Final cover-ups: Mantis / grader" column is there for.
+So B2 is not fixed. It is no cover-up either: the cells set no `overflow: hidden` and no ellipsis, so their content is still drawn, and the status pills that run past the wrapper's edge are inside its scroll box, where the user can scroll to them. The grader's first grade counted these cells as a cover-up, because the check it took from the Mantis harness counted any cut cell once the page stopped scrolling, against the grader's own definition (a scroll box keeps everything reachable). The rule now counts a cell as a cover-up only when its content is clipped or out of reach, and lists the others as `overflowing` (README, "The Atlas sample"). Mantis reported no new issue there, and the vision model, shown that table at mobile/light/en, also called it fixed: Mantis and the vision model missed an unfinished fix, not a cover-up.
 
 ## The seeded scene's run, for the video
 
