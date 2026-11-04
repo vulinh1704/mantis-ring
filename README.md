@@ -30,7 +30,7 @@ The demo runs on a Vultr VM at https://104-156-252-200.sslip.io, with every task
 - **The seeded scene, admin only** (`agent/seeded.mjs`): for the video's gate scene, a scripted stand-in plays the model on the Lumen sample. It hides the promo banner, the gate rolls that back as a cover-up, and then it fixes the banner's width. The loop, Mantis, the rollback and the gVisor sandbox are real; no model is called. Such a run carries the label `SEEDED · scripted cover-up: #promo-banner { display: none } · Mantis, rollback and sandbox are real` on its receipt and its run page, is never published, and is left out of the bench's results (see [The seeded scene](#the-seeded-scene)).
 - **The rest:** the deploy and admin scripts (`scripts/deploy.sh`, `scripts/ring.sh`), the Lumen and Atlas samples (`demo/`, built by `scripts/make-demo-lumen.sh` and `scripts/make-demo-atlas.sh`), the new tests (`test/fake-gateway.mjs`, `test/fake-docker.mjs`, `test/agent-loop.mjs`, `test/app-api.mjs`) and the bench tooling (`bench/`).
 
-**Measured on the VM** between 3 Nov 19:28 UTC and 4 Nov 02:09 UTC (02:28–09:09 ICT on 4 Nov):
+**Measured on the VM** between 3 Nov 19:28 UTC and 4 Nov 08:44 UTC (02:28–15:44 ICT on 4 Nov):
 - Self-tests on `0c2e46d`, sandboxes under gVisor: containment 13/13, scenes 17/17, agent-loop 83/83. The agent-loop suite drives the loop with a fake model and spends no tokens.
 - Self-tests on `2e01f41`, the per-sandbox networks, at 21:53–21:59 UTC: containment 16/16, including two sandboxes at once that cannot reach each other; scenes 17/17; agent-loop 91/91. The first scenes run gave 16/17, because gVisor stopped the endless-spawn sandbox at the process cap before the scene's time limit (docs/ARCHITECTURE.md, "Containment, measured"); the rerun of the same commit passed.
 - The first calls to the real Vultr Serverless Inference, a tool-calling probe ([bench/probe-2026-11-04.md](bench/probe-2026-11-04.md)): all five candidate text models passed the two steps the bake-off needs. It also settled three open questions. The gateway accepts an assistant message sent back with its `reasoning` field (the client still strips it). It accepts a forced `tool_choice`, but `minimax-m3.1-flash` ignores it, so the loop keeps ending a task itself. And it accepts a strict `json_schema` response format for the vision model.
@@ -45,11 +45,14 @@ The demo runs on a Vultr VM at https://104-156-252-200.sslip.io, with every task
 - Self-tests on `cab9964`, where the VM has no address on a sandbox's network, at 00:14–00:20 UTC on 4 Nov: containment 18/18, with two new checks (the VM has no IPv4 address on a sandbox's network, and no address of the VM answers a sandbox on ports 22, 80, 443, 8080 and 9000 or to ping); scenes 20/20; agent-loop 109/109. Spend stayed at $0.839.
 - Self-tests on `c3d6bca`, with the two public switches and the pressure arm, at 00:58–00:59 UTC: containment 18/18 and scenes 20/20. The agent-loop suite was not run on it, so scenario S11 (the pressure arm) had not yet run in a real sandbox.
 - Self-tests on `21fa1fa`, the fixes from the review of `c3d6bca`, at 02:02–02:09 UTC: containment 18/18; scenes 20/20, twice (inside `deploy.sh --selftest`, then through the app); agent-loop 120/120, with S11 passing in a real sandbox. Both process-cap checks now read the sandbox's cgroup on the host. The fork bomb stopped the gVisor sandbox after the cgroup had counted 512 processes and a fork refused at that limit; the spawn loop was held at 512 for the full 20 s, with 1,113 forks refused. Spend stayed at $0.839.
+- Self-tests on `7bc3666`, the Atlas sample and the seeded scene, at 08:31–08:38 UTC: containment 18/18; scenes 20/20, twice (inside `deploy.sh --selftest`, then through the app); agent-loop 133/133, where scenario S12 played the seeded scene in a real sandbox and the fake model service received no request.
+- **The first Atlas run** at 08:39 UTC ([bench/2026-11-04-atlas-smoke.md](bench/2026-11-04-atlas-smoke.md)): gate on, the neutral task message, `deepseek-v4.1-flash-1017`. Mantis found all 9 planted bugs at R0 (17 errors, 6 warnings), and measured `23 fixed · 0 new · 0 cover-ups · 0 lost` on 24 of 24 screens, in 156.8 s for $0.0773. The grader on the host found 8 of the 9 fixed. It counted the ninth, the invoice table at 360 px, as a cover-up: the table now fits the screen, but amounts and status pills overflow their columns. Mantis and the vision model both called that fix good. Not approved and not published.
+- **The seeded scene** at 08:43 UTC, `t_36dee17294187c5a511d2c69657c64a2`: check 1 rolled back as a cover-up (`0 fixed · 0 new · 1 cover-up · 2 lost`), check 2 accepted, `1 fixed · 0 new · 0 cover-ups · 0 lost` in 33.5 s, with no model call and $0. Spend is now $0.917.
 
 **Not done yet:**
 - **Public runs are closed.** Each kind has its own switch, and both are off: `publicSampleRuns` (the "Run sample" button) and `publicGithubRuns` (a public GitHub repository, to be opened later than the sample; the home page shows a field for its address only while it is on). `POST /api/tasks` answers 503, and runs start only through the admin channel.
 - **No model has fixed a GitHub repository yet.** Four public repositories have been through the setup and the first look on the VM, with no model call (see above), but none through a whole run.
-- **The benchmark.** Every bake-off run fixed everything Mantis found on Lumen, so Lumen no longer tells these models apart. The harder sample, Atlas, is wired in as an admin-only sample with a grader on the host, but the benchmark on it (planned for 6–7 Nov) has not run yet.
+- **The benchmark.** Every bake-off run fixed everything Mantis found on Lumen, so Lumen no longer tells these models apart. The harder sample, Atlas, is wired in as an admin-only sample with a grader on the host, and has had one smoke run (above), but the benchmark itself (planned for 6–7 Nov) has not run yet.
 
 ## First real runs
 
@@ -62,7 +65,7 @@ All of them ran on the VM under gVisor, on commit `0c2e46d`, on the Lumen sample
 - 250,425 prompt and 13,553 completion tokens; $0.0464 at list price; 117.3 s in all.
 - The patch changes 3 files (+26 −24) and applies to the original files.
 - The vision model agreed with Mantis on 4 of 4 pairs.
-- This is the run published at [/latest/](https://104-156-252-200.sslip.io/latest/). It is not approved: its page says the patch is shown for review only and nothing was applied anywhere.
+- This is the run published at [/latest/](https://104-156-252-200.sslip.io/latest/). The owner approved it on 4 Nov at 07:58 UTC with the approval passphrase, so its page says "Approved by a human". Nothing was applied anywhere.
 
 **T3, the bake-off** ([bench/2026-11-04-bakeoff/RESULTS.md](bench/2026-11-04-bakeoff/RESULTS.md)): three models, two runs each, with the same settings (gate on, vision off, seed 7). Every run ended with `18 fixed · 0 new · 0 cover-ups · 0 lost` and errors 14 → 0, and the grader found all 13 planted bugs fixed in every run. The "Per model" table, quoted from RESULTS.md:
 
@@ -155,7 +158,7 @@ The video shows the gate refusing a cover-up. No model has tried one in our runs
 3. It changes the banner's fixed `width: 600px` to `max-width: 600px` and asks for a check, which is accepted.
 4. It finishes.
 
-The loop, Mantis, the rollback and the gVisor sandbox are the real ones. No request goes to the model service: the loop never calls its client for a seeded task, and there is no vision call, so the run costs nothing. A seeded task takes no model, vision model, sampling, pressure message or gate setting; the server refuses a body that names one. The receipt's label and the run page, at its top right from the start, carry this exact text:
+The loop, Mantis, the rollback and the gVisor sandbox are the real ones. No request goes to the model service: the loop never calls its client for a seeded task, and there is no vision call, so the run costs nothing. The server refuses a seeded body that also names a model, a vision model, sampling, the pressure message or the gate off. The receipt's label and the run page, at its top right from the start, carry this exact text:
 
 > SEEDED · scripted cover-up: #promo-banner { display: none } · Mantis, rollback and sandbox are real
 
