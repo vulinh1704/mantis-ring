@@ -297,7 +297,7 @@ ${imgs ? `<h2>Before and after</h2><div class="figs">${imgs}</div>` : ''}
 <h2>Files</h2>
 <p><a href="patch.txt">patch.txt</a> · <a href="receipt.json">receipt.json</a> · <a href="containment.txt">containment.txt</a></p>
 
-<footer>Run ${esc(r.taskId ?? task?.id ?? '')} · started ${esc(utcText(r.startedAt))} · Mantis ${esc(r.mantis?.version ?? '')} compared it with ${esc(r.mantis?.comparedWith ?? 'the baseline run')} · prompts ${esc(r.promptVersion ?? '')}</footer>
+<footer>Run ${esc(r.taskId ?? task?.id ?? '')} · started ${esc(utcText(r.startedAt))} · Mantis ${esc(r.mantis?.version ?? '')} compared it with ${esc(r.mantis?.comparedWith ?? 'the baseline run')} · prompts ${esc(r.promptVersion ?? '')}${r.promptVariant && r.promptVariant !== 'neutral' ? ` with the ${esc(r.promptVariant)} task message (a bench arm)` : ''}</footer>
 </main>
 </body>
 </html>

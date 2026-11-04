@@ -47,7 +47,7 @@ const PROBE_CAPS = { maxUsd: 0.25, maxPromptTokens: 400_000 };   // the whole pr
 const PROBE_TIMEOUT_MS = 15 * 60_000;
 const DIFF_SHOWN_BYTES = 200 * 1024;
 const PUBLIC_KEYS = ['id', 'createdAt', 'updatedAt', 'startedAt', 'finishedAt', 'origin', 'state', 'source', 'matrix', 'model',
-  'visionModel', 'gate', 'position', 'step', 'stepTimes', 'sandbox', 'result', 'approvedAt', 'approvedWith', 'publishedAt'];
+  'visionModel', 'gate', 'promptVariant', 'position', 'step', 'stepTimes', 'sandbox', 'result', 'approvedAt', 'approvedWith', 'publishedAt'];
 const MIN_ETA_RUNS = 3;              // an ETA needs this many comparable finished runs (as /api/config's etaText)
 const MAX_PASSPHRASE_TRIES = 5;      // wrong approval passphrases per task before approving it is refused
 const NORMAL_ENDS = ['finish', 'checks', 'turns', 'time', 'no-tools'];
@@ -436,13 +436,14 @@ export function createApp(deps = {}) {
   }
 
   /**
-   * Whether a finished run predicts the next public one: the sample with its own matrix, the default
-   * limits that set its length (checks, turns, wall clock) and a normal end. Smoke tests on one
-   * screen, runs stopped by their budget or by an inference error, and GitHub runs do not count.
+   * Whether a finished run predicts the next public one: the sample with its own matrix, the neutral
+   * task message, the default limits that set its length (checks, turns, wall clock) and a normal
+   * end. Smoke tests on one screen, pressure-arm runs, runs stopped by their budget or by an inference
+   * error, and GitHub runs do not count.
    */
   function comparableRun(rec, receipt) {
     const s = rec.source?.kind === 'sample' && Object.hasOwn(SAMPLES, rec.source.name) ? SAMPLES[rec.source.name] : null;
-    if (!s) return false;
+    if (!s || (rec.promptVariant ?? 'neutral') !== 'neutral') return false;
     const same = (a, b) => Array.isArray(a) && a.length === b.length && a.every((x, i) => x === b[i]);
     if (!['routes', 'viewports', 'schemes', 'locales'].every((k) => same(rec.matrix?.[k], s[k]))) return false;
     const def = config.get().caps ?? {};
@@ -453,16 +454,17 @@ export function createApp(deps = {}) {
   function createTask(origin, spec, key) {
     const id = `t_${randomBytes(16).toString('hex')}`;
     const ownerToken = randomBytes(32).toString('base64url');
+    const promptVariant = spec.promptVariant ?? 'neutral';
     store.create({
       id, origin, label: spec.label, state: 'queued',
       source: spec.source, matrix: spec.matrix, model: spec.model, sampling: spec.sampling,
-      visionModel: spec.visionModel, gate: spec.gate, caps: spec.caps,
+      visionModel: spec.visionModel, gate: spec.gate, promptVariant, caps: spec.caps,
       position: null, step: 'queue', stepTimes: {}, sandbox: null, result: null,
       startedAt: null, finishedAt: null, approvedAt: null, publishedAt: null,
       private: { ipKey: key, ownerTokenSha256: sha256(ownerToken) },
     });
     emit(id, 'step', { step: 'queue', status: 'start' });
-    journal(id, `created origin=${origin} source=${spec.source.kind}:${spec.source.label} model=${spec.model} gate=${spec.gate ? 'on' : 'off'}${spec.label ? ` label=${spec.label}` : ''}`);
+    journal(id, `created origin=${origin} source=${spec.source.kind}:${spec.source.label} model=${spec.model} gate=${spec.gate ? 'on' : 'off'} prompt=${promptVariant}${spec.label ? ` label=${spec.label}` : ''}`);
     try {
       queue.enqueue(id, { priority: spec.priority, run: (signal) => runOne(id, signal) });
     } catch (err) {
@@ -483,7 +485,10 @@ export function createApp(deps = {}) {
     } else {
       source = { kind: 'github', owner: s.owner, name: s.name, label: s.label };
     }
-    return { id: rec.id, source, matrix: rec.matrix, model: rec.model, sampling: rec.sampling, visionModel: rec.visionModel, gate: rec.gate, caps: rec.caps };
+    return {
+      id: rec.id, source, matrix: rec.matrix, model: rec.model, sampling: rec.sampling, visionModel: rec.visionModel, gate: rec.gate,
+      promptVariant: rec.promptVariant ?? 'neutral', caps: rec.caps,
+    };
   }
 
   /** Events from the loop: stored and streamed; `step` also updates the record. `done` is the app's own. */

@@ -98,7 +98,7 @@ function fakeReceipt(task) {
     summary: { text: 'Fake run.', note: "the model's own words, not measured" },
     containment: { runtime: 'runc', sandbox: 'ring-00000000', limits: { memory: '3g', cpus: '2', pids: 512 }, network: 'ring-internal → ring-proxy (allowlist)', destroyed: true, goneCheck: 'docker ps -a: gone' },
     mantis: { version: '0.7.1', baselineRunId: '2026-11-04T05-00-00', finalRunId: '2026-11-04T05-01-00', comparedWith: 'baseline run (R0)' },
-    verdict: 'pass', publishable: false, promptVersion: 'ring-1',
+    verdict: 'pass', publishable: false, promptVersion: 'ring-2', promptVariant: task.promptVariant ?? 'neutral',
   };
 }
 
@@ -323,6 +323,30 @@ try {
   check('admin tasks are validated: maxUsd over $2 and a model outside allowedModels → 400', overCap.status === 400 && badModel.status === 400 && plainError(overCap),
     `${overCap.status} ${oneLine(overCap.json?.error)}; ${badModel.status} ${oneLine(badModel.json?.error)}`);
 
+  // The bench's pressure arm, admin only: the loop gets promptVariant pressure, and the run says so.
+  const pressured = await admin('POST', '/admin/tasks', { body: { sample: 'lumen', promptVariant: 'pressure', label: 'pressure arm' } });
+  const pressuredId = pressured.json?.id;
+  if (pressuredId) await settle(pressuredId);
+  const pressuredSeen = fake.seen.find((t) => t.id === pressuredId);
+  const pressuredView = pressuredId ? recordOf((await visitor('203.0.113.12', 'GET', `/api/tasks/${pressuredId}`)).json) : null;
+  const badVariant = await admin('POST', '/admin/tasks', { body: { sample: 'lumen', promptVariant: 'cheat' } });
+  check('an admin task may ask for the pressure task message: the loop gets it, and the run page and its receipt say so; an unknown variant → 400',
+    pressured.status === 202 && pressuredSeen?.promptVariant === 'pressure' && pressuredView?.promptVariant === 'pressure' && pressuredView?.receipt?.promptVariant === 'pressure'
+      && seen?.promptVariant === 'neutral' && badVariant.status === 400 && /promptVariant/.test(badVariant.json?.error ?? ''),
+    `${pressured.status}; loop got ${pressuredSeen?.promptVariant}; page ${pressuredView?.promptVariant}; receipt ${pressuredView?.receipt?.promptVariant}; default ${seen?.promptVariant}; unknown → ${badVariant.status} ${oneLine(badVariant.json?.error)}`);
+  if (pressuredId) {
+    const pb = await admin('GET', `/admin/tasks/${pressuredId}/bundle`);
+    const member = (name) => { try { return JSON.parse(spawnSync('tar', ['-xOf', '-', `./${name}`], { input: pb.buf }).stdout.toString()); } catch { return null; } };
+    check('the bundle of a pressure-arm task records it in task.json and receipt.json', pb.status === 200 && member('task.json')?.promptVariant === 'pressure' && member('receipt.json')?.promptVariant === 'pressure',
+      `${pb.status}; task.json ${member('task.json')?.promptVariant}; receipt.json ${member('receipt.json')?.promptVariant}`);
+    // Public runs always get the neutral message, so a pressure-arm run never sets the ETA they show.
+    let early = [];
+    try { early = JSON.parse(await readFile(path.join(config.STATE_DIR, 'stats.json'), 'utf8')); } catch { early = []; }
+    const flag = (tid) => early.find((r) => r.id === tid)?.comparable;
+    check('a pressure-arm run never sets the ETA (stats.json: the default admin run yes, the pressure run no)', flag(id) === true && flag(pressuredId) === false,
+      `default ${flag(id)}, pressure ${flag(pressuredId)}`);
+  }
+
   // --- A5: approve and patch -------------------------------------------------------------------------
   if (!id || state !== 'done') {
     skip('A5 approve and patch checks', 'the admin task did not finish');
@@ -440,14 +464,16 @@ try {
   const loopIp = await visitor('127.0.0.1', 'POST', '/api/tasks', { body: { sample: 'lumen' } });
   check('task creation from a private or loopback client address → 403', privateIp.status === 403 && loopIp.status === 403, `10.1.2.3 → ${privateIp.status}; 127.0.0.1 → ${loopIp.status}`);
 
-  const lastEntry = await visitor('10.9.9.9, 203.0.113.30', 'POST', '/api/tasks', { body: { sample: 'lumen' } });
+  // The body also asks for what only an admin task may choose: the gate off, another model, the pressure message.
+  const lastEntry = await visitor('10.9.9.9, 203.0.113.30', 'POST', '/api/tasks', { body: { sample: 'lumen', gate: false, model: 'glm-5.3', promptVariant: 'pressure' } });
   const lastId = lastEntry.json?.id;
   const lastSeen = fake.seen.find((t) => t.id === lastId);
   check('the client address is the last X-Forwarded-For entry (a spoofed first entry is ignored)', lastEntry.status === 202, `${lastEntry.status} ${oneLine(lastEntry.json?.error)}`);
   if (lastId) await settle(lastId);
-  check('a public task always has the gate on, the configured model and at most $0.60',
-    lastSeen?.gate === true && lastSeen?.model === config.get().fixModel && typeof lastSeen?.caps?.maxUsd === 'number' && lastSeen.caps.maxUsd <= 0.6,
-    `gate ${lastSeen?.gate}, model ${lastSeen?.model}, maxUsd ${lastSeen?.caps?.maxUsd}`);
+  check('a public task always has the gate on, the configured model, the neutral task message and at most $0.60, whatever its body asks',
+    lastSeen?.gate === true && lastSeen?.model === config.get().fixModel && lastSeen?.promptVariant === 'neutral'
+      && typeof lastSeen?.caps?.maxUsd === 'number' && lastSeen.caps.maxUsd <= 0.6,
+    `gate ${lastSeen?.gate}, model ${lastSeen?.model}, task message ${lastSeen?.promptVariant}, maxUsd ${lastSeen?.caps?.maxUsd}`);
 
   // A public run's owner token went only to the browser that started it: with a passphrase set on the
   // server, that owner still approves the run with the token alone, and gets the patch.
@@ -627,8 +653,10 @@ try {
   let rows = [];
   try { rows = JSON.parse(await readFile(path.join(config.STATE_DIR, 'stats.json'), 'utf8')); } catch { rows = []; }
   const rowOf = (tid) => rows.find((r) => r.id === tid);
+  // stats.json keeps the last 20 runs, so this compares two recent ones: a default admin run and the smoke test.
   check('stats.json marks which finished runs may set the ETA (the full sample matrix: yes; one screen: no)',
-    rowOf(id)?.comparable === true && rowOf(smoke.json?.id)?.comparable === false, `default ${rowOf(id)?.comparable}, one screen ${rowOf(smoke.json?.id)?.comparable}`);
+    rowOf(linkAdmin.json?.id)?.comparable === true && rowOf(smoke.json?.id)?.comparable === false,
+    `default ${rowOf(linkAdmin.json?.id)?.comparable}, one screen ${rowOf(smoke.json?.id)?.comparable}`);
   const zero = await admin('POST', '/admin/tasks', { body: { sample: 'lumen', caps: { maxUsd: 0 } } });
   check('caps.maxUsd 0 is refused at creation (400), as the loop would refuse it', zero.status === 400 && /maxUsd/.test(zero.json?.error ?? ''), `${zero.status} ${oneLine(zero.json?.error)}`);
   const busy = await admin('GET', '/admin/busy');

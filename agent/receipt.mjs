@@ -120,7 +120,8 @@ function runLabel(inferenceUrl, runtime, startedAt) {
  *   phasesMs: Record<string, number>, patch: string, patchApplies: boolean|null, patchTruncated?: boolean,
  *   proof: string|null, vision: object|null, summary: string,
  *   containment: {runtime: string, sandbox: string, limits: object, network: string, destroyed: boolean, goneCheck: string, goneAt: string|null},
- *   inferenceUrl: string, promptVersion: string }} input
+ *   inferenceUrl: string, promptVersion: string, promptVariant?: 'neutral'|'pressure' }} input
+ *   promptVariant: the task message the model got (default neutral; pressure is the bench's admin-only arm)
  * @returns {object}
  */
 export function buildReceipt(input) {
@@ -194,6 +195,7 @@ export function buildReceipt(input) {
     verdict: null,
     publishable: false,
     promptVersion: input.promptVersion,
+    promptVariant: typeof input.promptVariant === 'string' && input.promptVariant ? input.promptVariant : 'neutral',
   };
   receipt.verdict = verdictOf(receipt);
   receipt.publishable = isPublishable(receipt);
@@ -295,6 +297,6 @@ export function receiptMarkdown(receipt) {
 
   const k = r.containment ?? {};
   out.push('## Containment', '', `Runtime ${code(k.runtime)} · sandbox ${code(k.sandbox)} · ${k.limits?.memory ?? '—'} RAM, ${k.limits?.cpus ?? '—'} CPUs, ${k.limits?.pids ?? '—'} processes · network ${k.network ?? '—'} · ${k.destroyed ? `destroyed · ${k.goneCheck ?? 'docker ps -a: gone'}` : 'NOT confirmed destroyed'}${k.goneAt ? ` at ${k.goneAt}` : ''}`, '');
-  out.push('## Mantis', '', `Mantis ${r.mantis?.version ?? MANTIS_VERSION} · baseline run ${code(r.mantis?.baselineRunId ?? '—')} · final run ${code(r.mantis?.finalRunId ?? '—')} · compared with the ${r.mantis?.comparedWith ?? 'baseline run (R0)'} · prompt ${r.promptVersion ?? '—'}`, '');
+  out.push('## Mantis', '', `Mantis ${r.mantis?.version ?? MANTIS_VERSION} · baseline run ${code(r.mantis?.baselineRunId ?? '—')} · final run ${code(r.mantis?.finalRunId ?? '—')} · compared with the ${r.mantis?.comparedWith ?? 'baseline run (R0)'} · prompt ${r.promptVersion ?? '—'}, ${r.promptVariant ?? 'neutral'} task message`, '');
   return out.join('\n');
 }

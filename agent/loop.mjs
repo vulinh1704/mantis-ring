@@ -17,7 +17,7 @@
 import { BudgetError, INFERENCE_URL, PROVIDER, priceOf } from './inference.mjs';
 import { PINNED_AT } from './prices.mjs';
 import {
-  PROMPT_VERSION, checkMessage, compactedToolResult, editsLockedMessage, forcedCheckPreamble, lastCheckMessage,
+  PROMPT_VARIANTS, PROMPT_VERSION, checkMessage, compactedToolResult, editsLockedMessage, forcedCheckPreamble, lastCheckMessage,
   noChangeMessage, nudgeMessage, systemPrompt, taskMessage,
 } from './prompt.mjs';
 import { buildReceipt, diffStats, receiptLine, receiptMarkdown } from './receipt.mjs';
@@ -341,6 +341,9 @@ function checkTask(task, deps) {
   }
   if (m.routes.length === 0) throw new Error('task.matrix.routes is empty');
   if (typeof task.model !== 'string' || task.model === '') throw new Error('task.model is missing');
+  if (task.promptVariant !== undefined && task.promptVariant !== null && !PROMPT_VARIANTS.includes(task.promptVariant)) {
+    throw new Error(`task.promptVariant must be one of ${PROMPT_VARIANTS.join(', ')}`);
+  }
   if (typeof deps?.chat !== 'function' || typeof deps.createSandbox !== 'function' || typeof deps.store?.put !== 'function') {
     throw new Error('runFix needs deps.chat, deps.createSandbox and deps.store.put');
   }
@@ -352,6 +355,7 @@ class FixRun {
     this.task = task;
     this.deps = deps ?? {};
     this.caps = null;
+    this.variant = 'neutral'; // the task message's variant, set from task.promptVariant once the task is checked
     // Set by run(): start, hard deadline, soft stop, the time a final check needs, the time kept for
     // wrap-up, and the least time before the soft stop that a model call may start with.
     this.t0 = 0; this.deadline = 0; this.soft = 0; this.finalCheckMargin = 0; this.reserveMs = 0; this.minCallMs = 0;
@@ -482,6 +486,7 @@ class FixRun {
     try {
       this.caps = resolveCaps(this.task?.caps, { github: this.task?.source?.kind === 'github' });
       checkTask(this.task, this.deps);
+      this.variant = this.task.promptVariant ?? 'neutral';
     } catch (err) {
       error = `The task settings are invalid: ${firstLine(err.message)}`;
       this.journal(error);
@@ -693,12 +698,14 @@ class FixRun {
     this.say(`workspace ready · base snapshot ${this.base.slice(0, 12)}${this.upstream ? ` on top of commit ${this.upstream.slice(0, 12)}` : ''}`);
     this.tools = fileTools(this.box, { onWrite: (rel, info) => this.onWrite(rel, info) });
 
+    // The same system prompt and tools in every arm; the pressure arm changes only the task message.
+    if (this.variant !== 'neutral') this.journal(`task message: the ${this.variant} variant (an admin bench arm)`);
     this.push({ role: 'system', content: systemPrompt({ maxChecks: caps.maxChecks }) });
     this.push({
       role: 'user',
       content: taskMessage({
         projectLabel: task.source.label || task.source.name, serverKind: this.serverKind, port: this.matrixArgs?.port ?? PORT, matrix: task.matrix,
-        report: this.R0.report, maxChecks: caps.maxChecks,
+        report: this.R0.report, maxChecks: caps.maxChecks, variant: this.variant,
       }),
     });
 
@@ -1405,7 +1412,7 @@ class FixRun {
       turns: this.turns, toolCalls: this.toolCalls, invalidToolCalls: this.invalidCalls, toolErrors: this.toolErrors,
       phasesMs: this.phases, patch: this.patch, patchApplies: this.patchOk, patchTruncated: this.patchTruncated,
       proof: this.proof, vision, summary: this.summary, containment: this.containment,
-      inferenceUrl: INFERENCE_URL, promptVersion: PROMPT_VERSION,
+      inferenceUrl: INFERENCE_URL, promptVersion: PROMPT_VERSION, promptVariant: this.variant,
     });
     this.receipt = receipt;
     await this.save('receipt.json', `${JSON.stringify(receipt, null, 2)}\n`);
@@ -1429,7 +1436,8 @@ class FixRun {
  * @typedef {{ id:string,
  *   source: {kind:'sample', name:string, dir:string, label:string} | {kind:'github', owner:string, name:string, label:string},
  *   matrix: Matrix, model:string, sampling:{temperature?:number, topP?:number, seed?:number},
- *   visionModel: string|null, gate: boolean, caps: Partial<Caps> }} FixTask
+ *   visionModel: string|null, gate: boolean, caps: Partial<Caps>,
+ *   promptVariant?: 'neutral'|'pressure' }} FixTask  promptVariant: the task message (default neutral; pressure is admin only)
  * @typedef {{ status:'done'|'failed'|'timeout'|'cancelled', receipt: object|null, error?: string }} FixResult
  */
 

@@ -7,6 +7,7 @@ import { EventEmitter } from 'node:events';
 import { randomBytes } from 'node:crypto';
 import { appendFileSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { PROMPT_VARIANTS } from '../agent/prompt.mjs';
 import {
   CAP_RANGES, GITHUB_WALL_CLOCK_SEC, LOCALES, SAMPLES, SCHEMES, VIEWPORTS,
   checkCaps, checkSampling, isModelId, samplingFor,
@@ -479,7 +480,7 @@ export class RunStats {
 const REPO = /^https:\/\/github\.com\/([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/([A-Za-z0-9._-]{1,100}?)(?:\.git)?\/?$/;
 const ROUTE = /^\/[A-Za-z0-9._~!$&'()*+;=:@%/-]{0,100}$/;
 const LABEL = /^[A-Za-z0-9 ._:+-]{1,80}$/;
-const ADMIN_KEYS = new Set(['sample', 'repo', 'routes', 'viewports', 'schemes', 'locales', 'model', 'visionModel', 'gate', 'caps', 'sampling', 'label', 'priority']);
+const ADMIN_KEYS = new Set(['sample', 'repo', 'routes', 'viewports', 'schemes', 'locales', 'model', 'visionModel', 'gate', 'caps', 'sampling', 'label', 'priority', 'promptVariant']);
 export const SAY_BAD_REPO = 'Only public repositories on github.com are supported, written as https://github.com/owner/name.';
 export const SAY_REPO_PAGE = "Give the repository's own address, https://github.com/owner/name, not a link to a branch, folder, file or other page in it.";
 export const SAY_BAD_MATRIX = 'Routes must be paths like /pricing (up to 3); languages must come from the list.';
@@ -526,8 +527,10 @@ function pick(v, allowed, max, sentence) {
 /**
  * Validate a POST /api/tasks (public) or /admin/tasks (admin) body against the sample allowlist, the
  * input limits and the admin maxima. Returns the task fields; throws TaskInputError with one sentence.
+ * A public body may name only the project, routes and languages: everything else is fixed, so a
+ * public task always has the gate on and the neutral task message, whatever else the body says.
  * @returns {{source:object, matrix:object, model:string, sampling:object, visionModel:string|null,
- *            gate:boolean, caps:object, label:string|null, priority:boolean}}
+ *            gate:boolean, caps:object, label:string|null, priority:boolean, promptVariant:'neutral'|'pressure'}}
  */
 export function taskFromBody(body, { admin = false, cfg }) {
   if (!isObject(body)) throw new TaskInputError('Send a JSON object.');
@@ -563,11 +566,12 @@ export function taskFromBody(body, { admin = false, cfg }) {
     const model = cfg.fixModel;
     return {
       source, matrix, model, sampling: samplingFor(model, cfg), visionModel: cfg.visionModel ?? null,
-      gate: true, caps: capsFor(source, cfg.caps), label: null, priority: false,
+      gate: true, caps: capsFor(source, cfg.caps), label: null, priority: false, promptVariant: 'neutral',
     };
   }
 
-  // Admin only: screen sizes, schemes, model choice, the gate switch, caps, sampling, label, priority.
+  // Admin only: screen sizes, schemes, model choice, the gate switch, caps, sampling, label, priority,
+  // and the task message's variant (the bench's pressure arm).
   matrix.viewports = pick(body.viewports, VIEWPORTS, VIEWPORTS.length, `viewports must come from: ${VIEWPORTS.join(', ')}.`) ?? matrix.viewports;
   matrix.schemes = pick(body.schemes, SCHEMES, SCHEMES.length, `schemes must come from: ${SCHEMES.join(', ')}.`) ?? matrix.schemes;
 
@@ -605,8 +609,12 @@ export function taskFromBody(body, { admin = false, cfg }) {
     throw new TaskInputError('label must be 1 to 80 letters, digits, spaces or . _ : + -');
   }
   if (body.priority !== undefined && typeof body.priority !== 'boolean') throw new TaskInputError('priority must be true or false.');
+  const promptVariant = body.promptVariant ?? 'neutral';
+  if (!PROMPT_VARIANTS.includes(promptVariant)) throw new TaskInputError(`promptVariant must be one of: ${PROMPT_VARIANTS.join(', ')}.`);
 
-  return { source, matrix, model, sampling, visionModel, gate: body.gate ?? true, caps, label: body.label ?? null, priority: body.priority ?? false };
+  return {
+    source, matrix, model, sampling, visionModel, gate: body.gate ?? true, caps, label: body.label ?? null, priority: body.priority ?? false, promptVariant,
+  };
 }
 
 /** Default caps for a source: 15 minutes for a sample, 20 for a GitHub repository (§2.4). */

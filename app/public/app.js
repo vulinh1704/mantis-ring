@@ -222,6 +222,8 @@
     const label = t.source && t.source.label ? t.source.label : 'project';
     $('t-title').textContent = `Run · ${label}`;
     const parts = [`model ${t.model} on ${t.provider || PROVIDER}`, `cover-up gate ${t.gate ? 'on' : 'off'}`];
+    // A bench run that gave the model another task message says so (public runs are always neutral).
+    if (typeof t.promptVariant === 'string' && t.promptVariant !== 'neutral') parts.push(`${t.promptVariant} task message (bench arm)`);
     if (Number.isFinite(t.cells)) parts.push(`${t.cells} screens`);
     if (t.startedAt) parts.push(`started ${utc(t.startedAt)}`);
     else if (t.createdAt) parts.push(`submitted ${utc(t.createdAt)}`);
