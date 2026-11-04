@@ -328,9 +328,10 @@ function sseFrame(type, data, seq) {
  * what it fakes (usually runFix, spend and a temporary RING_STATE_DIR). `probe` is agent/probe.mjs
  * (probeAll); `vision` is visionCheck from agent/vision.mjs, to which each task adds its own chat,
  * tally and guard. Without them, /admin/probe answers 503 and runs skip the vision check.
- * `approval.passphraseSha256` (hex; read at call time, so a test may change it): when set, Approve
- * also needs the owner's approval passphrase, which the operator of the admin channel never holds.
- * Without it, the owner link alone approves, and the published page says exactly that.
+ * `approval.passphraseSha256` (hex; read at call time, so a test may change it): when set, approving an
+ * admin run, or a run that has been published, also needs the owner's approval passphrase, which the
+ * operator of the admin channel never holds. A public run is approved with its own owner link, and so
+ * is every run while no passphrase is set; the record and the published page then say exactly that.
  * @param {{config?:{get():object, set(patch:object):object}, store?:TaskStore, queue?:Queue, spend?:object|null,
  *   runFix?:Function|null, publish?:typeof publishLatest, status?:{statusData:Function, statusHtml:Function},
  *   now?:() => number, probe?:{probeAll:Function}|null, vision?:Function|null, stats?:RunStats, log?:(line:string) => void,
@@ -363,6 +364,20 @@ export function createApp(deps = {}) {
   const approvalHash = () => {
     const h = approval?.passphraseSha256;
     return typeof h === 'string' && /^[0-9a-f]{64}$/i.test(h) ? h.toLowerCase() : null;
+  };
+
+  /**
+   * The passphrase hash that approving this run needs, or null when its owner link alone approves it.
+   * An admin run needs the passphrase: the operator who started it holds its owner link too. So does
+   * a run that has been published (it is on /latest/, or was), because its approval is shown there,
+   * and approving the run on /latest/ renders that page again. A public run's owner token went only to
+   * the browser that started it, so its owner approves it with that link, as before.
+   */
+  const passphraseFor = (rec) => {
+    const want = approvalHash();
+    if (!want) return null;
+    const published = Boolean(rec?.publishedAt) || readLatest()?.taskId === rec?.id;
+    return rec?.origin === 'public' && !published ? null : want;
   };
 
   const journal = (id, text) => log(`task=${id} ${oneLine(text, 400)}`);
@@ -599,7 +614,7 @@ export function createApp(deps = {}) {
       out.etaSec = etaFor(rec.id);
     }
     out.hasPatch = rec.state === 'done' && store.size(rec.id, 'patch.diff') > 0;
-    out.approvalNeedsPassphrase = approvalHash() !== null;
+    out.approvalNeedsPassphrase = passphraseFor(rec) !== null;
     out.files = store.names(rec.id, TASK_IMAGE);
     if (full && FINISHED.has(rec.state)) {
       out.receipt = readReceipt(rec.id);
@@ -716,10 +731,13 @@ export function createApp(deps = {}) {
   }
 
   /**
-   * Approve (§4.2). The owner token alone cannot prove a person: the admin channel that created the
-   * task holds it too, and could send it through Caddy. So the admin channel is refused outright, and
-   * when the owner has set an approval passphrase on the server (RING_APPROVE_PASSPHRASE_SHA256 in the
-   * service's environment, which the operator cannot read), Approve also needs that passphrase. The
+   * Approve (§4.2). The admin channel is refused outright. The owner token of an admin run cannot
+   * prove a person: the admin channel that created the run holds it too, and could send it through
+   * Caddy. So when the owner has set an approval passphrase on the server
+   * (RING_APPROVE_PASSPHRASE_SHA256 in the service's environment, which the operator cannot read),
+   * approving an admin run needs that passphrase, and so does approving a published run, whose
+   * approval /latest/ shows (passphraseFor). A public run's token went only to the browser that
+   * started it, so its owner approves it with that token alone, and can then download the patch. The
    * record keeps which of the two approved the run, and the published page says no more than that.
    */
   async function approveTask(c) {
@@ -730,7 +748,7 @@ export function createApp(deps = {}) {
     if (rec.state !== 'done' || store.size(rec.id, 'patch.diff') <= 0) throw new HttpError(403, 'Only a finished run with a patch can be approved.');
     let approvedAt = rec.approvedAt;
     if (!approvedAt) {
-      const want = approvalHash();
+      const want = passphraseFor(rec);
       if (want) {
         const tries = passphraseTries.get(rec.id) ?? 0;
         if (tries >= MAX_PASSPHRASE_TRIES) throw new HttpError(403, 'Too many wrong passphrases for this run. It can be approved again after the demo restarts.');
@@ -1173,7 +1191,9 @@ async function main() {
   const approveHash = String(process.env.RING_APPROVE_PASSPHRASE_SHA256 ?? '').trim();
   const approval = { passphraseSha256: /^[0-9a-f]{64}$/i.test(approveHash) ? approveHash : null };
   if (approveHash && !approval.passphraseSha256) log('startup: RING_APPROVE_PASSPHRASE_SHA256 is not 64 hex digits, so it is ignored');
-  log(`startup: approval ${approval.passphraseSha256 ? 'needs the owner link and the approval passphrase' : 'needs the owner link only (no approval passphrase is set)'}`);
+  log(`startup: approval ${approval.passphraseSha256
+    ? 'needs the owner link and the approval passphrase for admin runs and published runs; a public run needs only its owner link'
+    : 'needs the owner link only (no approval passphrase is set)'}`);
 
   const app = createApp({
     config: configModule, store, spend, log, approval,

@@ -9,7 +9,7 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import http from 'node:http';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -323,13 +323,13 @@ try {
     check('A5 Approve with a wrong token → 403', wrong.status === 403, `${wrong.status}`);
     const byAdmin = await admin('POST', `/api/tasks/${id}/approve`, { body: {} });
     check('A5 an admin call without the owner token cannot approve (403)', byAdmin.status === 403, `${byAdmin.status}`);
-    // The operator who created the task holds its owner token. With a passphrase set, the token alone
-    // approves nothing: not through Caddy, and not over SSH to 127.0.0.1 with a made-up X-Forwarded-For.
+    // The operator who created this admin task holds its owner token. With a passphrase set, the token
+    // alone approves nothing: not through Caddy, and not over SSH to 127.0.0.1 with a made-up X-Forwarded-For.
     const tokenOnly = await visitor('203.0.113.9', 'POST', `/api/tasks/${id}/approve`, { body: {}, headers: owner });
     const spoofed = await admin('POST', `/api/tasks/${id}/approve`, { body: {}, headers: { ...owner, 'x-forwarded-for': '1.1.1.1' } });
     const wrongPass = await visitor('203.0.113.9', 'POST', `/api/tasks/${id}/approve`, { body: { passphrase: 'not it' }, headers: owner });
     const still = recordOf((await admin('GET', `/admin/tasks/${id}`)).json);
-    check('A5 with an approval passphrase set, the owner token alone cannot approve (via Caddy, or admin + token + spoofed XFF): 403',
+    check('A5 an admin run, with an approval passphrase set: its owner token alone cannot approve (via Caddy, or admin + token + spoofed XFF): 403',
       tokenOnly.status === 403 && spoofed.status === 403 && wrongPass.status === 403 && !still?.approvedAt,
       `token only ${tokenOnly.status}, admin+token+XFF ${spoofed.status}, wrong passphrase ${wrongPass.status}; approvedAt ${still?.approvedAt ?? 'none'}`);
     const ok = await visitor('203.0.113.9', 'POST', `/api/tasks/${id}/approve`, { body: { passphrase: PASSPHRASE }, headers: owner });
@@ -417,6 +417,45 @@ try {
     lastSeen?.gate === true && lastSeen?.model === config.get().fixModel && typeof lastSeen?.caps?.maxUsd === 'number' && lastSeen.caps.maxUsd <= 0.6,
     `gate ${lastSeen?.gate}, model ${lastSeen?.model}, maxUsd ${lastSeen?.caps?.maxUsd}`);
 
+  // A public run's owner token went only to the browser that started it: with a passphrase set on the
+  // server, that owner still approves the run with the token alone, and gets the patch.
+  if (!lastId || !lastEntry.json?.ownerToken) {
+    skip('approval of a public run with its owner link', 'the public task from the XFF check did not start');
+  } else {
+    const pubOwner = { 'x-ring-owner': lastEntry.json.ownerToken };
+    const pubBefore = recordOf((await visitor('203.0.113.30', 'GET', `/api/tasks/${lastId}`)).json);
+    const pubApprove = await visitor('203.0.113.30', 'POST', `/api/tasks/${lastId}/approve`, { body: {}, headers: pubOwner });
+    const pubPatch = await visitor('203.0.113.30', 'GET', `/api/tasks/${lastId}/patch`, { headers: pubOwner });
+    const pubAfter = recordOf((await visitor('203.0.113.30', 'GET', `/api/tasks/${lastId}`)).json);
+    check('a public run is approved with its own owner link while a passphrase is set (none is asked), recorded as owner-link; its owner then downloads the patch',
+      approvalCfg.passphraseSha256 !== null && pubBefore?.approvalNeedsPassphrase === false && pubApprove.status === 200
+        && pubAfter?.approvedWith === 'owner-link' && pubPatch.status === 200 && pubPatch.text === PATCH,
+      `asks for a passphrase: ${pubBefore?.approvalNeedsPassphrase}; approve ${pubApprove.status} ${oneLine(pubApprove.json?.error)}; approvedWith ${pubAfter?.approvedWith}; patch ${pubPatch.status}`);
+  }
+
+  // A public run on /latest/ is another matter: its approval is shown there, so it needs the passphrase.
+  const shown = await visitor('203.0.113.31', 'POST', '/api/tasks', { body: { sample: 'lumen' } });
+  const shownId = shown.json?.id;
+  if (!shownId) {
+    skip('approval of a published public run', `the public task did not start (${shown.status})`);
+  } else {
+    await settle(shownId);
+    const latestFile = path.join(config.STATE_DIR, 'latest.json');
+    await writeFile(latestFile, `${JSON.stringify({ taskId: shownId, at: new Date().toISOString(), line: '1 fixed · 0 new · 0 cover-ups · 0 lost' })}\n`);
+    try {
+      const shownOwner = { 'x-ring-owner': shown.json.ownerToken };
+      const asks = recordOf((await visitor('203.0.113.31', 'GET', `/api/tasks/${shownId}`)).json)?.approvalNeedsPassphrase;
+      const linkOnly = await visitor('203.0.113.31', 'POST', `/api/tasks/${shownId}/approve`, { body: {}, headers: shownOwner });
+      const withPass = await visitor('203.0.113.31', 'POST', `/api/tasks/${shownId}/approve`, { body: { passphrase: PASSPHRASE }, headers: shownOwner });
+      const shownRec = recordOf((await admin('GET', `/admin/tasks/${shownId}`)).json);
+      check('a public run that is on /latest/ needs the passphrase too: its owner link alone → 403, with the passphrase → approved as passphrase',
+        asks === true && linkOnly.status === 403 && withPass.status === 200 && shownRec?.approvedWith === 'passphrase',
+        `asks ${asks}; link only ${linkOnly.status}; with the passphrase ${withPass.status}; approvedWith ${shownRec?.approvedWith}`);
+    } finally {
+      await rm(latestFile, { force: true });
+    }
+  }
+
   // One run in progress per address.
   fake.mode = 'block';
   const first = await visitor('203.0.113.40', 'POST', '/api/tasks', { body: { sample: 'lumen' } });
@@ -457,15 +496,17 @@ try {
   const pubTry = await admin('POST', `/admin/publish/${id ?? 'x'}`, { body: {} });
   check('POST /admin/publish/:id refuses a TEST RUN receipt (409) and publishes nothing', pubTry.status === 409 && published.length === 0, `${pubTry.status} ${oneLine(pubTry.json?.error ?? pubTry.text)}`);
 
-  // Without a passphrase on the server the owner link alone approves, and the record says only that.
+  // Without a passphrase on the server the owner link alone approves an admin run too, and the record says only that.
+  const linkAdmin = await admin('POST', '/admin/tasks', { body: { sample: 'lumen', label: 'approved with the link' } });
+  if (linkAdmin.json?.id) await settle(linkAdmin.json.id);
   approvalCfg.passphraseSha256 = null;
-  const linkTask = lastEntry.json?.ownerToken ? lastId : null;
-  if (!linkTask) {
-    skip('approval with the owner link only', 'the public task from the XFF check did not start');
+  if (!linkAdmin.json?.ownerToken) {
+    skip('approval of an admin run with the owner link only', `the admin task did not start (${linkAdmin.status})`);
   } else {
-    const viaLink = await visitor('203.0.113.30', 'POST', `/api/tasks/${linkTask}/approve`, { body: {}, headers: { 'x-ring-owner': lastEntry.json.ownerToken } });
-    const linkRec = recordOf((await visitor('203.0.113.30', 'GET', `/api/tasks/${linkTask}`)).json);
-    check('without an approval passphrase the owner link approves, recorded as approvedWith owner-link',
+    const linkTask = linkAdmin.json.id;
+    const viaLink = await visitor('203.0.113.32', 'POST', `/api/tasks/${linkTask}/approve`, { body: {}, headers: { 'x-ring-owner': linkAdmin.json.ownerToken } });
+    const linkRec = recordOf((await visitor('203.0.113.32', 'GET', `/api/tasks/${linkTask}`)).json);
+    check('without an approval passphrase the owner link approves an admin run, recorded as approvedWith owner-link',
       viaLink.status === 200 && linkRec?.approvedWith === 'owner-link' && linkRec?.approvalNeedsPassphrase === false, `${viaLink.status}; approvedWith ${linkRec?.approvedWith}`);
   }
 
