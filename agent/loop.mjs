@@ -43,6 +43,12 @@ const ADMIN_MAX = {
   maxPromptTokens: 3_000_000, maxUsd: 2, wallClockSec: 2400, lookTimeoutSec: 600,
 };
 const GITHUB_WALL_CLOCK_SEC = 1200;
+/**
+ * How many route × viewport groups a look of a GitHub task opens at once (Mantis's default is 3).
+ * On 4 Nov a Next.js 16 app's dev server and files held 1.98 GB of the sandbox's 3 GB before the
+ * first look, and four pages at once took the rest within 6 s.
+ */
+export const GITHUB_LOOK_CONCURRENCY = 1;
 const PORT = 3000;
 const SUMMARY_MAX = 1500;
 const PATCH_MAX = 1_048_576;
@@ -590,6 +596,9 @@ class FixRun {
     const list = (a) => (a.length ? a.join(',') : undefined);
     this.matrixArgs = { port: PORT, routes: list(m.routes) };
     for (const k of ['viewports', 'schemes', 'locales']) if (list(m[k])) this.matrixArgs[k] = list(m[k]);
+    // A GitHub project's own dev server shares the sandbox's memory with Mantis's browser, so its
+    // looks open one route × viewport group at a time (its light and dark pages together).
+    if (s.kind === 'github') this.matrixArgs.concurrency = GITHUB_LOOK_CONCURRENCY;
 
     const tc = Date.now();
     this.step('clone', 'start');

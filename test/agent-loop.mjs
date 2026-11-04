@@ -910,6 +910,20 @@ async function u12() {
   check('U12 install failures: off-allowlist hosts are named, a private package, no space, a Node version, time, memory; a refused allowlisted host is not called off-allowlist',
     sentenceOk, JSON.stringify(sentences));
 
+  // The proxy's own refusal ("403 Filtered", from tinyproxy) as npm, pnpm and yarn report it (omni-tools on 4 Nov: xlsx from cdn.sheetjs.com).
+  const npmLog = '/home/ring/.npm/_logs/2026-11-04T07_50_59_123Z-debug-0.log';
+  const refused = {
+    npm: installFailure(`npm error code E403\nnpm error 403 403 Filtered - GET https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz\nnpm error 403\nnpm error 403 In most cases, you or one of your dependencies are requesting\nnpm error 403 a package version that is forbidden by your security policy, or\nnpm error 403 on a server you do not have access to.\nnpm error A complete log of this run can be found in: ${npmLog}`, { code: 1, pm: 'npm' }),
+    pnpm: installFailure(' ERR_PNPM_FETCH_403  GET https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz: Filtered - 403\n\nNo authorization header was set for the request.', { code: 1, pm: 'pnpm' }),
+    yarn: installFailure('error An unexpected error occurred: "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz: Request failed \\"403 Filtered\\"".\ninfo If you think this is a bug, please open a bug report with the information provided in "/work/app/yarn-error.log".\ninfo Visit https://yarnpkg.com/en/docs/cli/install for documentation about this command.', { code: 1, pm: 'yarn' }),
+    unnamed: installFailure('npm error code E403\nnpm error 403 403 Filtered - GET (a URL npm did not print)', { code: 1, pm: 'npm' }),
+    registry: installFailure('npm error code E403\nnpm error 403 403 Forbidden - GET https://registry.npmjs.org/@acme%2fsecret - you do not have permission', { code: 1, pm: 'npm' }),
+  };
+  check('U12 the proxy\'s "403 Filtered" names the host it refused, as npm (E403), pnpm (ERR_PNPM_FETCH_403) and yarn report it, never a host from help text; a 403 from the allowlisted registry is not called off-allowlist',
+    refused.npm === rt.sayOffAllowlist('cdn.sheetjs.com') && refused.pnpm === rt.sayOffAllowlist('cdn.sheetjs.com') && refused.yarn === rt.sayOffAllowlist('cdn.sheetjs.com')
+      && refused.unnamed === rt.sayOffAllowlist('') && refused.registry === rt.sayInstallFailed('npm'),
+    JSON.stringify(refused));
+
   const retries = [
     installRetry({ pm: 'npm', lock: true }, 'npm ci --no-audit --no-fund', 'npm error `npm ci` can only install packages when your package.json and package-lock.json or npm-shrinkwrap.json are in sync.'),
     installRetry({ pm: 'npm' }, 'npm install --no-audit --no-fund', 'npm error code ERESOLVE\nnpm error ERESOLVE unable to resolve dependency tree'),
@@ -1620,6 +1634,58 @@ async function u18() {
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+
+  // A GitHub task's looks open one group at a time: --concurrency reaches mantis only when given, and must be 1 to 16.
+  const scripts = [];
+  const okBox = { exec: async (script) => { scripts.push(script); return { code: 1, stdout: JSON.stringify(fakeReport('2026-11-04T10-00-00', [])), stderr: '', timedOut: false, truncated: false }; } };
+  const one = await look(okBox, { port: 3000, concurrency: 1 }).then((r) => r.runId, (e) => e.message);
+  const dflt = await look(okBox, { port: 3000 }).then((r) => r.runId, (e) => e.message);
+  const bad = await look(okBox, { port: 3000, concurrency: 0 }).then(() => 'accepted', (e) => e.message);
+  check('U18 look(): --concurrency is passed to mantis only when given (the loop gives 1 on the GitHub path), and must be a whole number from 1 to 16',
+    one === '2026-11-04T10-00-00' && dflt === one && /'--concurrency' '1'/.test(scripts[0] ?? '') && !/--concurrency/.test(scripts[1] ?? '') && /invalid concurrency/.test(bad)
+      && loop.GITHUB_LOOK_CONCURRENCY === 1,
+    `${oneLine(scripts[0])} | ${bad}`);
+
+  // After a successful install the download caches go; after a failed one nothing is removed.
+  const installBox = (codes) => { const calls = []; return { calls, exec: async (script) => { calls.push(script); return { code: codes[calls.length - 1] ?? 0, stdout: '', stderr: '', timedOut: false, truncated: false }; } }; };
+  const okInstall = installBox([0]);
+  await rt.installDeps(okInstall, { pmInfo: { pm: 'npm', lock: true, version: null }, install: true, static: false });
+  const failInstall = installBox([1]);
+  await rt.installDeps(failInstall, { pmInfo: { pm: 'npm', lock: true, version: null }, install: true, static: false }).catch(() => {});
+  check('U18 installDeps removes npm\'s and yarn\'s download caches (they sit in the sandbox\'s RAM) after a successful install, and nothing after a failed one',
+    okInstall.calls.length === 2 && okInstall.calls[1] === 'rm -rf -- /home/ring/.npm/_cacache /work/.yarn-cache' && failInstall.calls.length === 1 && !/rm -rf/.test(failInstall.calls.join(' ')),
+    `${okInstall.calls.map((c) => oneLine(c).slice(0, 60)).join(' → ')} | failed install: ${failInstall.calls.length} call(s)`);
+
+  // The warm-up, run with this Node against a small server: the route, then the page's own scripts
+  // and stylesheets ("/…" only), one at a time; never another origin, a protocol-relative or a relative path.
+  const { createServer } = await import('node:http');
+  const { execFile } = await import('node:child_process');
+  const asked = [];
+  const page = '<!doctype html><html><head><link rel="stylesheet" href="/_next/static/chunks/app.css"><link rel="icon" href="/favicon.ico">'
+    + '<link rel="preload" href="/_next/static/media/font.woff2" as="font"><script src="/_next/static/chunks/main.js" async></script>'
+    + '<script src="https://cdn.example.com/x.js"></script><script src="//evil.example/y.js"></script><link rel="stylesheet" href="styles.css">'
+    + '<script src="/_next/static/chunks/main.js"></script></head><body></body></html>';
+  const server = createServer((req, res) => {
+    asked.push(req.url);
+    if (req.url === '/') { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); res.end(page); return; }
+    res.writeHead(req.url.endsWith('.css') ? 200 : req.url.endsWith('.woff2') ? 404 : 200, { 'content-type': 'application/octet-stream' });
+    res.end('x');
+  });
+  await new Promise((ok) => server.listen(0, '127.0.0.1', ok));
+  let warmOut = '';
+  try {
+    const base = `http://127.0.0.1:${server.address().port}`;
+    // Asynchronous, so this process's server can answer while the warm-up runs.
+    warmOut = await new Promise((ok) => {
+      execFile(process.execPath, ['-e', rt.WARM_SCRIPT, base, '["/"]'], { timeout: 20_000 }, (err, stdout) => ok(err ? `error: ${err.message}` : stdout));
+    });
+  } finally {
+    await new Promise((ok) => server.close(ok));
+  }
+  check('U18 the warm-up asks for the route, then the scripts and stylesheets the page names by "/…" path on its own origin (each once), and says how many answered',
+    JSON.stringify(asked) === JSON.stringify(['/', '/_next/static/chunks/app.css', '/_next/static/media/font.woff2', '/_next/static/chunks/main.js'])
+      && /^\/ 200 in \d+ ms, \/ assets 2\/3 in \d+ ms$/.test(warmOut),
+    `${warmOut} | asked ${asked.join(' ')}`);
 
   check('U18 sandboxLines on nothing usable still says so; a LookError made the old way (three arguments) has no exit code, usage or post-mortem',
     JSON.stringify(sandboxLines({})) === '["0 processes, 0 threads, 0.00 GB resident","dev server unknown"]'

@@ -660,20 +660,43 @@ export function installRetry(info, cmd, output) {
   return null;
 }
 
+// A failure that reached out of the sandbox: a failed lookup, a refused connection, or a 403. The
+// proxy (tinyproxy, FilterDefaultDeny) refuses a host off the allowlist with "403 Filtered", which npm
+// reports as `npm error code E403` and `403 Filtered - GET https://<host>/…`, pnpm as
+// ERR_PNPM_FETCH_403 and yarn as `Request failed "403 Filtered"`.
+const NETWORK_FAILURE = /ENOTFOUND|EAI_AGAIN|getaddrinfo|tunneling socket|statusCode=403|\bE403\b|ERR_PNPM_FETCH_403|403 Forbidden|403 Filtered|Filtered - 403|Bad response: 403|Received HTTP code 403|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH/i;
+// The ones that mean the proxy refused or the name did not resolve, whichever host it was. A 403 from
+// an allowlisted host (the registry refusing a package) is not one of them.
+const PROXY_REFUSAL = /tunneling socket|statusCode=403|403 Filtered|Filtered - 403|Bad response: 403|Received HTTP code 403 from proxy|ENOTFOUND|EAI_AGAIN/i;
+// Hosts that tools name in their help text, never the host that failed.
+const HELP_HOSTS = ['docs.npmjs.com', 'yarnpkg.com', 'classic.yarnpkg.com', 'pnpm.io', 'nodejs.org'];
+
+/** The hosts off the allowlist that a piece of output names: after ENOTFOUND/EAI_AGAIN, and in URLs. */
+function offHosts(text) {
+  const hosts = [];
+  for (const m of text.matchAll(/(?:ENOTFOUND|EAI_AGAIN)\s+([a-z0-9-]+(?:\.[a-z0-9-]+)+)/gi)) hosts.push(m[1]);
+  for (const m of text.matchAll(/https?:\/\/([a-z0-9-]+(?:\.[a-z0-9-]+)+)(?::\d+)?/gi)) hosts.push(m[1]);
+  return hosts.map((h) => h.toLowerCase()).filter((h) => !ALLOWLIST.includes(h) && h.length <= 100);
+}
+
 /**
  * The host an install tried to reach outside the allowlist: its name, '' when the proxy refused a host
- * that the output does not name, or null when the failure was not about the network outside.
+ * that the output does not name, or null when the failure was not about the network outside. The
+ * host on the line that carries the failure (the 403, the failed lookup) wins; then the last one off
+ * the allowlist anywhere in the output, leaving out the hosts of help text.
  */
 export function offAllowlistHost(output) {
   const t = installTail(output);
-  const network = /ENOTFOUND|EAI_AGAIN|getaddrinfo|tunneling socket|statusCode=403|403 Forbidden|Bad response: 403|Received HTTP code 403|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH/i.test(t);
-  if (!network) return null;
-  const hosts = [];
-  for (const m of t.matchAll(/(?:ENOTFOUND|EAI_AGAIN)\s+([a-z0-9-]+(?:\.[a-z0-9-]+)+)/gi)) hosts.push(m[1]);
-  for (const m of t.matchAll(/https?:\/\/([a-z0-9-]+(?:\.[a-z0-9-]+)+)(?::\d+)?/gi)) hosts.push(m[1]);
-  const off = hosts.map((h) => h.toLowerCase()).filter((h) => !ALLOWLIST.includes(h) && h.length <= 100);
-  if (off.length) return off.at(-1);
-  return /tunneling socket|statusCode=403|403 Forbidden|Bad response: 403|Received HTTP code 403|ENOTFOUND|EAI_AGAIN/i.test(t) ? '' : null;
+  if (!NETWORK_FAILURE.test(t)) return null;
+  const lines = t.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (!NETWORK_FAILURE.test(lines[i])) continue;
+    const here = offHosts(lines[i]);
+    if (here.length) return here.at(-1);
+  }
+  const anywhere = offHosts(t).filter((h) => !HELP_HOSTS.includes(h));
+  if (anywhere.length) return anywhere.at(-1);
+  return PROXY_REFUSAL.test(t) ? '' : null;
 }
 
 /**
@@ -695,8 +718,22 @@ export function installFailure(output, { code = 1, timedOut = false, truncated =
 }
 
 /**
+ * The download caches an install leaves in the sandbox, where every tmpfs folder is RAM: npm's (it
+ * also installs pnpm and yarn) and yarn's. Nothing reads them after the install, and a Next.js app's
+ * npm cache alone took 0.17 GB of the sandbox's 3 GB. pnpm's store stays: node_modules is hard-linked
+ * into it, so removing it would free next to nothing.
+ */
+export const INSTALL_CACHES = Object.freeze(['/home/ring/.npm/_cacache', '/work/.yarn-cache']);
+
+/** Remove INSTALL_CACHES after a successful install. Best effort: a cache left behind costs memory, never correctness. */
+async function dropInstallCaches(box) {
+  await Promise.resolve(box.exec(`rm -rf -- ${INSTALL_CACHES.join(' ')}`, { timeoutMs: 60_000 })).catch(() => {});
+}
+
+/**
  * Install the dependencies inside the sandbox, 300 s at most in all: pnpm or yarn first when the
- * project uses it, then the install, then at most two retries (installRetry()).
+ * project uses it, then the install, then at most two retries (installRetry()). After a successful
+ * install the download caches go (INSTALL_CACHES).
  * @param {Sandbox} box
  * @param {object} kind  what inspectProject() returned
  * @returns {Promise<{pm: string|null, ran: string[]}>}  pm: pmText(); ran: the commands, in order
@@ -743,7 +780,10 @@ export async function installDeps(box, kind) {
   }
   let cmd = installCommand(info);
   for (let tries = 0; tries < 3; tries++) {
-    if (await attempt(cmd)) return { pm: pmText(info), ran };
+    if (await attempt(cmd)) {
+      await dropInstallCaches(box);
+      return { pm: pmText(info), ran };
+    }
     // After output that was cut off, the install may still run in the sandbox: no second one beside it.
     const next = last.r.truncated ? null : installRetry(info, cmd, last.text);
     if (!next || last.outOfTime) break;
@@ -790,25 +830,58 @@ Promise.all(cands.map((c) => fetch(url(c), { signal: AbortSignal.timeout(4000), 
 `;
 
 // Inside the sandbox: request each route once, 60 s in all, so a dev server that compiles a page on
-// its first request (Next.js, Astro) has done so before Mantis measures it.
+// its first request (Next.js, Astro) has done so before Mantis measures it. Then the scripts and
+// stylesheets the page names by an absolute path on its own origin ("/…", at most 40), one at a time:
+// a dev server that builds the browser's bundle only when the browser asks for it (Next.js with
+// Turbopack) builds it here, alone, not while Mantis's browser pages fill the same memory.
 const WARM = `
 const [base, list] = process.argv.slice(1);
 const until = Date.now() + 60000;
+const left = () => until - Date.now();
+const get = async (url) => {
+  const res = await fetch(url, { signal: AbortSignal.timeout(Math.max(1, Math.min(45000, left()))), redirect: 'manual' });
+  const html = /html/i.test(String(res.headers.get('content-type') || ''));
+  const body = html ? await res.text().catch(() => '') : await res.arrayBuffer().then(() => '', () => '');
+  return { status: res.status, body };
+};
+const assetsOf = (html) => {
+  const found = [];
+  for (const m of String(html).slice(0, 2000000).matchAll(/<(script|link)\\b[^>]*>/gi)) {
+    const tag = m[0];
+    const rel = (/\\brel\\s*=\\s*["']?([^"'\\s>]+)/i.exec(tag) || [])[1] || '';
+    if (m[1].toLowerCase() === 'link' && !['stylesheet', 'preload', 'modulepreload'].includes(rel.toLowerCase())) continue;
+    const src = (/\\b(?:src|href)\\s*=\\s*["']([^"']+)["']/i.exec(tag) || [])[1] || '';
+    if (/^\\/(?![\\/\\\\])\\S*$/.test(src) && !found.includes(src)) found.push(src);
+  }
+  return found.slice(0, 40);
+};
 (async () => {
   const out = [];
   for (const r of JSON.parse(list)) {
-    const left = until - Date.now();
-    if (left < 1000) break;
+    if (left() < 1000) break;
     const t = Date.now();
+    let html = '';
     try {
-      const res = await fetch(base + r, { signal: AbortSignal.timeout(Math.min(45000, left)), redirect: 'manual' });
-      await res.arrayBuffer().catch(() => {});
-      out.push(r + ' ' + res.status + ' in ' + (Date.now() - t) + ' ms');
-    } catch (e) { out.push(r + ' ' + ((e && e.name) || 'error') + ' after ' + (Date.now() - t) + ' ms'); }
+      const page = await get(base + r);
+      html = page.body;
+      out.push(r + ' ' + page.status + ' in ' + (Date.now() - t) + ' ms');
+    } catch (e) { out.push(r + ' ' + ((e && e.name) || 'error') + ' after ' + (Date.now() - t) + ' ms'); continue; }
+    const assets = assetsOf(html);
+    if (!assets.length) continue;
+    const ta = Date.now();
+    let ok = 0;
+    for (const a of assets) {
+      if (left() < 1000) break;
+      try { if ((await get(base + a)).status < 400) ok++; } catch {}
+    }
+    out.push(r + ' assets ' + ok + '/' + assets.length + ' in ' + (Date.now() - ta) + ' ms');
   }
   process.stdout.write(out.join(', '));
 })();
 `;
+
+/** The warm-up script itself, for the unit tests (it runs with the sandbox's Node, as `node -e WARM <base> <routes JSON>`). */
+export const WARM_SCRIPT = WARM;
 
 /** Where the app answers now, if anywhere, and whether its process is still running. */
 async function probeServer(box, port) {
@@ -997,16 +1070,19 @@ function csv(name, value) {
  *   schemes?: string|string[], baseline?: 'none'|string, prevRunId?: string, timeoutSec?: number}} o
  *   host: 127.0.0.1 (the default) or ::1, where startDevServer() found the app;
  *   baseline: 'none' (the default) or the absolute run folder inside the sandbox to compare with;
- *   prevRunId: the previous look's run id, which this look must not return again; timeoutSec: 300.
+ *   prevRunId: the previous look's run id, which this look must not return again; timeoutSec: 300;
+ *   concurrency: how many route × viewport groups Mantis opens at once, each with all its schemes
+ *   (Mantis's own default, 3, when not given).
  * While it runs, the sandbox's host cgroup is watched (box.watchUsage(), where the box has it).
  * @returns {Promise<{report: object, runId: string, runDir: string, exitCode: 0|1|2, crashed: boolean, ms: number,
  *   usage: import('./cgroup.mjs').Usage|null}>}
  *   crashed: exit 2 with a report, some cells could not be analysed (the rest were measured)
  * @throws {LookError} when there is no usable report
  */
-export async function look(box, { port, host = '127.0.0.1', routes = '/', locales, viewports, schemes, baseline = 'none', prevRunId, timeoutSec = 300 } = {}) {
+export async function look(box, { port, host = '127.0.0.1', routes = '/', locales, viewports, schemes, baseline = 'none', prevRunId, timeoutSec = 300, concurrency } = {}) {
   const url = baseUrl({ host, port });
   if (!Number.isInteger(timeoutSec) || timeoutSec < 1 || timeoutSec > 3600) throw new TypeError(`look: invalid timeoutSec ${timeoutSec}`);
+  if (concurrency !== undefined && !(Number.isInteger(concurrency) && concurrency >= 1 && concurrency <= 16)) throw new TypeError(`look: invalid concurrency ${concurrency}`);
   if (baseline !== 'none' && !(typeof baseline === 'string' && baseline.startsWith('/'))) {
     throw new TypeError(`look: baseline must be 'none' or an absolute run folder, got ${JSON.stringify(baseline)}`);
   }
@@ -1016,6 +1092,7 @@ export async function look(box, { port, host = '127.0.0.1', routes = '/', locale
   }
   // --style none: the result must not depend on a stray style.json. cwd stays /work: a relative
   // --out, the proof aliases and Mantis's project detection all depend on it.
+  if (concurrency !== undefined) args.push('--concurrency', String(concurrency));
   args.push('--out', MANTIS_OUT, '--baseline', baseline, '--style', 'none', '--json');
   const watch = typeof box.watchUsage === 'function' ? await box.watchUsage().catch(() => null) : null;
   const started = Date.now();
