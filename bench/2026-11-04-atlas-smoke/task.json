@@ -1,0 +1,82 @@
+{
+  "id": "t_4f043dd8ea0926a24adf3849472b477b",
+  "origin": "admin",
+  "label": "atlas smoke 4 Nov",
+  "state": "done",
+  "source": {
+    "kind": "sample",
+    "name": "atlas",
+    "label": "Atlas (invoicing app)"
+  },
+  "matrix": {
+    "routes": [
+      "/",
+      "/pricing.html",
+      "/account.html"
+    ],
+    "viewports": [
+      "mobile",
+      "desktop"
+    ],
+    "schemes": [
+      "light",
+      "dark"
+    ],
+    "locales": [
+      "en",
+      "vi"
+    ]
+  },
+  "model": "deepseek-v4.1-flash-1017",
+  "sampling": {
+    "temperature": 1,
+    "topP": 1,
+    "seed": 7
+  },
+  "visionModel": "qwen3.8-27b",
+  "gate": true,
+  "promptVariant": "neutral",
+  "seeded": null,
+  "caps": {
+    "maxChecks": 3,
+    "maxTurns": 36,
+    "maxTurnsPerCheck": 14,
+    "maxCallsPerTurn": 12,
+    "maxCompletionTokens": 8192,
+    "reasoning": {
+      "effort": "low",
+      "max_tokens": 2048
+    },
+    "maxPromptTokens": 1200000,
+    "maxUsd": 0.3,
+    "wallClockSec": 900,
+    "lookTimeoutSec": 300
+  },
+  "position": null,
+  "step": "vision",
+  "stepTimes": {
+    "clone": 225,
+    "install": 1536,
+    "look": 10826,
+    "fix": 133241,
+    "gate": 209,
+    "cleanup": 242,
+    "vision": 8481
+  },
+  "sandbox": {
+    "name": "ring-1fb9b3a2",
+    "runtime": "runsc"
+  },
+  "result": {
+    "status": "done",
+    "verdict": "pass",
+    "line": "23 fixed · 0 new · 0 cover-ups · 0 lost",
+    "error": null
+  },
+  "startedAt": "2026-11-04T08:39:05.701Z",
+  "finishedAt": "2026-11-04T08:41:42.528Z",
+  "approvedAt": null,
+  "publishedAt": null,
+  "createdAt": "2026-11-04T08:39:05.701Z",
+  "updatedAt": "2026-11-04T08:41:42.528Z"
+}

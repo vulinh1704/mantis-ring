@@ -1,0 +1,468 @@
+{
+  "schema": "mantis-ring/receipt@1",
+  "taskId": "t_4f043dd8ea0926a24adf3849472b477b",
+  "label": "REAL RUN · Vultr VX1 sea · 2026-11-04 08:39 UTC",
+  "startedAt": "2026-11-04T08:39:05.703Z",
+  "finishedAt": "2026-11-04T08:41:42.526Z",
+  "source": {
+    "kind": "sample",
+    "name": "atlas",
+    "commit": null
+  },
+  "trust": "sample",
+  "trustNote": "Verified: re-measured by Mantis (no LLM) against the original baseline.",
+  "matrix": {
+    "routes": [
+      "/",
+      "/pricing.html",
+      "/account.html"
+    ],
+    "viewports": [
+      "mobile",
+      "desktop"
+    ],
+    "schemes": [
+      "light",
+      "dark"
+    ],
+    "locales": [
+      "en",
+      "vi"
+    ],
+    "cells": 24
+  },
+  "line": "23 fixed · 0 new · 0 cover-ups · 0 lost",
+  "counts": {
+    "errorsBefore": 17,
+    "errorsAfter": 0,
+    "warningsBefore": 6,
+    "warningsAfter": 0,
+    "fixed": 23,
+    "new": 0,
+    "coverUps": 0,
+    "lost": 0,
+    "cellsCompared": 24,
+    "cellsExpected": 24
+  },
+  "fixed": [
+    {
+      "type": "overlap",
+      "route": "/",
+      "selector": "button.chat-bubble",
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi"
+      ]
+    },
+    {
+      "type": "contrast",
+      "route": "/",
+      "selector": "main > div.container > p.caption",
+      "cells": [
+        "mobile/light/en",
+        "desktop/light/en",
+        "mobile/light/vi",
+        "desktop/light/vi"
+      ]
+    },
+    {
+      "type": "tap-target",
+      "route": "/",
+      "selector": "div.social > a:nth-of-type(1)",
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi"
+      ]
+    },
+    {
+      "type": "console",
+      "route": "/",
+      "selector": null,
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi"
+      ]
+    },
+    {
+      "type": "contrast",
+      "route": "/",
+      "selector": "#promo h3",
+      "cells": [
+        "mobile/dark/en",
+        "desktop/dark/en",
+        "mobile/dark/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "theme-leak",
+      "route": "/",
+      "selector": "#promo",
+      "cells": [
+        "mobile/dark/en",
+        "desktop/dark/en",
+        "mobile/dark/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "layout-shift",
+      "route": "/",
+      "selector": "h2",
+      "cells": [
+        "mobile/light/vi",
+        "mobile/dark/vi"
+      ]
+    },
+    {
+      "type": "page-overflow",
+      "route": "/",
+      "selector": "div.filters",
+      "cells": [
+        "mobile/light/vi",
+        "mobile/dark/vi"
+      ]
+    },
+    {
+      "type": "overlap",
+      "route": "/pricing.html",
+      "selector": "button.chat-bubble",
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi"
+      ]
+    },
+    {
+      "type": "contrast",
+      "route": "/pricing.html",
+      "selector": "article.card.plan:nth-of-type(1) > p:nth-of-type(1) > span.caption",
+      "cells": [
+        "mobile/light/en",
+        "desktop/light/en",
+        "mobile/light/vi",
+        "desktop/light/vi"
+      ]
+    },
+    {
+      "type": "contrast",
+      "route": "/pricing.html",
+      "selector": "main > div.container > p.caption",
+      "cells": [
+        "mobile/light/en",
+        "desktop/light/en",
+        "mobile/light/vi",
+        "desktop/light/vi"
+      ]
+    },
+    {
+      "type": "tap-target",
+      "route": "/pricing.html",
+      "selector": "div.social > a:nth-of-type(1)",
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi"
+      ]
+    },
+    {
+      "type": "console",
+      "route": "/pricing.html",
+      "selector": null,
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi"
+      ]
+    },
+    {
+      "type": "broken-image",
+      "route": "/pricing.html",
+      "selector": "picture.pricing-art > img",
+      "cells": [
+        "mobile/dark/en",
+        "desktop/dark/en",
+        "mobile/dark/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "request-failed",
+      "route": "/pricing.html",
+      "selector": null,
+      "cells": [
+        "mobile/dark/en",
+        "desktop/dark/en",
+        "mobile/dark/vi",
+        "desktop/dark/vi"
+      ]
+    },
+    {
+      "type": "clipped-text",
+      "route": "/pricing.html",
+      "selector": "article.card.plan:nth-of-type(3) > h2.plan__name",
+      "cells": [
+        "mobile/light/vi",
+        "mobile/dark/vi"
+      ]
+    },
+    {
+      "type": "layout-shift",
+      "route": "/account.html",
+      "selector": "table.invoices",
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi"
+      ]
+    },
+    {
+      "type": "page-overflow",
+      "route": "/account.html",
+      "selector": "table.invoices",
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi"
+      ]
+    },
+    {
+      "type": "overlap",
+      "route": "/account.html",
+      "selector": "button.chat-bubble",
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi"
+      ]
+    },
+    {
+      "type": "contrast",
+      "route": "/account.html",
+      "selector": "th:nth-of-type(1)",
+      "cells": [
+        "mobile/light/en",
+        "desktop/light/en",
+        "mobile/light/vi",
+        "desktop/light/vi"
+      ]
+    },
+    {
+      "type": "contrast",
+      "route": "/account.html",
+      "selector": "#profile dt:nth-of-type(1)",
+      "cells": [
+        "mobile/light/en",
+        "desktop/light/en",
+        "mobile/light/vi",
+        "desktop/light/vi"
+      ]
+    },
+    {
+      "type": "tap-target",
+      "route": "/account.html",
+      "selector": "div.social > a:nth-of-type(1)",
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi"
+      ]
+    },
+    {
+      "type": "console",
+      "route": "/account.html",
+      "selector": null,
+      "cells": [
+        "mobile/light/en",
+        "mobile/dark/en",
+        "mobile/light/vi",
+        "mobile/dark/vi"
+      ]
+    }
+  ],
+  "new": [],
+  "gate": {
+    "enabled": true,
+    "coverUpAttempts": 0,
+    "tamperAttempts": 0,
+    "lostAttempts": 0,
+    "reverts": 0
+  },
+  "checks": [
+    {
+      "check": 1,
+      "decision": "accepted",
+      "line": "22 fixed · 0 new · 0 cover-ups · 0 lost",
+      "runId": "2026-11-04T08-40-24",
+      "ms": 10536,
+      "forced": false,
+      "final": false
+    },
+    {
+      "check": 2,
+      "decision": "accepted",
+      "line": "23 fixed · 0 new · 0 cover-ups · 0 lost",
+      "runId": "2026-11-04T08-40-42",
+      "ms": 10475,
+      "forced": false,
+      "final": false
+    },
+    {
+      "check": 3,
+      "decision": "accepted",
+      "line": "23 fixed · 0 new · 0 cover-ups · 0 lost",
+      "runId": "2026-11-04T08-41-17",
+      "ms": 10589,
+      "forced": false,
+      "final": false
+    }
+  ],
+  "stopReason": "finish",
+  "models": [
+    {
+      "role": "fix",
+      "id": "deepseek-v4.1-flash-1017",
+      "provider": "Vultr Serverless Inference",
+      "calls": 27,
+      "promptTokens": 366757,
+      "completionTokens": 28018,
+      "reasoningTokens": 22789,
+      "usd": 0.071824,
+      "price": {
+        "promptPer1M": 0.15,
+        "completionPer1M": 0.6,
+        "source": "catalog list price, 2026-11-04"
+      }
+    },
+    {
+      "role": "vision",
+      "id": "qwen3.8-27b",
+      "provider": "Vultr Serverless Inference",
+      "calls": 5,
+      "promptTokens": 10092,
+      "completionTokens": 3920,
+      "reasoningTokens": 1706,
+      "usd": 0.005434,
+      "price": {
+        "promptPer1M": 0.15,
+        "completionPer1M": 1,
+        "source": "catalog list price, 2026-11-04"
+      }
+    }
+  ],
+  "tokens": {
+    "prompt": 376849,
+    "completion": 31938,
+    "reasoning": 24495
+  },
+  "usd": 0.077258,
+  "turns": 27,
+  "toolCalls": 52,
+  "invalidToolCalls": 0,
+  "toolErrors": 1,
+  "time": {
+    "totalSec": 156.8,
+    "phases": {
+      "sandbox": 0.2,
+      "clone": 0.2,
+      "install": 0.1,
+      "serve": 1.5,
+      "baseline": 10.8,
+      "model": 98.5,
+      "tools": 2.9,
+      "checks": 31.6,
+      "verify": 0.2,
+      "proof": 1.7,
+      "copyOut": 0.4,
+      "destroy": 0.2,
+      "vision": 8.5
+    }
+  },
+  "diff": {
+    "files": 7,
+    "insertions": 37,
+    "deletions": 8,
+    "bytes": 7116,
+    "sha256": "401da72afe4618d941b544842231f55a55f370637a20060954483e71ce8d6996",
+    "applies": true,
+    "truncated": false
+  },
+  "proof": "proof.png",
+  "vision": {
+    "model": "qwen3.8-27b",
+    "provider": "Vultr Serverless Inference",
+    "verdict": "pass",
+    "agree": 1,
+    "pairs": [
+      {
+        "issue": "page-overflow on div.filters · / · mobile/light/vi",
+        "mantis": "fixed",
+        "vision": "fixed",
+        "evidence": "Before: the three filter buttons (Tất cả hóa đơn, Đã thanh toán, Quá hạn...) are in a single flex row that overflows the 360px viewport — the third button is clipped at the right edge. After: flex-wrap: wrap was added to .filters, so the buttons now wrap onto two rows, all fully visible within the …"
+      },
+      {
+        "issue": "page-overflow on table.invoices · /account.html · mobile/light/en",
+        "mantis": "fixed",
+        "vision": "fixed",
+        "evidence": "Before: the table extended ~404px past the right edge of the 360px viewport, causing page-level horizontal scroll. After: the table is wrapped in a .table-wrap div with overflow-x:auto and uses table-layout:fixed with percentage column widths (18%+30%+17%+19%+16%=100%), so it fits within the viewpo…"
+      },
+      {
+        "issue": "overlap on button.chat-bubble · / · mobile/light/en",
+        "mantis": "fixed",
+        "vision": "fixed",
+        "evidence": "The chat bubble and the Accept button no longer overlap; the cookie bar's added right padding on mobile pushes the button clear of the bubble, and both elements are fully visible and usable."
+      },
+      {
+        "issue": "overlap on button.chat-bubble · /pricing.html · mobile/light/en",
+        "mantis": "fixed",
+        "vision": "fixed",
+        "evidence": "The CSS diff adds `padding-right: 88px` to `.cookie` at max-width 899px, pushing the cookie bar's content (text + Accept button) leftward to clear the chat bubble. In the BEFORE image, the Accept button and chat bubble overlap (red outlines 9 and 10 show the intersection). In the AFTER image, the A…"
+      }
+    ],
+    "usd": 0.005434
+  },
+  "summary": {
+    "text": "All 17 errors and all 6 warnings from the starting point are now fixed (23 issues resolved, 0 new problems, 0 cover-ups). \n\nWhat I changed:\n\n1. **Console errors (all 3 routes)** — `js/drawer.js` called `addEventListener` on `#nav-toggle` without checking it existed. I added a null guard and a small-screen check, so the script no longer throws on pages without the drawer toggle.\n\n2. **Overlap: chat bubble on buttons** — the cookie bar sat under the floating support bubble on mobile. I added right padding to `.cookie` below 900px so the bar's content clears the bubble and taps land on the intended control. Nothing was hidden or shrunk.\n\n3. **Low-contrast text in light mode** — the root cause was one token, `--text-muted: #a1a1aa` (about 2.5:1 on white). I darkened it to `#5b6472`, which passes 4.5:1 on both the white page and the `#f8fafc` card surfaces. This fixed the captions, plan \"/month\" labels, table headers and profile labels at once.\n\n4. **`#promo` theme leak in dark mode** — `.card--promo` hard-coded `--surface: #ffffff`, so the promo kept a white background while its text switched to light colours. I removed the hard-coded surface so it uses the theme token; it now renders dark with readable text in both schemes.\n\n5. **`div.filters` horizontal overflow on mobile/vi** — the filter row was a non-wrapping flex row with long Vietnamese labels. I added `flex-wrap: wrap` so the row breaks onto multiple lines instead of pushing past the viewport.\n\n6. **Clipped plan name on p",
+    "note": "the model's own words, not measured"
+  },
+  "containment": {
+    "runtime": "runsc",
+    "sandbox": "ring-1fb9b3a2",
+    "limits": {
+      "memory": "3g",
+      "cpus": "2",
+      "pids": 512,
+      "shm": "512m",
+      "work": "2g",
+      "tmp": "512m",
+      "home": "1g"
+    },
+    "network": "ring-task-1fb9b3a2 (internal, this sandbox only, no host address) → ring-proxy (allowlist)",
+    "destroyed": true,
+    "goneCheck": "docker ps -a: gone",
+    "goneAt": "2026-11-04T08:41:34.043Z"
+  },
+  "mantis": {
+    "version": "0.7.1",
+    "baselineRunId": "2026-11-04T08-39-07",
+    "finalRunId": "2026-11-04T08-41-17",
+    "comparedWith": "baseline run (R0)"
+  },
+  "verdict": "pass",
+  "publishable": true,
+  "promptVersion": "ring-2",
+  "promptVariant": "neutral"
+}

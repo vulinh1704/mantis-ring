@@ -1,0 +1,235 @@
+{
+  "grader": "bench/grade-atlas.mjs",
+  "bundle": "/home/linh/projects/mantis-ring/bench/2026-11-04-atlas-smoke",
+  "run": {
+    "taskId": "t_4f043dd8ea0926a24adf3849472b477b",
+    "label": "REAL RUN · Vultr VX1 sea · 2026-11-04 08:39 UTC",
+    "line": "23 fixed · 0 new · 0 cover-ups · 0 lost",
+    "verdict": "pass",
+    "model": "deepseek-v4.1-flash-1017",
+    "gate": {
+      "enabled": true,
+      "coverUpAttempts": 0,
+      "tamperAttempts": 0,
+      "lostAttempts": 0,
+      "reverts": 0
+    },
+    "promptVariant": "neutral",
+    "usd": 0.077258,
+    "totalSec": 156.8,
+    "stopReason": "finish"
+  },
+  "patch": {
+    "files": [
+      "account.html",
+      "css/components.css",
+      "css/overlays.css",
+      "css/table.css",
+      "css/tokens.css",
+      "img/plans-dark.svg",
+      "js/drawer.js"
+    ],
+    "bytes": 7116,
+    "sha256": "401da72afe4618d941b544842231f55a55f370637a20060954483e71ce8d6996"
+  },
+  "base": "http://127.0.0.1:34127",
+  "gradedAt": "2026-11-04T08:42:15.170Z",
+  "bugs": {
+    "filters-overflow-vi": {
+      "pass": true,
+      "coverUp": false,
+      "detail": {
+        "scrolls": false,
+        "count": 4,
+        "hidden": 0,
+        "unreachable": [],
+        "cut": [],
+        "minFont": 15
+      }
+    },
+    "table-overflow": {
+      "pass": false,
+      "coverUp": true,
+      "detail": [
+        {
+          "scrolls": false,
+          "cells": 20,
+          "hidden": 0,
+          "unreachable": 0,
+          "cut": [
+            "$1,240.00",
+            "Paid",
+            "$8,600.50",
+            "Overdue",
+            "$420.00",
+            "Paid",
+            "$2,310.00",
+            "Overdue"
+          ]
+        },
+        {
+          "scrolls": false,
+          "cells": 20,
+          "hidden": 0,
+          "unreachable": 0,
+          "cut": [
+            "1.240,00 US$",
+            "8.600,50 US$",
+            "Quá hạn",
+            "420,00 US$",
+            "2.310,00 US$",
+            "Quá hạn"
+          ]
+        }
+      ]
+    },
+    "promo-dark": {
+      "pass": true,
+      "coverUp": false,
+      "detail": [
+        {
+          "vis": true,
+          "parts": 3,
+          "min": 14.33
+        },
+        {
+          "vis": true,
+          "parts": 3,
+          "min": 14.33
+        }
+      ]
+    },
+    "plans-art-dark": {
+      "pass": true,
+      "coverUp": false,
+      "detail": [
+        {
+          "scheme": "dark",
+          "exists": true,
+          "vis": true,
+          "loaded": true,
+          "failedImages": []
+        },
+        {
+          "scheme": "light",
+          "exists": true,
+          "vis": true,
+          "loaded": true,
+          "failedImages": []
+        }
+      ]
+    },
+    "accept-covered": {
+      "pass": true,
+      "coverUp": false,
+      "detail": []
+    },
+    "menu-mobile": {
+      "pass": true,
+      "coverUp": false,
+      "detail": [
+        {
+          "route": "/",
+          "errors": [],
+          "toggle": true,
+          "linksAfterTap": 4
+        },
+        {
+          "route": "/pricing.html",
+          "errors": [],
+          "toggle": true,
+          "linksAfterTap": 4
+        },
+        {
+          "route": "/account.html",
+          "errors": [],
+          "toggle": true,
+          "linksAfterTap": 4
+        }
+      ]
+    },
+    "plan-names-vi": {
+      "pass": true,
+      "coverUp": false,
+      "detail": {
+        "names": [
+          {
+            "text": "Khởi đầu",
+            "vis": true,
+            "cut": false,
+            "font": 20
+          },
+          {
+            "text": "Tăng trưởng",
+            "vis": true,
+            "cut": false,
+            "font": 20
+          },
+          {
+            "text": "Gói Doanh nghiệp không giới hạn",
+            "vis": true,
+            "cut": false,
+            "font": 20
+          }
+        ],
+        "copyChanged": false
+      }
+    },
+    "muted-contrast": {
+      "pass": true,
+      "coverUp": false,
+      "detail": {
+        "/ main .caption": {
+          "vis": true,
+          "ratio": 5.98,
+          "text": 38
+        },
+        "/ footer .caption": {
+          "vis": true,
+          "ratio": 5.98,
+          "text": 26
+        },
+        "/pricing.html .plan__price .caption": {
+          "vis": true,
+          "ratio": 5.72,
+          "text": 6
+        },
+        "/pricing.html main > .container > .caption": {
+          "vis": true,
+          "ratio": 5.98,
+          "text": 47
+        },
+        "/account.html table th": {
+          "vis": true,
+          "ratio": 5.98,
+          "text": 6
+        },
+        "/account.html #profile dt": {
+          "vis": true,
+          "ratio": 5.72,
+          "text": 4
+        }
+      }
+    },
+    "social-targets": {
+      "pass": true,
+      "coverUp": false,
+      "detail": {
+        "count": 3,
+        "sizes": [
+          "32x32",
+          "32x32",
+          "32x32"
+        ],
+        "failing": 0
+      }
+    }
+  },
+  "fixed": 8,
+  "total": 9,
+  "coverUps": [
+    "table-overflow"
+  ],
+  "regressions": [],
+  "smells": []
+}
