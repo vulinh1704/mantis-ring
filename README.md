@@ -87,8 +87,8 @@ The rule ranks models by planted bugs fixed, then new issues, then cost, then ti
 **The tests** need Node 22 or newer. Two suites need nothing else:
 
 ```bash
-node test/agent-loop.mjs --unit     # path and tool rules, the receipt, check messages, the tamper guard, the client against a fake gateway, the sandbox's network against a fake docker, the GitHub path's decisions, the pressure arm, the rules the containment suites judge by, the seeded scene and when the loop stops it, the Atlas sample, what its grader refuses, an Atlas receipt, and how bench/table.mjs grades an Atlas run (101 checks)
-node test/app-api.mjs               # the HTTP API: the admin rule, the two public switches and ring.sh's step for each, limits, approval and patch rules, the publish bar, SSE replay, pasted repository addresses, the admin-only Atlas sample, the seeded scene and the bodies it refuses, the longest running task in /status.json (79 checks)
+node test/agent-loop.mjs --unit     # path and tool rules, the receipt, check messages, the tamper guard, the client against a fake gateway, the sandbox's network against a fake docker, the GitHub path's decisions, the pressure arm, the rules the containment suites judge by, the seeded scene and when the loop stops it, the Atlas sample, what its grader refuses, an Atlas receipt, how bench/table.mjs grades an Atlas run, how a failed look says why, and speech for the video's voice with its spend guard (125 checks)
+node test/app-api.mjs               # the HTTP API: the admin rule, the two public switches and ring.sh's step for each, limits, approval and patch rules, the publish bar, SSE replay, pasted repository addresses, the admin-only Atlas sample, the seeded scene and the bodies it refuses, the longest running task in /status.json, the admin speech route's caps and ring.sh tts (85 checks)
 ```
 
 The others need Docker:
@@ -124,6 +124,7 @@ scripts/ring.sh get <id>                   # the full record and the receipt
 scripts/ring.sh bundle <id> <dir>          # every file of the task
 scripts/ring.sh publish <id>               # only a run that passes the publish bar
 scripts/ring.sh selftest agent-loop        # or containment, or scenes; sandboxes under gVisor
+scripts/ring.sh tts chatterbox passage.txt sample.wav default   # the video's voice: the VM speaks at most 800 characters ($0.05 a call, $0.50 a day at most); the key stays there
 ```
 
 With `--selftest`, `deploy.sh` also runs `ring-selftest`, a wrapper the bootstrap script installs, which runs the containment and scene suites with `RING_RUNTIME=runsc`. After each deploy it checks from outside that both public switches are still off; once the owner opens them, `RING_ALLOW_PUBLIC=sample` accepts open sample runs (GitHub runs must still be closed), `github` the other way round, and `yes` accepts both. `ring.sh config` reads the same values, one switch at a time: it sends a patch that opens `publicSampleRuns` only with `RING_ALLOW_PUBLIC=sample` (or `yes`), one that opens `publicGithubRuns` only with `github` (or `yes`), and closing them needs nothing. The first step is `RING_ALLOW_PUBLIC=sample scripts/ring.sh config '{"publicSampleRuns":true}'`, and later deploys then run with `RING_ALLOW_PUBLIC=sample`. The owner link is for the owner only. The admin channel can never approve a run.
