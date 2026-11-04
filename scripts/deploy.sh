@@ -12,16 +12,20 @@
 # Usage: scripts/deploy.sh [--dirty] [--force] [--selftest]
 #   --dirty     deploy uncommitted changes too (app/VERSION.json then says dirty: true)
 #   --force     restart even while a task or a self-test runs, or when the VM's queue cannot be read
-#   --selftest  afterwards, with no task running, run ring-selftest (containment and scenes; every check must pass)
+#   --selftest  afterwards, run the containment, scene and agent-loop suites through the app's queue, one
+#               POST /admin/selftest each (scripts/ring.sh selftest): each waits until no task runs and
+#               holds new ones until it ends. Each must start under gVisor and pass every check, and
+#               /status.json must then show each suite's result on the deployed commit
 # Once the owner opens public runs (D-5): RING_ALLOW_PUBLIC=sample accepts open sample runs while
 # GitHub runs must still be closed, github the other way round, and yes accepts both open (the same
 # values that let scripts/ring.sh config open each switch).
 # Environment, for tests only: RING_SSH, RING_RSYNC (programs to use instead of ssh and rsync; they
 # must be executable), RING_HOST, RING_URL. With RING_TEST=1 the script refuses to run unless both
 # programs are test stand-ins and the host is not the real VM, so a broken fake can never fall
-# through to the real ssh.
+# through to the real ssh. test/app-api.mjs sources this file with RING_TEST=1 to run single steps
+# against stand-ins: sourced, it only defines its functions and deploys nothing.
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
 REAL_HOST=104.156.252.200
 HOST_ADDR=${RING_HOST:-$REAL_HOST}
 H=deploy@$HOST_ADDR
@@ -105,13 +109,112 @@ require_idle() {
   esac
 }
 
+# The suites that --selftest runs through the app, in this order.
+SELFTEST_SUITES=(containment scenes agent-loop)
+# The app rereads the suites' result files for /status.json at most every 30 s, so a read that still
+# shows the earlier results is tried again: up to STATUS_TRIES reads, STATUS_PAUSE seconds apart.
+STATUS_TRIES=8
+STATUS_PAUSE=5
+
+# selftest_problem SUITE FILE: nothing when FILE, the output of one POST /admin/selftest, shows that the
+# suite started under gVisor, that every "n/m ... checks passed" line it printed has n = m, and that
+# its last line is "selftest SUITE: exit 0"; otherwise one sentence that names the suite.
+selftest_problem() {
+  local suite=$1 file=$2 started last summary
+  started=$(grep -m 1 -E "^selftest $suite: started" "$file" || true)
+  last=$(grep -v -E '^[[:space:]]*$' "$file" | tail -n 1 || true)
+  summary=$(grep -E '^[0-9]+/[0-9]+ .*checks passed' "$file" || true)
+  if [ -z "$started" ]; then
+    echo "the $suite self-test did not start (no 'selftest $suite: started' line; the last line: ${last:-none})"
+  elif [ "$started" != "selftest $suite: started, runtime runsc" ]; then
+    echo "the $suite self-test did not run under gVisor: '$started'"
+  elif [ "$last" != "selftest $suite: exit 0" ]; then
+    echo "the $suite self-test failed: its last line is '$last', not 'selftest $suite: exit 0'"
+  elif [ -z "$summary" ]; then
+    echo "the $suite self-test printed no 'n/m ... checks passed' line"
+  elif ! printf '%s\n' "$summary" | awk '{ split($1, n, "/"); if (n[1] != n[2] || n[2] == 0) bad = 1 } END { exit bad }'; then
+    echo "the $suite self-test did not pass every check: $(printf '%s' "$summary" | tr '\n' ' ')"
+  fi
+}
+
+# selftest_results COMMIT: one line per suite from the /status.json on stdin (app/status.mjs
+# readSelftests); fails unless each suite's result is on COMMIT, under runsc, with every check passed.
+selftest_results() {
+  node -e 'let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => {
+    const commit = process.argv[1];
+    let st = null;
+    try { st = JSON.parse(s).selftest ?? null; } catch { st = null; }
+    if (!st || typeof st !== "object") { console.log("/status.json: no self-test results"); process.exit(1); }
+    let bad = 0;
+    for (const [key, name] of [["containment", "containment"], ["scenes", "scenes"], ["agentLoop", "agent-loop"]]) {
+      const r = st[key];
+      const ok = !!r && r.commit === commit && r.runtime === "runsc" && Number.isInteger(r.total) && r.total > 0 && r.passed === r.total;
+      if (!ok) bad += 1;
+      console.log(`/status.json: ${name} ${r ? `${r.passed}/${r.total} under ${r.runtime ?? "an unknown runtime"} on ${r.commit ?? "an unknown commit"} at ${r.at ?? "an unknown time"}` : "no result"}${ok ? "" : ` (not a pass under runsc on ${commit})`}`);
+    }
+    process.exit(bad ? 1 : 0);
+  });' "$1"
+}
+
+# run_selftests COMMIT: step 10. Each suite goes through the app's queue with scripts/ring.sh selftest,
+# given the same ssh, host and test flag as this script. The app waits until no task runs and holds new
+# ones meanwhile, so a busy VM is reported here, not refused. Afterwards /status.json must show each
+# suite's result on COMMIT, under runsc, with every check passed.
+run_selftests() {
+  local commit=$1 state running queued busy suite rc why out verdict='' try
+  local summaries=()
+  [[ $commit =~ ^[0-9a-f]{4,40}$ ]] || die "the deployed commit is unknown ('$commit'), so the self-tests' results cannot be checked"
+  state=$(busy_state)
+  case "$state" in
+    down) die "nothing answers on 127.0.0.1:8080 on the VM (connection refused): the self-tests run through the app" ;;
+    unknown) echo "the queue on the VM could not be read; each suite still waits in the app until no task runs" ;;
+    *)
+      read -r running queued busy <<< "$state"
+      if [ "$running" = 0 ] && [ "$queued" = 0 ] && [ "$busy" = none ]; then
+        echo "idle: no task running or waiting, no self-test"
+      else
+        echo "busy: $running task(s) running, $queued waiting, self-test: $busy. Each suite waits until no task runs, and no task starts while it waits or runs"
+      fi ;;
+  esac
+  SELFTEST_LOG=$(mktemp /tmp/ring-selftest.XXXXXX)
+  trap 'rm -f "$SELFTEST_LOG"' EXIT
+  for suite in "${SELFTEST_SUITES[@]}"; do
+    printf '\n--- %s, through the app\n' "$suite"
+    rc=0
+    RING_SSH=${RING_SSH:-} RING_HOST=$HOST_ADDR RING_TEST=${RING_TEST:-} bash scripts/ring.sh selftest "$suite" | tee "$SELFTEST_LOG" || rc=$?
+    why=$(selftest_problem "$suite" "$SELFTEST_LOG")
+    [ -z "$why" ] || die "$why"
+    [ "$rc" = 0 ] || die "scripts/ring.sh selftest $suite exited $rc"
+    summaries+=("$(grep -E '^[0-9]+/[0-9]+ .*checks passed' "$SELFTEST_LOG" | tail -n 1)")
+  done
+  echo
+  printf '%s\n' "${summaries[@]}"
+  for ((try = 1; try <= STATUS_TRIES; try++)); do
+    out=$("${S[@]}" 'curl -fsS -m 10 http://127.0.0.1:8080/status.json' 2> /dev/null || true)
+    if verdict=$(printf '%s' "$out" | selftest_results "$commit"); then
+      printf '%s\n' "$verdict"
+      return 0
+    fi
+    [ "$try" = "$STATUS_TRIES" ] || sleep "$STATUS_PAUSE"
+  done
+  printf '%s\n' "$verdict" >&2
+  die "/status.json does not show every suite passing under runsc on $commit (lines above)"
+}
+
+# Sourced by a test (only with RING_TEST=1, so the guard above has run): the functions are defined, and
+# nothing below runs.
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+  [ "${RING_TEST:-}" = 1 ] || die "this file is sourced only by tests, with RING_TEST=1"
+  return 0
+fi
+
 dirty=no force=no selftest=no
 for arg in "$@"; do
   case "$arg" in
     --dirty) dirty=yes ;;
     --force) force=yes ;;
     --selftest) selftest=yes ;;
-    -h | --help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h | --help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "usage: scripts/deploy.sh [--dirty] [--force] [--selftest]" >&2; exit 64 ;;
   esac
 done
@@ -232,22 +335,12 @@ case "${RING_ALLOW_PUBLIC:-}" in
 esac
 echo "public runs: sample ${sample_runs:-unknown}, GitHub ${github_runs:-unknown}"
 
-# 10. Self-tests under gVisor, only with no task running.
+# 10. Self-tests under gVisor, through the app's queue: no task runs beside them.
 if [ "$selftest" = yes ]; then
-  say "10/11 ring-selftest (every sandbox under gVisor)"
-  require_idle "The self-test"
-  log=$(mktemp /tmp/ring-selftest.XXXXXX)
-  trap 'rm -f "$log"' EXIT
-  status=0
-  "${S[@]}" 'sudo -u ring-orch /usr/local/sbin/ring-selftest' 2>&1 | tee "$log" || status=$?
-  summary=$(grep -E '^[0-9]+/[0-9]+ .*checks passed' "$log" || true)
-  printf '\n%s\n' "$summary"
-  [ "$status" = 0 ] || die "ring-selftest failed (exit $status)"
-  [ "$(printf '%s\n' "$summary" | grep -c .)" -ge 2 ] || die "ring-selftest printed fewer than two summary lines"
-  printf '%s\n' "$summary" | awk '{ split($1, n, "/"); if (n[1] != n[2]) bad = 1 } END { exit bad }' \
-    || die "a self-test suite did not pass every check"
+  say "10/11 self-tests through the app's queue: ${SELFTEST_SUITES[*]} (every sandbox under gVisor)"
+  run_selftests "$(json_field commit < app/VERSION.json)"
 else
-  say "10/11 self-tests skipped (pass --selftest to run ring-selftest)"
+  say "10/11 self-tests skipped (pass --selftest to run them through the app's queue)"
 fi
 
 # 11. Images and the proxy are rebuilt by ring-setup, which this script never runs on its own.

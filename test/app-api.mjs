@@ -4,12 +4,13 @@
 // and a fake runFix that finishes (or waits) on command. It checks the routes, the local-admin rule
 // D-4 (loopback peer, no X-Forwarded-For, loopback Host), D-5 (public runs closed), the per-IP and
 // queue limits, approve/patch with the owner token, and SSE replay, and POST /admin/speech (the video's
-// voice: admin only, its text and cost caps, the ledger line) with scripts/ring.sh tts, and what
-// scripts/ring.sh mem sends (scripts/vm-mem.sh, the VM's memory, read-only). /status and the
+// voice: admin only, its text and cost caps, the ledger line) with scripts/ring.sh tts, what
+// scripts/ring.sh mem sends (scripts/vm-mem.sh, the VM's memory, read-only), and scripts/ring.sh
+// selftest with the --selftest step of scripts/deploy.sh, against a stand-in for ssh. /status and the
 // speech calls talk to test/fake-gateway.mjs, never to the real inference service. Each check prints
 // PASS or FAIL.
 // Usage: node test/app-api.mjs
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import http from 'node:http';
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
@@ -986,6 +987,143 @@ try {
       && ttsNo.status !== 0 && /801 characters/.test(ttsNo.stderr) && leftOver.length === 0 && ttsBad.every((r) => r.status !== 0) && sshCalls === 1,
     `ok: exit ${ttsOk.status} ${oneLine(ttsOk.stdout)} ${oneLine(ttsOk.stderr)}; body ${JSON.stringify(ttsBody)}; refused: exit ${ttsNo.status} ${oneLine(ttsNo.stderr)}, left ${leftOver.join(' ') || 'nothing'}; `
       + `bad: ${ttsBad.map((r) => `${r.status} ${oneLine(r.stderr)}`).join(' / ')}; ${sshCalls} call(s) reached ssh`);
+
+  // scripts/ring.sh selftest and the --selftest step of scripts/deploy.sh, against a stand-in for ssh that
+  // plays the app's answers from files in RING_FAKE_DIR: a suite's stream for POST /admin/selftest, JSON
+  // for /admin/busy and /status.json. deploy.sh is sourced with RING_TEST=1, so it only defines its
+  // functions and one step runs alone; RING_TEST=1 refuses the real ssh, rsync and VM. These commands
+  // run without blocking this process, so that a fake site served from it can answer them.
+  const runAsync = (cmd, args, { env, cwd, timeout = 60_000 } = {}) => new Promise((resolve) => {
+    const child = spawn(cmd, args, { env, cwd, stdio: ['pipe', 'pipe', 'pipe'] });
+    let stdout = '', stderr = '';
+    child.stdout.setEncoding('utf8').on('data', (d) => { stdout += d; });
+    child.stderr.setEncoding('utf8').on('data', (d) => { stderr += d; });
+    const timer = setTimeout(() => child.kill('SIGKILL'), timeout);
+    child.on('error', (err) => { clearTimeout(timer); resolve({ status: null, stdout, stderr: `${stderr}${err.message}` }); });
+    child.on('close', (status) => { clearTimeout(timer); resolve({ status, stdout, stderr }); });
+    child.stdin.end();
+  });
+  const deploySh = fileURLToPath(new URL('../scripts/deploy.sh', import.meta.url));
+  const play = path.join(stateDir, 'fake-ssh-play');
+  await writeFile(play, String.raw`#!/bin/sh
+# A stand-in for ssh: the last argument is the remote command. The app's answers come from files in
+# $RING_FAKE_DIR, and every call (its arguments, then its stdin) is logged there.
+d=$RING_FAKE_DIR
+[ -n "$d" ] || exit 99
+for last; do :; done
+body=$(cat)
+printf 'CALL %s\n' "$*" >> "$d/calls.log"
+[ -z "$body" ] || printf 'BODY %s\n' "$body" >> "$d/calls.log"
+case "$last" in
+  *'/admin/busy'*) cat "$d/busy.json" ;;
+  *'/admin/selftest'*)
+    suite=$(printf '%s' "$body" | sed -n 's/^{"suite":"\([a-z-]*\)"}$/\1/p')
+    cat "$d/st-$suite.out" 2> /dev/null
+    if [ -f "$d/st-$suite.code" ]; then exit "$(cat "$d/st-$suite.code")"; fi ;;
+  *'/status.json'*)
+    n=$(( $(cat "$d/status.n" 2> /dev/null || echo 0) + 1 ))
+    echo "$n" > "$d/status.n"
+    if [ -f "$d/status-$n.json" ]; then cat "$d/status-$n.json"; else cat "$d/status.json"; fi ;;
+  *) echo '{}' ;;
+esac
+`, { mode: 0o755 });
+  const noRsync = path.join(stateDir, 'fake-rsync');
+  await writeFile(noRsync, "#!/bin/sh\necho 'fake rsync: no step tested here copies anything' >&2\nexit 97\n", { mode: 0o755 });
+  const COMMIT = 'abc1234';
+  /** What POST /admin/selftest streams for one suite (app/server.mjs adminSelftest), with the suite's own summary line. */
+  const stream = (suite, { runtime = 'runsc', passed = 18, total = 18, exit = 0, end = true } = {}) => [
+    `selftest ${suite}: waiting until no task is running (new tasks wait too)`, `selftest ${suite}: started, runtime ${runtime}`,
+    `runtime: ${runtime}`, 'PASS  one check', '', `${passed}/${total} ${suite} checks passed`, ...(end ? ['', `selftest ${suite}: exit ${exit}`] : []), '',
+  ].join('\n');
+  /** /status.json's self-test results (app/status.mjs readSelftests), each on `commit` under runsc. */
+  const stored = (commit) => JSON.stringify({ selftest: {
+    containment: { passed: 18, total: 18, at: '2026-11-04T15:01:00.000Z', runtime: 'runsc', commit },
+    scenes: { passed: 20, total: 20, at: '2026-11-04T15:03:00.000Z', runtime: 'runsc', commit },
+    agentLoop: { passed: 168, total: 168, at: '2026-11-04T15:07:00.000Z', runtime: 'runsc', commit },
+  } });
+  let fakeVms = 0;
+  const fakeVm = async ({ busy = { running: 0, queued: 0, selftest: null }, streams = {}, codes = {}, statuses = [], status = stored(COMMIT) } = {}) => {
+    const dir = path.join(stateDir, `fake-vm-${++fakeVms}`);
+    await mkdir(dir, { recursive: true });
+    await writeFile(path.join(dir, 'calls.log'), '');
+    await writeFile(path.join(dir, 'busy.json'), JSON.stringify(busy));
+    for (const s of ['containment', 'scenes', 'agent-loop']) await writeFile(path.join(dir, `st-${s}.out`), streams[s] ?? stream(s));
+    for (const [s, code] of Object.entries(codes)) await writeFile(path.join(dir, `st-${s}.code`), String(code));
+    for (const [i, json] of statuses.entries()) await writeFile(path.join(dir, `status-${i + 1}.json`), json);
+    await writeFile(path.join(dir, 'status.json'), status);
+    return dir;
+  };
+  const callsTo = async (dir) => {
+    const log = await readFile(path.join(dir, 'calls.log'), 'utf8');
+    return { log, posted: [...log.matchAll(/^BODY \{"suite":"([a-z-]+)"\}$/gm)].map((m) => m[1]), statusReads: (log.match(/^CALL .*\/status\.json/gm) ?? []).length };
+  };
+  const scriptEnv = (extra) => ({ PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin', HOME: stateDir, LANG: 'C.UTF-8', RING_TEST: '1', RING_HOST: '192.0.2.1', RING_SSH: play, ...extra });
+  const deployLines = (r) => oneLine(r.stderr.split('\n').filter((l) => /^(deploy|ring\.sh): /.test(l)).join(' '));
+
+  const ringSelftest = async (suite, vm) => {
+    const dir = await fakeVm(vm);
+    return { ...(await runAsync('bash', [ringSh, 'selftest', suite], { env: scriptEnv({ RING_FAKE_DIR: dir }) })), ...(await callsTo(dir)) };
+  };
+  // A suite's own output with an "exit 0" line in it, then cut short before the app's last line.
+  const forged = 'selftest containment: waiting until no task is running (new tasks wait too)\nselftest containment: started, runtime runsc\nselftest containment: exit 0\nPASS  one check\n';
+  const [stOk, stFailed, stCut, stForged, stUnknown] = await Promise.all([
+    ringSelftest('containment'),
+    ringSelftest('scenes', { streams: { scenes: stream('scenes', { passed: 19, total: 20, exit: 1 }) } }),
+    ringSelftest('agent-loop', { streams: { 'agent-loop': stream('agent-loop', { end: false }) }, codes: { 'agent-loop': 255 } }),
+    ringSelftest('containment', { streams: { containment: forged } }),
+    ringSelftest('everything'),
+  ]);
+  const keepalive = /^CALL .* -o ServerAliveInterval=30 -o ServerAliveCountMax=6 deploy@192\.0\.2\.1 curl -sSN --fail-with-body -X POST -H 'content-type: application\/json' --data-binary @- 'http:\/\/127\.0\.0\.1:8080\/admin\/selftest'$/m;
+  check('scripts/ring.sh selftest sends {"suite":…} on stdin to POST /admin/selftest with SSH keepalives, and exits 0 only when the last line is "selftest <suite>: exit 0"; a non-zero exit line, a stream cut short (after an earlier "exit 0" line too) and an unknown suite fail',
+    stOk.status === 0 && keepalive.test(stOk.log) && stOk.posted.join() === 'containment'
+      && stFailed.status !== 0 && /the self-test failed: selftest scenes: exit 1$/m.test(stFailed.stderr)
+      && stCut.status !== 0 && /no final 'selftest agent-loop: exit N' line came back \(curl\/ssh exit 255\)/.test(stCut.stderr)
+      && stForged.status !== 0 && /no final 'selftest containment: exit N' line/.test(stForged.stderr)
+      && stUnknown.status !== 0 && stUnknown.log === '' && /suite must be agent-loop, containment or scenes/.test(stUnknown.stderr),
+    [stOk, stFailed, stCut, stForged, stUnknown].map((r) => `exit ${r.status}${r.posted.length ? `, posted ${r.posted.join(' ')}` : ''} ${deployLines(r)}`).join(' | '));
+
+  const deployStep = async (call, vm, { env = {}, cwd } = {}) => {
+    const dir = await fakeVm(vm);
+    const r = await runAsync('bash', ['-c', `source "$1"\n${call}`, 'deploy-test', deploySh],
+      { cwd, env: scriptEnv({ RING_RSYNC: noRsync, RING_URL: 'http://127.0.0.1:9', RING_FAKE_DIR: dir, ...env }) });
+    return { ...r, ...(await callsTo(dir)) };
+  };
+  const selftestStep = (vm, tries = 8) => deployStep(`STATUS_TRIES=${tries}; STATUS_PAUSE=0; run_selftests ${COMMIT}`, vm);
+  const [okIdle, okBusy, notTest] = await Promise.all([
+    selftestStep({}),
+    selftestStep({ busy: { running: 1, queued: 2, selftest: null }, statuses: [stored('0000000')] }),
+    deployStep(`run_selftests ${COMMIT}`, {}, { env: { RING_TEST: '' } }),
+  ]);
+  const inOrder = (r) => r.posted.join() === 'containment,scenes,agent-loop'
+    && (r.log.match(/^CALL .* -o ServerAliveInterval=30 -o ServerAliveCountMax=6 deploy@192\.0\.2\.1 curl -sSN .*'http:\/\/127\.0\.0\.1:8080\/admin\/selftest'$/gm) ?? []).length === 3;
+  check('scripts/deploy.sh --selftest: one POST /admin/selftest per suite, containment, scenes, agent-loop, through scripts/ring.sh with SSH keepalives; a busy VM is reported, not refused; then /status.json must show every result on the deployed commit under runsc, read again while it still shows earlier ones; sourced without RING_TEST=1 it stops',
+    okIdle.status === 0 && inOrder(okIdle) && /^idle: no task running or waiting, no self-test$/m.test(okIdle.stdout) && okIdle.statusReads === 1
+      && /^18\/18 containment checks passed\n18\/18 scenes checks passed\n18\/18 agent-loop checks passed$/m.test(okIdle.stdout)
+      && /^\/status\.json: agent-loop 168\/168 under runsc on abc1234 at 2026-11-04T15:07:00\.000Z$/m.test(okIdle.stdout)
+      && okBusy.status === 0 && inOrder(okBusy) && okBusy.statusReads === 2
+      && /^busy: 1 task\(s\) running, 2 waiting, self-test: none\. Each suite waits until no task runs/m.test(okBusy.stdout)
+      && notTest.status !== 0 && notTest.log === '' && /sourced only by tests, with RING_TEST=1/.test(notTest.stderr),
+    [okIdle, okBusy, notTest].map((r) => `exit ${r.status}, posted ${r.posted.join(' ') || 'nothing'}, ${r.statusReads} status read(s) ${deployLines(r)}`).join(' | '));
+
+  const [badRuntime, badExit, noExit, badCount, noStart, staleStatus] = await Promise.all([
+    selftestStep({ streams: { containment: stream('containment', { runtime: 'runc' }) } }),
+    selftestStep({ streams: { scenes: stream('scenes', { passed: 19, total: 20, exit: 1 }) } }),
+    selftestStep({ streams: { 'agent-loop': stream('agent-loop', { end: false }) } }),
+    selftestStep({ streams: { containment: stream('containment', { passed: 17, total: 18 }) } }),
+    selftestStep({ streams: { containment: '' }, codes: { containment: 255 } }),
+    selftestStep({ status: stored('0000000') }, 2),
+  ]);
+  check('scripts/deploy.sh --selftest stops at the first suite that fails and names it: a start under another runtime than runsc, a last line other than "exit 0" or none, a summary line with n ≠ m, no start at all; results in /status.json on another commit fail after its retries',
+    badRuntime.status !== 0 && /the containment self-test did not run under gVisor: 'selftest containment: started, runtime runc'/.test(badRuntime.stderr) && badRuntime.posted.join() === 'containment'
+      && badExit.status !== 0 && /the scenes self-test failed: its last line is 'selftest scenes: exit 1', not 'selftest scenes: exit 0'/.test(badExit.stderr) && badExit.posted.join() === 'containment,scenes'
+      && noExit.status !== 0 && /the agent-loop self-test failed: its last line is '18\/18 agent-loop checks passed', not 'selftest agent-loop: exit 0'/.test(noExit.stderr) && noExit.posted.length === 3
+      && badCount.status !== 0 && /the containment self-test did not pass every check: 17\/18 containment checks passed/.test(badCount.stderr) && badCount.posted.join() === 'containment'
+      && noStart.status !== 0 && /the containment self-test did not start \(no 'selftest containment: started' line; the last line: none\)/.test(noStart.stderr) && noStart.posted.join() === 'containment'
+      && [badRuntime, badExit, noExit, badCount, noStart].every((r) => r.statusReads === 0)
+      && staleStatus.status !== 0 && staleStatus.posted.length === 3 && staleStatus.statusReads === 2
+      && /^\/status\.json: containment 18\/18 under runsc on 0000000 at .* \(not a pass under runsc on abc1234\)$/m.test(staleStatus.stderr)
+      && /does not show every suite passing under runsc on abc1234/.test(staleStatus.stderr),
+    [badRuntime, badExit, noExit, badCount, noStart, staleStatus].map((r) => `exit ${r.status}, posted ${r.posted.join(' ') || 'nothing'}, ${r.statusReads} status read(s): ${deployLines(r)}`).join(' | '));
 
   check('no request reached the model service', gw.chats().length === 0, `${gw.chats().length} chat requests`);
 } catch (err) {

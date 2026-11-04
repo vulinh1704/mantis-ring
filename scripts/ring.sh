@@ -23,8 +23,9 @@
 #                             RING_ALLOW_PUBLIC=github (or yes), and yes alone lets one patch open both, as in
 #                             deploy.sh; the old publicRuns needs yes. Closing them never needs anything
 #   spend                     /admin/spend
-#   selftest <suite>          POST /admin/selftest (agent-loop | containment | scenes); streams its output
-#                             and exits with the suite's own exit code
+#   selftest <suite>          POST /admin/selftest (agent-loop | containment | scenes): the app waits until no
+#                             task runs and holds new ones until the suite ends. Streams its output, with SSH
+#                             keepalives while it waits, and exits with the suite's own exit code
 #   logs                      the last 300 lines of the app's journal
 #   mem [seconds]             the VM's memory, read-only (scripts/vm-mem.sh): free -m, then what each container (the
 #                             sandboxes, the proxy), the app, Caddy and Docker hold now, at most and at their limit;
@@ -43,11 +44,12 @@ HOST_ADDR=${RING_HOST:-$REAL_HOST}
 H=deploy@$HOST_ADDR
 SSH_BIN=${RING_SSH:-ssh}
 # IdentitiesOnly: only the deploy key is ever offered, never an agent's key or a default identity.
-S=("$SSH_BIN" -i ~/.ssh/vultr_ring_deploy -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 "$H")
+SSH_OPTS=(-i ~/.ssh/vultr_ring_deploy -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10)
+S=("$SSH_BIN" "${SSH_OPTS[@]}" "$H")
 APP=http://127.0.0.1:8080
 
 die() { printf 'ring.sh: %s\n' "$*" >&2; exit 1; }
-usage() { sed -n '8,39p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '8,40p' "$0" | sed 's/^# \{0,1\}//'; }
 if [ -n "${RING_SSH:-}" ] && [ ! -x "$RING_SSH" ]; then die "RING_SSH is set but is not an executable file: $RING_SSH"; fi
 if [ "${RING_TEST:-}" = 1 ]; then
   [ "$HOST_ADDR" != "$REAL_HOST" ] || die "RING_TEST=1, but the host is the real VM: set RING_HOST"
@@ -147,16 +149,20 @@ case "$cmd" in
   selftest)
     [[ ${1:-} =~ ^(agent-loop|containment|scenes)$ ]] || die "suite must be agent-loop, containment or scenes"
     # The app answers 200 before the suite starts and reports the outcome in its last line
-    # ("selftest <suite>: exit N"), so the exit code comes from that line, not from curl.
+    # ("selftest <suite>: exit N"), so the exit code comes from that line, not from curl; a stream
+    # cut short ends with another line and fails. Before the suite starts, the app may say nothing
+    # for as long as running tasks take: keepalives hold an idle connection open and end a dead one
+    # within 3 minutes.
     tmp=$(mktemp /tmp/ring-selftest.XXXXXX)
     trap 'rm -f "$tmp"' EXIT
     rc=0
-    printf '{"suite":"%s"}' "$1" | "${S[@]}" "curl -sSN --fail-with-body -X POST -H 'content-type: application/json' --data-binary @- '$APP/admin/selftest'" | tee "$tmp" || rc=$?
-    last=$(grep -E "^selftest $1: (exit|could not start)" "$tmp" | tail -n 1 || true)
+    printf '{"suite":"%s"}' "$1" | "$SSH_BIN" "${SSH_OPTS[@]}" -o ServerAliveInterval=30 -o ServerAliveCountMax=6 "$H" \
+      "curl -sSN --fail-with-body -X POST -H 'content-type: application/json' --data-binary @- '$APP/admin/selftest'" | tee "$tmp" || rc=$?
+    last=$(grep -v -E '^[[:space:]]*$' "$tmp" | tail -n 1 || true)
     case "$last" in
       "selftest $1: exit 0") exit 0 ;;
-      '') die "no final 'selftest $1: exit N' line came back (curl/ssh exit $rc)" ;;
-      *) die "the self-test failed: $last" ;;
+      "selftest $1: exit "* | "selftest $1: could not start"*) die "the self-test failed: $last" ;;
+      *) die "no final 'selftest $1: exit N' line came back (curl/ssh exit $rc)" ;;
     esac ;;
   logs) "${S[@]}" 'sudo journalctl -u mantis-ring -n 300 --no-pager' ;;
   mem)
