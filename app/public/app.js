@@ -33,6 +33,8 @@
   const EVENT_TYPES = ['state', 'step', 'log', 'model', 'tool', 'look', 'gate', 'vision', 'receipt', 'done'];
   const FINISHED = new Set(['done', 'failed', 'timeout', 'cancelled', 'interrupted']);
   const MAX_LOG_LINES = 600;
+  /** What a published public run says instead of Approve: the server then wants the demo owner's passphrase too. */
+  const PUBLISHED_APPROVAL = "This run has been published, so approving it also needs the demo owner's approval passphrase, which this link does not carry; its diff stays readable on this page.";
 
   const $ = (id) => document.getElementById(id);
   /** A new element with an optional class and text. Text always goes in through textContent. */
@@ -108,6 +110,11 @@
     if (cfg.publicGithubRuns === true) {
       const input = $('repo-url');
       const go = $('run-repo');
+      // The wall clock comes from the server's caps; time spent waiting in line comes on top.
+      const wall = Number(cfg.githubWallClockSec);
+      if (Number.isFinite(wall) && wall > 0) {
+        $('repo-note').append(document.createTextNode(` Once it starts, a run takes up to ${Math.ceil(wall / 60)} minutes.`));
+      }
       $('repo-try').hidden = false;
       const start = () => { if (!go.disabled) startRun({ repo: input.value.trim() }, go); };
       go.addEventListener('click', start);
@@ -304,6 +311,10 @@
         d.addEventListener('click', () => downloadPatch(S, d));
         box.append(d);
       }
+    } else if (t.approvalNeedsPassphrase && t.origin === 'public') {
+      // A public run asks for the passphrase only once it has been published (passphraseFor in
+      // server.mjs). Its owner link cannot approve it alone then, so no box and no button, one sentence.
+      box.append(el('span', 'hint', PUBLISHED_APPROVAL));
     } else if (S.owner) {
       const a = button('Approve', true);
       let pass = null;

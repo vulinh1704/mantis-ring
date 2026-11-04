@@ -238,6 +238,9 @@ try {
   check('the home page keeps the GitHub row hidden until its switch opens; app.js reads publicSampleRuns and publicGithubRuns, never publicRuns',
     /<li id="repo-try" hidden>/.test(home.text) && /cfg\.publicSampleRuns === true/.test(appJs) && /cfg\.publicGithubRuns === true/.test(appJs) && !/\bpublicRuns\b/.test(appJs),
     `row hidden: ${/<li id="repo-try" hidden>/.test(home.text)}; app.js mentions publicRuns: ${/\bpublicRuns\b/.test(appJs)}`);
+  check('the GitHub row names no fixed run time: app.js fills it from /api/config (githubWallClockSec)',
+    !/\d+\s*minutes/.test(home.text) && /id="repo-note"/.test(home.text) && /cfg\.githubWallClockSec/.test(appJs),
+    `minutes in index.html: ${/\d+\s*minutes/.exec(home.text)?.[0] ?? 'none'}; app.js reads githubWallClockSec: ${/cfg\.githubWallClockSec/.test(appJs)}`);
   const st = await visitor('203.0.113.1', 'GET', '/status');
   const stj = await visitor('203.0.113.1', 'GET', '/status.json');
   check('GET /status (HTML) and /status.json answer; neither shows the key or the environment',
@@ -419,6 +422,13 @@ try {
     unknownKey.status === 400 && badValue.status === 400 && oldOpen.status === 400 && /publicSampleRuns/.test(oldOpen.json?.error ?? '')
       && stillShut.json?.publicSampleRuns === false && stillShut.json?.publicGithubRuns === false,
     `${unknownKey.status}, ${badValue.status}, ${oldOpen.status} ${oneLine(oldOpen.json?.error)}`);
+  const longer = await admin('POST', '/admin/config', { body: { caps: { wallClockSec: 1500 } } });
+  const cfgLonger = await visitor('203.0.113.1', 'GET', '/api/config');
+  const back = await admin('POST', '/admin/config', { body: { caps: { wallClockSec: 900 } } });
+  const cfgBack = await visitor('203.0.113.1', 'GET', '/api/config');
+  check('/api/config gives the GitHub wall clock from the caps: 1200 s by default, the default wall clock once an admin raises it above that',
+    cfg.json?.githubWallClockSec === 1200 && longer.status === 200 && cfgLonger.json?.githubWallClockSec === 1500 && back.status === 200 && cfgBack.json?.githubWallClockSec === 1200,
+    `default ${cfg.json?.githubWallClockSec}; wall clock 1500 → ${cfgLonger.json?.githubWallClockSec} (${longer.status}); back to 900 → ${cfgBack.json?.githubWallClockSec}`);
   const open = await admin('POST', '/admin/config', { body: { publicSampleRuns: true } });
   const cfgOpen = await visitor('203.0.113.1', 'GET', '/api/config');
   const stOpen = await visitor('203.0.113.1', 'GET', '/status.json');
@@ -503,7 +513,13 @@ try {
     await writeFile(latestFile, `${JSON.stringify({ taskId: shownId, at: new Date().toISOString(), line: '1 fixed · 0 new · 0 cover-ups · 0 lost' })}\n`);
     try {
       const shownOwner = { 'x-ring-owner': shown.json.ownerToken };
-      const asks = recordOf((await visitor('203.0.113.31', 'GET', `/api/tasks/${shownId}`)).json)?.approvalNeedsPassphrase;
+      const shownView = recordOf((await visitor('203.0.113.31', 'GET', `/api/tasks/${shownId}`)).json);
+      const asks = shownView?.approvalNeedsPassphrase;
+      // The run page (app.js) shows its owner one sentence then, not a passphrase box it cannot fill.
+      check('the run page shows a published public run one sentence instead of the passphrase box and Approve (origin public, a passphrase asked)',
+        shownView?.origin === 'public' && asks === true && /t\.approvalNeedsPassphrase && t\.origin === 'public'/.test(appJs)
+          && /This run has been published, so approving it also needs the demo owner's approval passphrase/.test(appJs),
+        `origin ${shownView?.origin}, asks ${asks}; app.js has the sentence: ${/This run has been published/.test(appJs)}`);
       const linkOnly = await visitor('203.0.113.31', 'POST', `/api/tasks/${shownId}/approve`, { body: {}, headers: shownOwner });
       const withPass = await visitor('203.0.113.31', 'POST', `/api/tasks/${shownId}/approve`, { body: { passphrase: PASSPHRASE }, headers: shownOwner });
       const shownRec = recordOf((await admin('GET', `/admin/tasks/${shownId}`)).json);

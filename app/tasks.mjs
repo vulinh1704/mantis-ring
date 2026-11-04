@@ -620,6 +620,14 @@ export function taskFromBody(body, { admin = false, cfg }) {
 /** Default caps for a source: 15 minutes for a sample, 20 for a GitHub repository (§2.4). */
 function capsFor(source, base) {
   const caps = structuredClone(base);
-  if (source.kind === 'github') caps.wallClockSec = Math.min(Math.max(caps.wallClockSec, GITHUB_WALL_CLOCK_SEC), CAP_RANGES.wallClockSec[1]);
+  if (source.kind === 'github') caps.wallClockSec = githubWallClockSec(caps);
   return caps;
+}
+
+/**
+ * The wall clock of a GitHub run, in seconds, under the default caps `base` (config caps): at least
+ * GITHUB_WALL_CLOCK_SEC, at most the highest wall clock a cap may take. /api/config shows it.
+ */
+export function githubWallClockSec(base) {
+  return Math.min(Math.max(base.wallClockSec, GITHUB_WALL_CLOCK_SEC), CAP_RANGES.wallClockSec[1]);
 }

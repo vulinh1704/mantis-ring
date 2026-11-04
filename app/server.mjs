@@ -23,7 +23,7 @@ import { PublishError, notPublishable, publishLatest, refreshPlaceholder } from 
 import { Spend } from './spend.mjs';
 import * as statusModule from './status.mjs';
 import { oneLine, readLatest } from './status.mjs';
-import { INTERRUPTED, Queue, QueueFullError, RunStats, TaskInputError, TaskStore, taskFromBody } from './tasks.mjs';
+import { INTERRUPTED, Queue, QueueFullError, RunStats, TaskInputError, TaskStore, githubWallClockSec, taskFromBody } from './tasks.mjs';
 
 const PUBLIC_ROOT = fileURLToPath(new URL('./public/', import.meta.url));
 const REPO_ROOT = fileURLToPath(new URL('../', import.meta.url));
@@ -333,8 +333,10 @@ function sseFrame(type, data, seq) {
  * tally and guard. Without them, /admin/probe answers 503 and runs skip the vision check.
  * `approval.passphraseSha256` (hex; read at call time, so a test may change it): when set, approving an
  * admin run, or a run that has been published, also needs the owner's approval passphrase, which the
- * operator of the admin channel never holds. A public run is approved with its own owner link, and so
- * is every run while no passphrase is set; the record and the published page then say exactly that.
+ * operator of the admin channel never holds. A public run that was never published is approved with
+ * its own owner link, and so is every run while no passphrase is set; the record and the published
+ * page then say exactly that. A published public run needs both, so the judge who started it, who
+ * has only the link, can no longer approve it or download its patch (its diff stays public).
  * @param {{config?:{get():object, set(patch:object):object}, store?:TaskStore, queue?:Queue, spend?:object|null,
  *   runFix?:Function|null, publish?:typeof publishLatest, status?:{statusData:Function, statusHtml:Function},
  *   now?:() => number, probe?:{probeAll:Function}|null, vision?:Function|null, stats?:RunStats, log?:(line:string) => void,
@@ -372,9 +374,13 @@ export function createApp(deps = {}) {
   /**
    * The passphrase hash that approving this run needs, or null when its owner link alone approves it.
    * An admin run needs the passphrase: the operator who started it holds its owner link too. So does
-   * a run that has been published (it is on /latest/, or was), because its approval is shown there,
-   * and approving the run on /latest/ renders that page again. A public run's owner token went only to
-   * the browser that started it, so its owner approves it with that link, as before.
+   * a run that has been published (it is on /latest/, or was), whatever its origin, because its
+   * approval is shown there, and approving the run on /latest/ renders that page again: an operator
+   * who publishes a public run cannot have it approved on /latest/ by a link alone. A public run's
+   * owner token went only to the browser that started it, so until the run is published its owner
+   * approves it with that link alone. Once it is published, the run page shows that owner one
+   * sentence instead of the passphrase box (app.js). The alternative, a passphrase for admin runs
+   * only, would let that judge approve their published run, but not keep /latest/ to this rule.
    */
   const passphraseFor = (rec) => {
     const want = approvalHash();
@@ -748,9 +754,10 @@ export function createApp(deps = {}) {
    * prove a person: the admin channel that created the run holds it too, and could send it through
    * Caddy. So when the owner has set an approval passphrase on the server
    * (RING_APPROVE_PASSPHRASE_SHA256 in the service's environment, which the operator cannot read),
-   * approving an admin run needs that passphrase, and so does approving a published run, whose
-   * approval /latest/ shows (passphraseFor). A public run's token went only to the browser that
-   * started it, so its owner approves it with that token alone, and can then download the patch. The
+   * approving an admin run needs that passphrase, and so does approving a published run of either
+   * origin, whose approval /latest/ shows (passphraseFor). A public run's token went only to the
+   * browser that started it, so until the run is published its owner approves it with that token
+   * alone, and can then download the patch; once it is published, the token alone is refused. The
    * record keeps which of the two approved the run, and the published page says no more than that.
    */
   async function approveTask(c) {
@@ -1021,6 +1028,7 @@ export function createApp(deps = {}) {
         publicSampleRuns: cfg.publicSampleRuns === true, publicGithubRuns: cfg.publicGithubRuns === true,
         provider: PROVIDER, fixModel: cfg.fixModel, visionModel: cfg.visionModel,
         samples: Object.entries(SAMPLES).map(([id, s]) => ({ id, label: s.label, etaText })),
+        githubWallClockSec: githubWallClockSec(cfg.caps),   // the longest a GitHub run may take once it starts
         latest: readLatest(),   // null until a run is published
       });
     }],
@@ -1206,7 +1214,7 @@ async function main() {
   const approval = { passphraseSha256: /^[0-9a-f]{64}$/i.test(approveHash) ? approveHash : null };
   if (approveHash && !approval.passphraseSha256) log('startup: RING_APPROVE_PASSPHRASE_SHA256 is not 64 hex digits, so it is ignored');
   log(`startup: approval ${approval.passphraseSha256
-    ? 'needs the owner link and the approval passphrase for admin runs and published runs; a public run needs only its owner link'
+    ? 'needs the owner link and the approval passphrase for admin runs and published runs; a public run that was never published needs only its owner link'
     : 'needs the owner link only (no approval passphrase is set)'}`);
 
   const app = createApp({
