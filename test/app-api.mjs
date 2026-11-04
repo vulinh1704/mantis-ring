@@ -1125,6 +1125,65 @@ esac
       && /does not show every suite passing under runsc on abc1234/.test(staleStatus.stderr),
     [badRuntime, badExit, noExit, badCount, noStart, staleStatus].map((r) => `exit ${r.status}, posted ${r.posted.join(' ') || 'nothing'}, ${r.statusReads} status read(s): ${deployLines(r)}`).join(' | '));
 
+  // The outside checks of scripts/deploy.sh against a fake site on 127.0.0.1 that stands in for Caddy
+  // and the app: RING_HEALTHCHECK's script when it is set, the built-in health check otherwise.
+  const site = { seen: [], status: '<code>runtime: runsc</code>', latest: 200 };
+  const siteServer = http.createServer((req, res) => {
+    site.seen.push(req.url);
+    const send = (code, type, body) => { res.writeHead(code, { 'content-type': type }); res.end(body); };
+    if (req.url === '/') return send(200, 'text/html', '<title>Mantis Ring</title>');
+    if (req.url === '/latest/') return send(site.latest, 'text/html', '<title>Latest verified run</title>');
+    if (req.url === '/status') return send(200, 'text/html', site.status);
+    if (req.url === '/api/config') return send(200, 'application/json', JSON.stringify({ publicSampleRuns: false, publicGithubRuns: false }));
+    return send(404, 'application/json', '{"error":"Not found."}');
+  });
+  await new Promise((ok) => siteServer.listen(0, '127.0.0.1', ok));
+  try {
+    const siteUrl = `http://127.0.0.1:${siteServer.address().port}`;
+    const hcDir = path.join(stateDir, 'healthchecks');
+    const hcArgsFile = path.join(stateDir, 'healthcheck-args.txt');
+    await mkdir(hcDir, { recursive: true });
+    await writeFile(path.join(hcDir, 'hc-ok.sh'), `printf '%s\\n' "$*" > '${hcArgsFile}'\necho "2026-11-04T15:00:00Z OK $1 | stand-in"\n`);
+    await writeFile(path.join(hcDir, 'hc-fail.sh'), `printf '%s\\n' "$*" > '${hcArgsFile}'\necho "2026-11-04T15:00:00Z FAIL $1 | stand-in"\nexit 1\n`);
+    const outside = async (env = {}, cwd = undefined) => {
+      site.seen = [];
+      await rm(hcArgsFile, { force: true });
+      const r = await deployStep('outside_checks', {}, { cwd, env: { RING_URL: siteUrl, ...env } });
+      return { ...r, seen: site.seen.join(' '), hcArgs: (await readFile(hcArgsFile, 'utf8').catch(() => '')).trim() };
+    };
+    const okLine = new RegExp(`^\\S+ OK ${siteUrl.replace(/[.]/g, '\\.')} \\| / 200 [0-9.]+s \\| /latest/ 200 [0-9.]+s \\| /status 200 [0-9.]+s$`, 'm');
+    const builtIn = await outside();
+    Object.assign(site, { status: '<code>runtime: unavailable</code>', latest: 404 });
+    const builtInFails = await outside();
+    Object.assign(site, { status: '<code>runtime: runsc</code>', latest: 200 });
+    check('scripts/deploy.sh outside checks without RING_HEALTHCHECK: /, /latest/ and /status must answer 200 and /status name runsc, in one line as healthcheck.sh prints it, then /admin/health must be a 404 and both switches closed; a page that is not 200 or a /status without runsc stops the deploy',
+      builtIn.status === 0 && okLine.test(builtIn.stdout) && /^\/admin\/health through Caddy: 404$/m.test(builtIn.stdout)
+        && /^public runs: sample false, GitHub false$/m.test(builtIn.stdout) && builtIn.seen === '/ /latest/ /status /admin/health /api/config' && builtIn.log === ''
+        && builtInFails.status !== 0 && /^\S+ FAIL .* \| \/latest\/ 404 [0-9.]+s FAIL \| \/status 200 [0-9.]+s \(no 'runsc'\)$/m.test(builtInFails.stderr)
+        && /deploy: the outside health check did not pass/.test(builtInFails.stderr) && builtInFails.seen === '/ /latest/ /status',
+      `ok: exit ${builtIn.status}, asked ${builtIn.seen}: ${oneLine(builtIn.stdout)} | failing: exit ${builtInFails.status}, asked ${builtInFails.seen}: ${oneLine(builtInFails.stderr)}`);
+
+    const viaScript = await outside({ RING_HEALTHCHECK: 'hc-ok.sh' }, hcDir);
+    const scriptFails = await outside({ RING_HEALTHCHECK: path.join(hcDir, 'hc-fail.sh') });
+    const noScript = await outside({ RING_HEALTHCHECK: path.join(hcDir, 'no-such-healthcheck.sh') });
+    const dirScript = await outside({ RING_HEALTHCHECK: hcDir });
+    check('scripts/deploy.sh outside checks with RING_HEALTHCHECK: that script runs with the URL and --status-grep runsc instead of the built-in checks (a relative path is the caller\'s), and its failure stops the deploy; a RING_HEALTHCHECK that is no readable file stops deploy.sh before anything runs',
+      viaScript.status === 0 && viaScript.hcArgs === `${siteUrl} --status-grep runsc` && viaScript.stdout.includes(`OK ${siteUrl} | stand-in`)
+        && viaScript.seen === '/admin/health /api/config'
+        && scriptFails.status !== 0 && scriptFails.stderr.includes(`FAIL ${siteUrl} | stand-in`) && /hc-fail\.sh did not pass \(its line above\)/.test(scriptFails.stderr) && scriptFails.seen === ''
+        && noScript.status !== 0 && /RING_HEALTHCHECK is set but is not a readable file: \S*no-such-healthcheck\.sh/.test(noScript.stderr) && noScript.seen === '' && noScript.hcArgs === ''
+        && dirScript.status !== 0 && /RING_HEALTHCHECK is set but is not a readable file/.test(dirScript.stderr) && dirScript.seen === '',
+      [viaScript, scriptFails, noScript, dirScript].map((r) => `exit ${r.status}, args '${r.hcArgs}', asked '${r.seen}' ${deployLines(r)}`).join(' | '));
+
+    const urls = ['', 'https://104-156-252-200.sslip.io', 'http://104-156-252-200.sslip.io', 'https://127.0.0.1', 'http://192.0.2.1:8080'];
+    const refusedUrls = await Promise.all(urls.map((u) => outside({ RING_URL: u })));
+    check('scripts/deploy.sh with RING_TEST=1 refuses any RING_URL but a loopback http:// address (the real site is the default), before anything runs',
+      refusedUrls.every((r) => r.status !== 0 && /RING_TEST=1, but RING_URL is not a loopback http:\/\/ address/.test(r.stderr) && r.log === '') && site.seen.length === 0,
+      refusedUrls.map((r, i) => `'${urls[i]}': exit ${r.status} ${deployLines(r)}`).join(' | '));
+  } finally {
+    siteServer.close();
+  }
+
   check('no request reached the model service', gw.chats().length === 0, `${gw.chats().length} chat requests`);
 } catch (err) {
   check('app-api tests ran to the end', false, `stopped: ${err.stack?.split('\n').slice(0, 3).join(' ') ?? err}`);

@@ -19,12 +19,20 @@
 # Once the owner opens public runs (D-5): RING_ALLOW_PUBLIC=sample accepts open sample runs while
 # GitHub runs must still be closed, github the other way round, and yes accepts both open (the same
 # values that let scripts/ring.sh config open each switch).
+# RING_HEALTHCHECK=<script>: the outside checks run `bash <script> <url> --status-grep runsc`, which must
+# exit 0 (the deployment templates' healthcheck.sh takes these arguments), instead of the built-in
+# ones: /, /latest/ and /status answer 200 within 20 s, /status names runsc, and an https:// address
+# has a certificate with 7 days or more left. When set, it must name a readable file.
 # Environment, for tests only: RING_SSH, RING_RSYNC (programs to use instead of ssh and rsync; they
 # must be executable), RING_HOST, RING_URL. With RING_TEST=1 the script refuses to run unless both
-# programs are test stand-ins and the host is not the real VM, so a broken fake can never fall
-# through to the real ssh. test/app-api.mjs sources this file with RING_TEST=1 to run single steps
-# against stand-ins: sourced, it only defines its functions and deploys nothing.
+# programs are test stand-ins, the host is not the real VM and RING_URL is a loopback http:// address,
+# so a broken fake can never fall through to the real ssh or the real site. test/app-api.mjs sources
+# this file with RING_TEST=1 to run single steps against stand-ins: sourced, it only defines its
+# functions and deploys nothing.
 set -euo pipefail
+# RING_HEALTHCHECK is a path from the caller's folder, so a relative one is resolved before the cd.
+HEALTHCHECK=${RING_HEALTHCHECK:-}
+[ -z "$HEALTHCHECK" ] || [[ $HEALTHCHECK == /* ]] || HEALTHCHECK=$PWD/$HEALTHCHECK
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 REAL_HOST=104.156.252.200
 HOST_ADDR=${RING_HOST:-$REAL_HOST}
@@ -36,7 +44,6 @@ KEY=~/.ssh/vultr_ring_deploy
 SSH_OPTS=(-i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10)
 S=("$SSH_BIN" "${SSH_OPTS[@]}" "$H")
 URL=${RING_URL:-https://104-156-252-200.sslip.io}
-HEALTHCHECK=/mnt/g/Work/MyCompany/FindJob/30-projects/mantis/vultr-pack/deploy/healthcheck.sh
 PATHS=(app agent runner test scripts demo sandbox proxy bench)
 # Anchored where they must be (/out, /state, /.ring-public); excluded paths on the VM are never deleted.
 EXCLUDES='--exclude .git --exclude node_modules --exclude /out --exclude .mantis --exclude /state --exclude /.ring-public'
@@ -57,12 +64,15 @@ for v in RING_SSH RING_RSYNC; do
 done
 if [ "${RING_TEST:-}" = 1 ]; then
   [ "$HOST_ADDR" != "$REAL_HOST" ] || die "RING_TEST=1, but the host is the real VM: set RING_HOST"
+  # The outside checks would reach the real site (the default URL): only a loopback http:// address.
+  [[ $URL =~ ^http://(127\.0\.0\.1|localhost)(:[0-9]{1,5})?$ ]] || die "RING_TEST=1, but RING_URL is not a loopback http:// address: '$URL'"
   for b in "$SSH_BIN" "$RSYNC_BIN"; do
     case "$(command -v -- "$b" || true)" in
       '' | /usr/bin/* | /bin/* | /usr/local/bin/*) die "RING_TEST=1, but '$b' is not a test stand-in: set RING_SSH and RING_RSYNC" ;;
     esac
   done
 fi
+[ -z "$HEALTHCHECK" ] || { [ -f "$HEALTHCHECK" ] && [ -r "$HEALTHCHECK" ]; } || die "RING_HEALTHCHECK is set but is not a readable file: $HEALTHCHECK"
 
 # busy_state: "<running> <queued> <selftest|none>" from the app on the VM; "down" when nothing listens
 # on its port (curl exit 7); "unknown" for anything else (a timeout, an answer without numbers).
@@ -201,6 +211,81 @@ run_selftests() {
   die "/status.json does not show every suite passing under runsc on $commit (lines above)"
 }
 
+# builtin_healthcheck: the outside checks' own health check when RING_HEALTHCHECK is not set, as strict
+# as the deployment templates' healthcheck.sh: /, /latest/ and /status answer 200 within 20 s, /status
+# names runsc (the page shows that word only when Docker lists gVisor), and an https:// address has a
+# certificate with 7 days or more left. Prints one line, as healthcheck.sh does; fails when a check fails.
+builtin_healthcheck() {
+  local fail=0 parts=() p out code secs item hostport connect end end_s days
+  for p in / /latest/ /status; do
+    out=$(curl -sS --max-time 20 -w '\n%{http_code} %{time_total}' "$URL$p" 2> /dev/null || true)
+    code='' secs=''
+    read -r code secs <<< "${out##*$'\n'}" || true
+    [[ $code =~ ^[0-9]{3}$ ]] || code=000
+    if [[ $secs =~ ^[0-9]+(\.[0-9]{1,2})? ]]; then secs=${BASH_REMATCH[0]}; else secs=0; fi
+    item="$p $code ${secs}s"
+    if [ "$code" != 200 ]; then
+      fail=1
+      item="$item FAIL"
+    elif [ "$p" = /status ] && [[ $out != *runsc* ]]; then
+      fail=1
+      item="$item (no 'runsc')"
+    fi
+    parts+=("$item")
+  done
+  if [[ $URL == https://* ]]; then
+    hostport=${URL#https://}
+    hostport=${hostport%%/*}
+    connect=$hostport
+    [[ $hostport == *:* ]] || connect=$hostport:443
+    end=$(timeout 20 openssl s_client -servername "${hostport%%:*}" -connect "$connect" < /dev/null 2> /dev/null \
+      | openssl x509 -noout -enddate 2> /dev/null | cut -d= -f2 || true)
+    end_s=$(date -d "$end" +%s 2> /dev/null || true)
+    if [ -n "$end" ] && [[ $end_s =~ ^[0-9]+$ ]]; then
+      days=$(( (end_s - $(date +%s)) / 86400 ))
+      [ "$days" -ge 7 ] || fail=1
+      parts+=("cert ${days}d")
+    else
+      fail=1
+      parts+=("cert unreadable")
+    fi
+  fi
+  if [ "$fail" = 0 ]; then item=OK; else item=FAIL; fi
+  echo "$(date -u +%FT%TZ) $item $URL$(printf ' | %s' "${parts[@]}")"
+  [ "$fail" = 0 ]
+}
+
+# outside_checks: step 9, the site as a judge reaches it: the health check (RING_HEALTHCHECK's script,
+# or the built-in one), /admin/* a 404 through Caddy, and both public switches closed (D-5), or only
+# what RING_ALLOW_PUBLIC allows open.
+outside_checks() {
+  local hc admin_code api_config sample_runs github_runs
+  if [ -n "$HEALTHCHECK" ]; then
+    hc=$(bash "$HEALTHCHECK" "$URL" --status-grep runsc) || { printf '%s\n' "$hc" >&2; die "$HEALTHCHECK did not pass (its line above)"; }
+  else
+    hc=$(builtin_healthcheck) || { printf '%s\n' "$hc" >&2; die "the outside health check did not pass (its line above)"; }
+  fi
+  printf '%s\n' "$hc"
+  admin_code=$(curl -s -o /dev/null -m 20 -w '%{http_code}' "$URL/admin/health" || true)
+  [ "$admin_code" = 404 ] || die "$URL/admin/health answered $admin_code (it must be 404): the admin API may be public. Fix this before anything else."
+  echo "/admin/health through Caddy: 404"
+  # Each switch reads true, false, or '' when /api/config did not answer or lacks it (anything but false is open).
+  api_config=$(curl -fsS -m 20 "$URL/api/config" || true)
+  sample_runs=$(printf '%s' "$api_config" | json_field publicSampleRuns)
+  github_runs=$(printf '%s' "$api_config" | json_field publicGithubRuns)
+  case "${RING_ALLOW_PUBLIC:-}" in
+    yes) ;;
+    sample)
+      [ "$github_runs" = false ] || die "$URL/api/config says publicGithubRuns is '$github_runs': runs on GitHub repositories must stay closed with RING_ALLOW_PUBLIC=sample (D-5). Close them with scripts/ring.sh config, or set RING_ALLOW_PUBLIC=yes once the owner opens them." ;;
+    github)
+      [ "$sample_runs" = false ] || die "$URL/api/config says publicSampleRuns is '$sample_runs': runs of the sample must stay closed with RING_ALLOW_PUBLIC=github (D-5). Close them with scripts/ring.sh config, or set RING_ALLOW_PUBLIC=yes once the owner opens them." ;;
+    *)
+      [ "$sample_runs" = false ] && [ "$github_runs" = false ] \
+        || die "$URL/api/config says publicSampleRuns is '$sample_runs' and publicGithubRuns is '$github_runs': public runs must stay closed (D-5). Close them with scripts/ring.sh config, or set RING_ALLOW_PUBLIC=sample or yes once the owner opens them." ;;
+  esac
+  echo "public runs: sample ${sample_runs:-unknown}, GitHub ${github_runs:-unknown}"
+}
+
 # Sourced by a test (only with RING_TEST=1, so the guard above has run): the functions are defined, and
 # nothing below runs.
 if [ "${BASH_SOURCE[0]}" != "$0" ]; then
@@ -214,7 +299,7 @@ for arg in "$@"; do
     --dirty) dirty=yes ;;
     --force) force=yes ;;
     --selftest) selftest=yes ;;
-    -h | --help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h | --help) sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "usage: scripts/deploy.sh [--dirty] [--force] [--selftest]" >&2; exit 64 ;;
   esac
 done
@@ -310,30 +395,7 @@ echo "the app answers /status.json"
 # 9. From outside, as a judge: the pages answer, gVisor is on, the admin API is not reachable, and
 # both public switches are still closed (D-5), or only what RING_ALLOW_PUBLIC allows is open.
 say "9/11 outside checks ($URL)"
-if hc=$(bash "$HEALTHCHECK" "$URL" --status-grep runsc); then
-  echo "$hc"
-else
-  echo "$hc" >&2
-  die "the healthcheck did not print OK (line above)"
-fi
-admin_code=$(curl -s -o /dev/null -m 20 -w '%{http_code}' "$URL/admin/health" || true)
-[ "$admin_code" = 404 ] || die "$URL/admin/health answered $admin_code (it must be 404): the admin API may be public. Fix this before anything else."
-echo "/admin/health through Caddy: 404"
-# Each switch reads true, false, or '' when /api/config did not answer or lacks it (anything but false is open).
-api_config=$(curl -fsS -m 20 "$URL/api/config" || true)
-sample_runs=$(printf '%s' "$api_config" | json_field publicSampleRuns)
-github_runs=$(printf '%s' "$api_config" | json_field publicGithubRuns)
-case "${RING_ALLOW_PUBLIC:-}" in
-  yes) ;;
-  sample)
-    [ "$github_runs" = false ] || die "$URL/api/config says publicGithubRuns is '$github_runs': runs on GitHub repositories must stay closed with RING_ALLOW_PUBLIC=sample (D-5). Close them with scripts/ring.sh config, or set RING_ALLOW_PUBLIC=yes once the owner opens them." ;;
-  github)
-    [ "$sample_runs" = false ] || die "$URL/api/config says publicSampleRuns is '$sample_runs': runs of the sample must stay closed with RING_ALLOW_PUBLIC=github (D-5). Close them with scripts/ring.sh config, or set RING_ALLOW_PUBLIC=yes once the owner opens them." ;;
-  *)
-    [ "$sample_runs" = false ] && [ "$github_runs" = false ] \
-      || die "$URL/api/config says publicSampleRuns is '$sample_runs' and publicGithubRuns is '$github_runs': public runs must stay closed (D-5). Close them with scripts/ring.sh config, or set RING_ALLOW_PUBLIC=sample or yes once the owner opens them." ;;
-esac
-echo "public runs: sample ${sample_runs:-unknown}, GitHub ${github_runs:-unknown}"
+outside_checks
 
 # 10. Self-tests under gVisor, through the app's queue: no task runs beside them.
 if [ "$selftest" = yes ]; then
