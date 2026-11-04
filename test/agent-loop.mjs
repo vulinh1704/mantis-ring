@@ -599,7 +599,7 @@ async function u10() {
 async function u11() {
   const sandbox = await load('../runner/sandbox.mjs');
   if (!sandbox) return;
-  const { Sandbox, TASK_LABEL, run } = sandbox;
+  const { NETWORK_OPTIONS, Sandbox, TASK_LABEL, run } = sandbox;
   const dir = mkdtempSync(path.join(os.tmpdir(), 'ring-fake-docker-'));
   const stateFile = path.join(dir, 'state.json');
   const q = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
@@ -626,9 +626,10 @@ async function u11() {
     const na = s.networks[a.network];
     const ca = s.containers[a.name];
     const at = (log, prefix) => log.findIndex((l) => l.startsWith(prefix));
-    const made = [at(s.log, `network create --internal --label ${TASK_LABEL}`), at(s.log, `network connect ${a.network} ring-proxy`), at(s.log, `run -d --name ${a.name}`)];
-    check('U11 create(): the sandbox gets its own internal network ring-task-<id>, labelled like it, with ring-proxy on it and in its /etc/hosts',
+    const made = [at(s.log, `network create ${(NETWORK_OPTIONS ?? []).join(' ')} --label ${TASK_LABEL}`), at(s.log, `network connect ${a.network} ring-proxy`), at(s.log, `run -d --name ${a.name}`)];
+    check('U11 create(): the sandbox gets its own internal network ring-task-<id>, with no host address on it (inhibit_ipv4, IPv6 off), labelled like it, with ring-proxy on it and in its /etc/hosts',
       a.network === `ring-task-${a.name.slice('ring-'.length)}` && na?.internal === true && na.labels['mantis-ring'] === 'task'
+        && na.options?.['com.docker.network.bridge.inhibit_ipv4'] === 'true' && na.ipv6 === false
         && na.labels['mantis-ring.sandbox'] === a.name && na.labels['mantis-ring.owner'] === 'app' && na.labels['mantis-ring.task'] === 't_u11a'
         && Boolean(na.members['ring-proxy']) && ca?.network === a.network && ca.addHost.includes(`ring-proxy:${na.members['ring-proxy']}`)
         && made[0] >= 0 && made[0] < made[1] && made[1] < made[2],

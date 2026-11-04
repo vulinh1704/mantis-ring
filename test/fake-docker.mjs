@@ -21,7 +21,7 @@ if (args[0] === 'fake-docker-ping') {
 }
 
 const VALUE_FLAGS = ['--label', '--filter', '--format', '--name', '--network', '--add-host', '--type', '--tmpfs', '--shm-size',
-  '--memory', '--memory-swap', '--cpus', '--pids-limit', '--cap-drop', '--security-opt', '-e', '--runtime', '--alias'];
+  '--memory', '--memory-swap', '--cpus', '--pids-limit', '--cap-drop', '--security-opt', '-e', '--runtime', '--alias', '-o', '--opt'];
 const out = [];
 const err = [];
 let st;
@@ -74,7 +74,10 @@ function handle(a) {
     if (fails('network-create')) return no('Error response from daemon: all predefined address pools have been fully subnetted');
     if (st.networks[name]) return no(`Error response from daemon: network with name ${name} already exists`);
     const n = ++st.seq;
-    st.networks[name] = { id: `net${n}`, internal: Boolean(flags['--internal']), labels: labelsOf(flags['--label']), created: new Date().toISOString(), subnet: n, members: {} };
+    // Driver options (-o key=value) as given, and IPv6: true, false (--ipv6=false) or unset (the daemon's default).
+    const options = labelsOf([...(flags['-o'] ?? []), ...(flags['--opt'] ?? [])]);
+    const ipv6 = flags['--ipv6=false'] ? false : flags['--ipv6'] || flags['--ipv6=true'] ? true : null;
+    st.networks[name] = { id: `net${n}`, internal: Boolean(flags['--internal']), ipv6, options, labels: labelsOf(flags['--label']), created: new Date().toISOString(), subnet: n, members: {} };
     out.push(`net${n}`);
     return 0;
   }
@@ -123,7 +126,7 @@ function handle(a) {
       const n = st.networks[net];
       if (!n) { code = no(`Error: No such network: ${net}`); continue; }
       const Containers = Object.fromEntries(Object.keys(n.members).map((m, i) => [`ep${i}`, { Name: m }]));
-      out.push(JSON.stringify({ Name: net, Id: n.id, Created: n.created, Internal: n.internal, Labels: n.labels, Containers }));
+      out.push(JSON.stringify({ Name: net, Id: n.id, Created: n.created, Internal: n.internal, EnableIPv6: n.ipv6 === true, Options: n.options ?? {}, Labels: n.labels, Containers }));
     }
     return code;
   }

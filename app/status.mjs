@@ -10,7 +10,7 @@ import { ping } from '../agent/inference.mjs';
 import { APP_LABEL, LIMITS, TASK_LABEL, run } from '../runner/sandbox.mjs';
 import { PROVIDER, STATE_DIR } from './config.mjs';
 
-export const NETWORK = 'one internal network per sandbox (ring-task-…) → ring-proxy (allowlist)';
+export const NETWORK = 'one internal network per sandbox (ring-task-…), with no host address on it → ring-proxy (allowlist)';
 const SUITES = [['containment', 'containment'], ['scenes', 'scenes'], ['agentLoop', 'agent-loop']];
 const VERSION_FILE = new URL('./VERSION.json', import.meta.url);
 

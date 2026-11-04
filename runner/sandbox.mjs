@@ -1,7 +1,8 @@
 // One throwaway container per task, driven through the docker CLI from the host.
 // The container gets nothing from the host environment: no API keys, no tokens. It runs read-only,
 // without capabilities, with memory, CPU and process caps, on an internal network of its own whose
-// only other member is the allowlist proxy, so two sandboxes never share a network. Every task ends
+// only other member is the allowlist proxy, so two sandboxes never share a network, and on which the
+// host has no address, so the sandbox cannot reach the VM's own services either. Every task ends
 // with destroy(), whatever happened: the container goes, then the proxy leaves the network and the
 // network goes.
 // The host side is careful too: every child process (the docker CLI included) gets a minimal
@@ -22,6 +23,19 @@ export const TASK_LABEL = 'mantis-ring=task';
 export const NETWORK_PREFIX = 'ring-task-';
 /** How old a sandbox network without a sandbox must be before a sweep removes it: create() makes the network first. */
 export const STALE_NETWORK_MS = 10 * 60_000;
+/**
+ * `docker network create` options of every sandbox network:
+ * - `--internal`: no route out;
+ * - `inhibit_ipv4`: the bridge gets no IPv4 address, so the host has none on the network. With only
+ *   `--internal` the bridge held the network's gateway address, and a sandbox reached the VM's sshd
+ *   and Caddy there. Now that address is handed out like any other, so the proxy, the first
+ *   container on the network, gets it. The proxy is reached from container to container on the
+ *   bridge, which needs no host address;
+ * - `--ipv6=false`: no IPv6 on the network, whatever the daemon's defaults are. The bridge still gets
+ *   an IPv6 link-local address, but a sandbox under gVisor has no IPv6 address to reach it from
+ *   (test/containment.mjs measures both).
+ */
+export const NETWORK_OPTIONS = Object.freeze(['--internal', '--ipv6=false', '-o', 'com.docker.network.bridge.inhibit_ipv4=true']);
 const NETWORK_NAME = /^ring-task-[0-9a-f]{8}$/;
 const PROXY_NAME = 'ring-proxy';
 const PROXY = `http://${PROXY_NAME}:8888`;
@@ -47,7 +61,7 @@ const CLOSING = 'sandbox start stopped: this process is removing its sandboxes (
 
 /** How a sandbox's network reads on its receipt and in the live log. */
 export function networkText(network) {
-  return `${network || 'its own network'} (internal, this sandbox only) → ${PROXY_NAME} (allowlist)`;
+  return `${network || 'its own network'} (internal, this sandbox only, no host address) → ${PROXY_NAME} (allowlist)`;
 }
 
 /**
@@ -231,8 +245,9 @@ export class Sandbox {
    * `mantis-ring=task` is always set (the tests and the clean-ups filter on it), and the network also
    * gets `mantis-ring.sandbox=<name>`.
    *
-   * 1. `docker network create --internal ring-task-<id>`: a network with no route out, for this
-   *    sandbox alone, so two tasks that run at once cannot reach each other.
+   * 1. `docker network create` with NETWORK_OPTIONS, `ring-task-<id>`: a network with no route out
+   *    and no host address on it, for this sandbox alone, so two tasks that run at once cannot reach
+   *    each other, and neither can reach the VM itself.
    * 2. The running `ring-proxy` joins it (`docker network connect`), and its address on it goes into
    *    the sandbox's /etc/hosts (`--add-host`). Under gVisor (runsc), Docker's embedded DNS on a
    *    user-defined network cannot be reached, so the name would not resolve otherwise; see "DNS
@@ -491,7 +506,7 @@ async function startSandbox({ image = 'mantis-ring/sandbox', runtime, limits = L
   const id = randomBytes(4).toString('hex');
   const box = new Sandbox(`ring-${id}`, `${NETWORK_PREFIX}${id}`);
 
-  const made = await run('docker', ['network', 'create', '--internal', '--label', TASK_LABEL, '--label', `mantis-ring.sandbox=${box.name}`, ...labelArgs, box.network], { timeoutMs: 30_000 });
+  const made = await run('docker', ['network', 'create', ...NETWORK_OPTIONS, '--label', TASK_LABEL, '--label', `mantis-ring.sandbox=${box.name}`, ...labelArgs, box.network], { timeoutMs: 30_000 });
   if (made.code !== 0) {
     // A create that timed out may have made the network all the same.
     const left = await removeNetwork(box.network).then(() => '', (err) => `; ${err.message}`);
