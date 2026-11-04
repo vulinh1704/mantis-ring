@@ -102,6 +102,11 @@ Nothing below was changed by this scan.
 4. **Dev-only overlays are measured.** shadcn-admin's one error is the TanStack Query devtools button, which only the dev server shows, overlapping the user menu.
 5. **There is no SHA pin.** A task clones the default branch's HEAD. Each B2 run should check that its receipt names `2609f5995035973e00c16ec723165a5fff87cceb`. CoreUI React's last commit was on 23 Sep, so a change during 6–7 Nov is unlikely.
 
+**Since then (4 Nov, 17:00–17:30 ICT):**
+- **Finding 1 was memory, and it is fixed.** It was not a timeout: the sandbox ran out of its 3 GB. Both Next.js apps are now measured, and the page names the cause when a look fails. See [2026-11-04-nextjs-memory.md](2026-11-04-nextjs-memory.md).
+- **Finding 2 is fixed:** omni-tools now gets "The install tried to reach cdn.sheetjs.com, which is outside the sandbox's allowlist (only npm and GitHub)."
+- **What this means for B2:** a GitHub task's looks now open one screen size at a time, so CoreUI's looks take somewhat longer than the 10.6 s above.
+
 ## Recommendation
 
 **B2: [coreui/coreui-free-react-admin-template](https://github.com/coreui/coreui-free-react-admin-template) at `2609f5995035973e00c16ec723165a5fff87cceb`.**

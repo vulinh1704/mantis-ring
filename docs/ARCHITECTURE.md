@@ -86,9 +86,10 @@ Everything that reads the repository runs inside its sandbox (`runner/run-task.m
    - **pnpm and yarn** are first installed with npm into the sandbox user's home, through the same proxy as every package, at the version the project names. Yarn 2 and later runs with the node-modules linker and a cache outside the repository. Corepack is not used: by default it fetches Yarn 2 and later from repo.yarnpkg.com, which the allowlist refuses. A yarn that the repository ships (`yarnPath`) is used as it is.
    - **Retries.** `npm ci` with a lock file that is out of date is retried as `npm install`. A peer-dependency conflict is retried with `--legacy-peer-deps`, and pnpm's lock-file errors with `--no-frozen-lockfile`. Each happens once.
    - **Skipped:** the browser downloads of Puppeteer, Playwright, Cypress and Electron, which the allowlist would refuse anyway, and git hooks.
+   - **The download caches go.** After a successful install, npm's and yarn's caches are removed (`INSTALL_CACHES`). They sit in the sandbox's RAM, and nothing reads them later; for a Next.js app, npm's cache alone took 0.17 GB. pnpm's store stays, because `node_modules` is hard-linked into it.
    - **The output stays in the sandbox.** Each step writes stdout and stderr to `/tmp/ring-install.log` inside the sandbox, and only the last 64 KiB come out, with the install's own exit code. So an install that prints a flood (npm with `loglevel=silly`, or a hostile script) is neither cut off nor scanned on the app's event loop, and a process the install leaves behind cannot hold the output open. Output that bypasses the file is cut at 1 MiB, and the install then fails at once, with no retry beside an install that may still run. The checks below read at most the last 64 KiB.
    - **A failure gives one sentence** from the end of the output:
-     - a host outside the allowlist, which is named;
+     - a host outside the allowlist, which is named. The proxy refuses it with `403 Filtered`, which npm reports as `E403`, pnpm as `ERR_PNPM_FETCH_403` and yarn as a failed request; the host on the line of the failure is named, never one from help text. A 403 from the allowlisted registry is not called off-allowlist;
      - a package that is not on the public registry;
      - no space;
      - a Node version;
@@ -97,16 +98,34 @@ Everything that reads the repository runs inside its sandbox (`runner/run-task.m
    - It gives up early once the process has exited.
    - The address that answered is where every look and check measures, and the live log names it. Unless told otherwise, Vite and Astro listen on `localhost`, which can be `::1` inside the sandbox.
    - Each route is then requested once, so a server that compiles a page on its first request (Next.js, Astro) is warm before R0.
+   - The scripts and stylesheets the page names by a path on its own origin (`/…`, at most 40) are then requested one at a time. A dev server that builds the browser's bundle only when the browser asks for it builds it here, alone, and not while Mantis's pages fill the same memory.
    - If the server stops answering during a task, it is restarted with the same command.
-6. **The live log** shows the plan before the install, for example `project: pnpm 10 (pnpm-lock.yaml) · start: astro dev --host 127.0.0.1 --port 3000`.
+6. **Memory.** The sandbox's 3 GB holds the tmpfs folders (the clone, `node_modules`) as well as the dev server and Mantis's browser. A Next.js 16 app held about 2 GB before its first look.
+   - The looks of a GitHub task therefore open one route × viewport group at a time (`mantis look --concurrency 1`), with its light and dark pages together. The samples keep Mantis's default of 3.
+   - Before the first look, the journal records what the sandbox holds: the host cgroup's memory and processes, every process with its memory and threads, the tmpfs folders, and the size of `node_modules`, `.next` and the npm cache.
+   - When less than 1 GiB is free, the live log says that measuring may run out of memory, and names what is used of what.
+7. **The live log** shows the plan before the install, for example `project: pnpm 10 (pnpm-lock.yaml) · start: astro dev --host 127.0.0.1 --port 3000`.
 
 Every failure in these steps is a `SetupError`. Its `publicMessage` is the one sentence that the task's page shows, and its `message` keeps the detail, such as the last lines of the install or the dev-server log, for the journal.
+
+**A look that fails says why** (`look()` and `LookError` in `runner/run-task.mjs`, `runner/cgroup.mjs`).
+- **Only the time limit is a timeout:** exit 124, the host's own timer, or 137 once the limit has passed.
+- **Any other exit code of 128 or more** names its signal and how long the look ran.
+- **While each look runs,** the runner watches the sandbox's host cgroup: the memory and processes at the start and at most, and what the kernel counted at their limits (`memory.events`, `pids.events`).
+- **The cause on the page.** An OOM in the host cgroup, or a container that Docker calls OOM-killed, gives "the sandbox ran out of memory". A refused fork gives "the sandbox reached its limit of 512 processes and threads". A stopped container gives "the sandbox stopped while the page was measured". Anything else gives "the checker stopped unexpectedly".
+- **The detail goes to the journal only,** in lines under the app's 400-character limit and with credentials redacted: the end of stderr, and a post-mortem taken at once (Docker's state, every process left, the tmpfs folders, the dev server and the end of its log).
+- **Under gVisor the host's OOM killer takes the whole sandbox kernel.** When that happens during a later check or the verify look, the run ends with the reason ("The run stopped at check 2: the sandbox ran out of memory …"), not as an internal error.
 
 **Measured on the VM** on 3 Nov ([bench/2026-11-04-github-path.md](../bench/2026-11-04-github-path.md)), with no model call:
 - **The repositories:** a Vite + React app on npm (TailAdmin), a Vite + Vue app on pnpm 12 with catalogs (vitesse-lite), an Astro site on pnpm (astro-paper) and a static site (vcard).
 - **Before this path,** on `2e01f41`, only the static site was measured. The Vite and Astro servers never answered on 127.0.0.1, and npm could not read pnpm catalogs.
 - **After it,** on `468c5f6`, all four were measured on 4 of 4 screens. The whole task took 7–40 s, with installs of 8.5–14.6 s.
 - **Edge cases:** `vitejs/vite` was refused as a monorepo, a missing repository and `torvalds/linux` each got their sentence, and the Linux clone was stopped at 300 MB after 14 s.
+
+**Next.js, measured on 4 Nov** ([bench/2026-11-04-nextjs-memory.md](../bench/2026-11-04-nextjs-memory.md)), with no model call:
+- **Before:** two Next.js 16 apps (next-shadcn-admin-dashboard, ray-so) failed every time with "the measurement timed out". It was memory: about 2 GB was in use before the look, and four pages at once took the sandbox past 3 GB within 3–6 s. The host's OOM killer then stopped the sandbox, and `docker exec` returned 128.
+- **After `86c0e9d`:** both were measured on 4 of 4 screens, at no more than 2.35 GB and 2.89 GB. ray-so came within 0.11 GB of the limit.
+- **The proxy's refusal** of `cdn.sheetjs.com` (omni-tools) is now named in the install's sentence.
 
 ## The tools
 
