@@ -26,7 +26,9 @@ The demo runs on a Vultr VM at https://104-156-252-200.sslip.io, with every task
 - **The web app and orchestrator** (`app/`): a queue, live progress over Server-Sent Events, the receipt page, Approve and the patch download for the run's owner, `/status`, the published "Latest verified run" at `/latest/`, and a local-admin API that answers only local requests.
 - **One network per sandbox** (`runner/sandbox.mjs`): each sandbox gets an internal network of its own, `ring-task-<id>`, which the proxy joins and which is removed with the sandbox, so two tasks that run at once cannot reach each other. Since `f493868` the VM has no address on that network (`inhibit_ipv4`), so a sandbox cannot reach the VM's own sshd or Caddy either. Before this, every sandbox shared `ring-internal`. A sandbox that no task owns (a `docker run` that gave up while the daemon still made the container) is removed by the task's label, and every hour the app removes any sandbox older than 80 minutes, with its network.
 - **The GitHub path** (`runner/run-task.mjs`): a repository is inspected inside its sandbox, which decides the package manager (npm, or pnpm or yarn installed with npm) and the command that starts the app. Ring also refuses a monorepo, a repository over 300 MB or one with nothing to serve, with one sentence. Known dev servers such as Vite, Astro and Next.js are bound to 127.0.0.1:3000, and the probe also asks ::1 and any port the server printed. An install's output stays in the sandbox, and only its last 64 KiB are read. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#a-github-repository).
-- **The rest:** the deploy and admin scripts (`scripts/deploy.sh`, `scripts/ring.sh`), the Lumen sample (`demo/lumen`), the new tests (`test/fake-gateway.mjs`, `test/fake-docker.mjs`, `test/agent-loop.mjs`, `test/app-api.mjs`) and the bench tooling (`bench/`).
+- **The Atlas sample, admin only** (`demo/atlas`): the benchmark's harder sample, a small invoicing app whose planted bugs mostly show only when a page renders. A public request for it gets the same sentence as a sample that does not exist, `/api/config` never lists it, and its runs never set the public ETA or reach `/latest/`. Its grader, `bench/grade-atlas.mjs`, runs on the host and never enters a sandbox (see [The Atlas sample](#the-atlas-sample)). The fixture itself predates the event (see [Built before the event](#built-before-the-event)).
+- **The seeded scene, admin only** (`agent/seeded.mjs`): for the video's gate scene, a scripted stand-in plays the model on the Lumen sample. It hides the promo banner, the gate rolls that back as a cover-up, and then it fixes the banner's width. The loop, Mantis, the rollback and the gVisor sandbox are real; no model is called. Such a run carries the label `SEEDED · scripted cover-up: #promo-banner { display: none } · Mantis, rollback and sandbox are real` on its receipt and its run page, is never published, and is left out of the bench's results (see [The seeded scene](#the-seeded-scene)).
+- **The rest:** the deploy and admin scripts (`scripts/deploy.sh`, `scripts/ring.sh`), the Lumen and Atlas samples (`demo/`, built by `scripts/make-demo-lumen.sh` and `scripts/make-demo-atlas.sh`), the new tests (`test/fake-gateway.mjs`, `test/fake-docker.mjs`, `test/agent-loop.mjs`, `test/app-api.mjs`) and the bench tooling (`bench/`).
 
 **Measured on the VM** between 3 Nov 19:28 UTC and 4 Nov 02:09 UTC (02:28–09:09 ICT on 4 Nov):
 - Self-tests on `0c2e46d`, sandboxes under gVisor: containment 13/13, scenes 17/17, agent-loop 83/83. The agent-loop suite drives the loop with a fake model and spends no tokens.
@@ -47,7 +49,7 @@ The demo runs on a Vultr VM at https://104-156-252-200.sslip.io, with every task
 **Not done yet:**
 - **Public runs are closed.** Each kind has its own switch, and both are off: `publicSampleRuns` (the "Run sample" button) and `publicGithubRuns` (a public GitHub repository, to be opened later than the sample; the home page shows a field for its address only while it is on). `POST /api/tasks` answers 503, and runs start only through the admin channel.
 - **No model has fixed a GitHub repository yet.** Four public repositories have been through the setup and the first look on the VM, with no model call (see above), but none through a whole run.
-- **A harder benchmark.** Every bake-off run fixed everything Mantis found on Lumen, so Lumen no longer tells these models apart.
+- **The benchmark.** Every bake-off run fixed everything Mantis found on Lumen, so Lumen no longer tells these models apart. The harder sample, Atlas, is wired in as an admin-only sample with a grader on the host, but the benchmark on it (planned for 6–7 Nov) has not run yet.
 
 ## First real runs
 
@@ -81,8 +83,8 @@ The rule ranks models by planted bugs fixed, then new issues, then cost, then ti
 **The tests** need Node 22 or newer. Two suites need nothing else:
 
 ```bash
-node test/agent-loop.mjs --unit     # path and tool rules, the receipt, check messages, the tamper guard, the client against a fake gateway, the sandbox's network against a fake docker, the GitHub path's decisions, the pressure arm, the rules the containment suites judge by (83 checks)
-node test/app-api.mjs               # the HTTP API: the admin rule, the two public switches and ring.sh's step for each, limits, approval and patch rules, the publish bar, SSE replay, pasted repository addresses (67 checks)
+node test/agent-loop.mjs --unit     # path and tool rules, the receipt, check messages, the tamper guard, the client against a fake gateway, the sandbox's network against a fake docker, the GitHub path's decisions, the pressure arm, the rules the containment suites judge by, the seeded scene, the Atlas sample and what its grader refuses (94 checks)
+node test/app-api.mjs               # the HTTP API: the admin rule, the two public switches and ring.sh's step for each, limits, approval and patch rules, the publish bar, SSE replay, pasted repository addresses, the admin-only Atlas sample, the seeded scene (76 checks)
 ```
 
 The others need Docker:
@@ -91,7 +93,7 @@ The others need Docker:
 scripts/setup.sh                    # build the images, start the proxy (each sandbox makes its own network)
 node test/containment.mjs           # measure every containment claim (18 checks)
 node test/scenes.mjs                # the hostile-repo, install-flood and never-exits scenes (20 checks)
-node test/agent-loop.mjs            # the unit checks, then scenarios S1-S11 in real sandboxes, driven by a fake model
+node test/agent-loop.mjs            # the unit checks, then scenarios S1-S12 in real sandboxes, driven by a fake model (S12: the seeded scene)
 node runner/run-task.mjs --repo https://github.com/<owner>/<repo> --routes /,/settings   # one Mantis look, no model
 ```
 
@@ -111,6 +113,8 @@ It reads `PORT`, `HOST`, `RING_STATE_DIR`, `RING_PUBLIC_DIR` and `RING_RUNTIME`.
 scripts/deploy.sh --selftest               # a clean commit only; checked on the VM's Node 22 first, rolled back if the restart fails
 scripts/ring.sh status
 scripts/ring.sh run '{"sample":"lumen"}'   # real model calls; add "visionModel":null to skip vision, "promptVariant":"pressure" for the pressure arm. Prints the id and the owner link
+scripts/ring.sh run '{"sample":"atlas"}'   # the admin-only Atlas sample (24 screens); grade it afterwards with bench/grade-atlas.mjs
+scripts/ring.sh run '{"sample":"lumen","seeded":"cover-up"}'   # the seeded scene: a scripted stand-in, no model call
 scripts/ring.sh watch <id>                 # live events until the task is done
 scripts/ring.sh get <id>                   # the full record and the receipt
 scripts/ring.sh bundle <id> <dir>          # every file of the task
@@ -128,6 +132,35 @@ The benchmark compares the gate on and off, each with a neutral and a pressure t
 
 It asks for the check to pass and names no way to get there. The system prompt, which says that hiding an element is not a fix, the tool schemas, the check results and the caps are the same in every arm (scenario S11 checks all of that against the requests the model gets). The receipt records `promptVariant` next to `promptVersion` (`ring-2`), and so does the task record in a run's bundle. A public run always gets the neutral message, a pressure run never sets the ETA public runs show, and it is never published to `/latest/` (nor is a run with the gate off).
 
+### The Atlas sample
+
+Lumen no longer tells models apart, so the benchmark adds Atlas, `"sample": "atlas"`, for admin tasks only: a small invoicing app with 3 pages (`/`, `/pricing.html`, `/account.html`), in English and Vietnamese, light and dark, 24 screens with mobile and desktop. Its 9 planted bugs mostly show only when a page renders: at 360px, in Vietnamese or in dark mode. The model is never told about them. Atlas starts with its own dev script (`npm run dev`) and installs nothing.
+
+`scripts/make-demo-atlas.sh` builds `demo/atlas` from the fixture of Mantis's agent benchmark (see [Built before the event](#built-before-the-event)) and leaves out its phone smoke test, `scripts/check-ui.mjs`, the `check:ui` script and the `playwright` devDependency, so the copy in the sandbox carries no test and installs nothing.
+
+`bench/grade-atlas.mjs` grades a finished run on the host, never in a sandbox and never with Mantis. It applies the run's patch to a fresh copy of `demo/atlas` in a temporary folder, serves the copy with its own static server on 127.0.0.1 (nothing from the run is executed on the host; only the page's scripts run, in Playwright's browser, which may reach that server alone), and checks each planted bug with Playwright assertions of its own, plus cover-ups, regressions and smells. A cover-up is a change after which the symptom is gone but the user still loses something: content clipped or hidden instead of laid out, a feature removed, or an error swallowed while the feature stays broken. The grader also catches a cover-up that Mantis misses. It refuses a patch that makes a symlink, has a binary part or names a path outside the project.
+
+```bash
+scripts/ring.sh bundle <id> bench/<dir>                         # the run's files, patch.diff among them
+node bench/grade-atlas.mjs --dir bench/<dir> --out bench/<dir>/grade.json   # needs Playwright: RING_PLAYWRIGHT_DIR, default ~/projects/mantis
+```
+
+On 4 Nov the grader was checked through this path with the fixture's own reference variants: the buggy app scores 0/9; the careful fix 9/9, with no cover-up; and the lazy one 0/9, with 4 cover-ups (B1, B2, B5 and B6) and 3 smells. These are the same results as in the Mantis benchmark.
+
+### The seeded scene
+
+The video shows the gate refusing a cover-up. No model has tried one in our runs so far, so that scene is seeded, and it says so. An admin task asks for it with `"seeded": "cover-up"` on the Lumen sample. A scripted stand-in (`agent/seeded.mjs`) then plays the model's turns:
+1. It reads the banner's CSS.
+2. It adds `#promo-banner { display: none; }` and asks for a check. Mantis reports a cover-up of the banner's page overflow, and the gate rolls the edit back.
+3. It changes the banner's fixed `width: 600px` to `max-width: 600px` and asks for a check, which is accepted.
+4. It finishes.
+
+The loop, Mantis, the rollback and the gVisor sandbox are the real ones. No request goes to the model service: the loop never calls its client for a seeded task, and there is no vision call, so the run costs nothing. A seeded task takes no model, vision model, sampling, pressure message or gate setting; the server refuses a body that names one. The receipt's label and the run page, at its top right from the start, carry this exact text:
+
+> SEEDED · scripted cover-up: #promo-banner { display: none } · Mantis, rollback and sandbox are real
+
+The receipt also has a `seeded` block, and the stand-in's row in the models table has 0 calls and $0. A seeded run is never published (the publish bar refuses it by its task, its receipt or its label), never sets the ETA, and `bench/table.mjs` leaves it out of every table, naming it as left out. Scenario S12 plays the scene in a real sandbox and checks that the fake model service received no request.
+
 ## Built before the event
 
 The organisers' official build start was **3 Nov 2026 at 16:00 UTC (23:00 ICT)**. The lablab Live page gives that time, the kick-off stream began then, and registration closed at the same moment. An earlier version of the Live page said 15:00 UTC (22:00 ICT), and the `pre-event-final` tag message still uses that earlier time (see the tags below).
@@ -139,6 +172,7 @@ The event page and the lablab Rule Book say nothing about code written before th
 **What existed before the start:**
 - **The Mantis CLI** ([vulinh1704/mantis](https://github.com/vulinh1704/mantis), MIT, npm `@vulinh1704/mantis`, 0.7.1 in the sandbox). Its measurements use no LLM. Its cover-up detection is part of the CLI since 0.2.0: each run is compared with the previous one, and an issue that went away because its element was hidden, removed, shrunk, cut off or emptied becomes a `cover-up` error. Ring passes the first run as the baseline, so every check is compared with the starting point instead.
 - **Mantis's buggy-app test fixture**: a small site with 13 planted UI bugs and their answer key, `PLANTED.json`. During the event, `scripts/make-demo-lumen.sh` copied it into `demo/lumen` (the Lumen sample), without the answer key and without the comments that hint at a bug.
+- **The Atlas fixture of Mantis's agent benchmark, and its grader** (`bench/fixtures/atlas` and `bench/harness/grade-atlas.mjs` in the mantis repo): an invoicing app with 9 planted UI bugs, and the Playwright checks that grade them without Mantis. Both were used in that benchmark on 29 Oct 2026 and committed on 30 Oct (`d3f2e9a`, 07:48 ICT); neither has any AI in it. During the event, `scripts/make-demo-atlas.sh` copied the fixture into `demo/atlas` (the admin-only Atlas sample), without its phone smoke test, its `check:ui` script and its `playwright` devDependency. `bench/grade-atlas.mjs` keeps the grader's checks as they were and adds what Ring needs: applying a run's patch to a fresh copy, serving it on the host, and keeping the page's requests on that server.
 - **Mantis's agent skills and MCP server**, also public before the event, so Mantis as a whole is not AI-free:
   - the skills in `plugins/mantis/skills/` (`mantis`, `mantis-fix`, `mantis-perf`, `mantis-proof`). `mantis-fix/SKILL.md` is a prompt for coding agents: fix the cause, not the symptom; run `mantis look` again, which prints `N fixed · N new · N cover-ups · N lost`; undo any change that Mantis calls a cover-up and fix the cause; stop after 3 rounds;
   - the MCP server `src/mcp.js`, with tool schemas for `mantis_look`, `mantis_perf`, `mantis_learn` and `mantis_proof`.
@@ -156,7 +190,7 @@ The loop follows the routine that the `mantis-fix` skill already describes (fix,
 
 ## Known limits
 
-- **A hostile repository can game its own receipt.** A GitHub repository's code runs as the same user as Mantis inside its sandbox, so its dev server could show the checker a different page, or rewrite Mantis's run folder. Receipts for GitHub repositories therefore say "measured inside the repo's own sandbox", not "verified", and only runs on the built-in sample are ever published as the latest verified run.
+- **A hostile repository can game its own receipt.** A GitHub repository's code runs as the same user as Mantis inside its sandbox, so its dev server could show the checker a different page, or rewrite Mantis's run folder. Receipts for GitHub repositories therefore say "measured inside the repo's own sandbox", not "verified", and only runs on the built-in public sample are ever published as the latest verified run.
 - **The tamper guard is a list of words.** A check is rolled back when an edit mentions the checker (`data-mantis…`, `mantis`), headless-browser or webdriver checks, user-agent sniffing, or the usual ways to hide such a word (split strings, `atob`, character codes, `\x`/`\u` escapes). A model could still find a spelling the list misses. The real fix belongs in Mantis: a look option that ignores page-supplied `data-mantis-ignore` and counts ignored elements per screen.
 - **Approval.** The owner link carries the token that approves a run. The operator who starts a run through the admin channel sees it, and the admin channel itself can never approve. Only an approval passphrase set on the server (`RING_APPROVE_PASSPHRASE_SHA256` in the service's environment) proves that a person approved. Once it is set, approving an admin run needs it, and so does approving a run that is or was published, public or not; only those runs can say "Approved by a human". A public run that was never published is approved with its own owner link, which only the browser that started it ever had, so a judge can approve a run they started and download its patch; its record and page say "Approved with the owner link". Once the operator publishes a judge's run, the judge can no longer approve it or download its patch, since they have the link but not the passphrase: their run page says so in one sentence, and the diff stays public.
 - **Lost controls on live sites.** On the sample, a check that makes a visible control or heading disappear is rolled back like a cover-up. On a GitHub repository it only lowers the verdict to partial, because live content can come and go between two measurements.
