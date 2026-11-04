@@ -11,9 +11,11 @@ Visitor ──HTTPS──► Vultr VM (VX1, Seattle)
                    ├─ Caddy: HTTPS · /latest/ as static files · everything else ─► the app
                    ├─ app: Node 22, user ring-orch, one listener on 127.0.0.1:8080
                    │    pages, API, live events (SSE), queue, spend ledger, publisher
-                   │    └─ agent loop ── chat() ──► Vultr Serverless Inference (OpenAI-compatible)
-                   │         │                       fix model and vision model; the key stays in this process
-                   │         └─ file tools ── docker exec, positional arguments ──► the task's sandbox
+                   │    ├─ agent loop ── chat() ──► Vultr Serverless Inference (OpenAI-compatible)
+                   │    │    │                       fix model and vision model; the key stays in this process
+                   │    │    └─ file tools ── docker exec, positional arguments ──► the task's sandbox
+                   │    └─ /admin/speech ── speech() ──► Vultr Serverless Inference (text to speech)
+                   │                         the video's voice, admin only, not part of a run
                    ├─ Docker + gVisor (runsc): one sandbox per task, destroyed when the task ends
                    │    Node 22, git, Chromium headless shell, Mantis CLI 0.7.1
                    │    no host environment · read-only root · 3 GB RAM, 2 CPUs, 512 processes · uid 10001
@@ -89,7 +91,7 @@ Everything that reads the repository runs inside its sandbox (`runner/run-task.m
    - **The download caches go.** After a successful install, npm's and yarn's caches are removed (`INSTALL_CACHES`). They sit in the sandbox's RAM, and nothing reads them later; for a Next.js app, npm's cache alone took 0.17 GB. pnpm's store stays, because `node_modules` is hard-linked into it.
    - **The output stays in the sandbox.** Each step writes stdout and stderr to `/tmp/ring-install.log` inside the sandbox, and only the last 64 KiB come out, with the install's own exit code. So an install that prints a flood (npm with `loglevel=silly`, or a hostile script) is neither cut off nor scanned on the app's event loop, and a process the install leaves behind cannot hold the output open. Output that bypasses the file is cut at 1 MiB, and the install then fails at once, with no retry beside an install that may still run. The checks below read at most the last 64 KiB.
    - **A failure gives one sentence** from the end of the output:
-     - a host outside the allowlist, which is named. The proxy refuses it with `403 Filtered`, which npm reports as `E403`, pnpm as `ERR_PNPM_FETCH_403` and yarn as a failed request; the host on the line of the failure is named, never one from help text. A 403 from the allowlisted registry is not called off-allowlist;
+     - a host outside the allowlist, which is named. The proxy refuses it with `403 Filtered`, which npm reports as `E403`, pnpm as `ERR_PNPM_FETCH_403` and yarn as a failed request; the host on the line of the failure is named. When that line names none, a host elsewhere in the output is named only after the proxy's refusal or a failed lookup, and never one from a warning or notice (such as a deprecation notice's link) or from help text. A 403 from the allowlisted registry, or a refused connection to 127.0.0.1, is not called off-allowlist;
      - a package that is not on the public registry;
      - no space;
      - a Node version;
@@ -125,7 +127,7 @@ Every failure in these steps is a `SetupError`. Its `publicMessage` is the one s
 **Next.js, measured on 4 Nov** ([bench/2026-11-04-nextjs-memory.md](../bench/2026-11-04-nextjs-memory.md)), with no model call:
 - **Before:** two Next.js 16 apps (next-shadcn-admin-dashboard, ray-so) failed every time with "the measurement timed out". It was memory: about 2 GB was in use before the look, and four pages at once took the sandbox past 3 GB within 3–6 s. The host's OOM killer then stopped the sandbox, and `docker exec` returned 128.
 - **After `86c0e9d`:**
-  - next-shadcn-admin-dashboard was measured on 4 of 4 screens in all 3 runs, at no more than 2.35 GB.
+  - next-shadcn-admin-dashboard was measured on 4 of 4 screens in both runs, at no more than 2.35 GB.
   - ray-so was measured in 1 of 2 runs, at 2.89 GB. In the other, it used 2.24 GB before the look; the live log warned, and the look ran out of memory on the desktop screens.
   - The page then said "the sandbox ran out of memory".
   - A larger memory limit would give such apps a margin. That is the owner's call.
@@ -256,7 +258,7 @@ The app has one HTTP listener, on `127.0.0.1:8080`, and Caddy forwards public tr
 
 The spend ledger (`app/spend.mjs`) is append-only and checks, before every model call, the task's cap ($0.60 by default, at most $2 for an admin task), the day's cap for public or admin runs ($5 and $15) and the total cap ($60), all at list price.
 
-**Speech for the video's voice** (`POST /admin/speech`, admin only, not part of a run): the VM sends one passage of at most 800 characters to a priced speech model of the catalogue (`chatterbox` and `qwen3-tts-12hz-1.7b` are pinned at $0.00028 a second of audio) with a built-in voice; cloned and designed voices are refused. The answer is the audio itself, so `scripts/ring.sh tts` writes it to a file on the operator's machine and the key stays on the VM. One call at a time. Before the call, an upper bound (a third of ordinary speaking pace, plus 5 s) must fit $0.05 and what is left of today's $0.50 for speech, inside the admin and total caps. The ledger line, kind `speech`, records the seconds the provider billed (its `X-Usage-Seconds` and `X-Usage-Cost`), or the estimate when it reported none.
+**Speech for the video's voice** (`POST /admin/speech`, admin only, not part of a run): the VM sends one passage of at most 800 characters to a priced speech model of the catalogue (`chatterbox` and `qwen3-tts-12hz-1.7b` are pinned at $0.00028 a second of audio) with a built-in voice; cloned and designed voices are refused. The answer is the audio itself, so `scripts/ring.sh tts` writes it to a file on the operator's machine and the key stays on the VM. One call at a time. Before the call, an estimate (a third of ordinary speaking pace, plus 5 s) must fit $0.05 and what is left of today's $0.50 for speech, inside the admin and total caps. That bounds ordinary prose, not every text: long runs of digits or symbols, which a voice reads out word by word, can be billed for more, so one call can pass $0.05, and the day $0.50, by the difference. The ledger line, kind `speech`, records what the provider billed (the larger of its `X-Usage-Cost` and its `X-Usage-Seconds` at the list price); without those headers, a WAV's own length at the list price; otherwise the estimate.
 
 ## The receipt
 

@@ -555,8 +555,10 @@ const VOICE = /^[a-z][a-z0-9_]{0,39}$/;
 const LANGUAGE = /^[A-Za-z][A-Za-z -]{0,34}$/;
 
 /**
- * The upper bound speech() gives the guard before a call: the seconds a passage of `chars` characters
+ * The estimate speech() gives the guard before a call: the seconds a passage of `chars` characters
  * could be billed for at a third of ordinary speaking pace, plus 5, and their price at `perSecond`.
+ * It bounds ordinary prose, not every text: long runs of digits or symbols, which a voice reads out
+ * word by word, can be billed for more, and the ledger then records what was billed.
  * @returns {{seconds: number, usd: number}}
  */
 export function speechEstimate(chars, perSecond) {
@@ -589,7 +591,7 @@ export function wavSeconds(buf) {
  * itself. The provider bills by the second of audio generated (before `speed`, rounded up) and reports
  * the seconds and the cost in its X-Usage-Seconds and X-Usage-Cost headers.
  *  - Before the call, guard.before(model, {promptTokens: 0, maxCompletionTokens: 0, usd, seconds}) gets
- *    the upper bound of speechEstimate() at the model's list price. A model without a speech price gets
+ *    the estimate of speechEstimate() at the model's list price. A model without a speech price gets
  *    usd null, which the spend guard refuses.
  *  - Afterwards, guard.after(model, {}, usd, {seconds, chars}) gets what was billed: the larger of
  *    X-Usage-Cost and X-Usage-Seconds at the list price; without those headers, a WAV's own length at

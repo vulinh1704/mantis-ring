@@ -929,6 +929,24 @@ async function u12() {
       && refused.unnamed === rt.sayOffAllowlist('') && refused.registry === rt.sayInstallFailed('npm'),
     JSON.stringify(refused));
 
+  // A link elsewhere in the output is not the host that failed: a registry 403, or a refused connection
+  // to 127.0.0.1 from a postinstall script, says nothing about the allowlist, whatever a deprecation
+  // notice or a help line links to; after the proxy's refusal, a host may come from another line, never
+  // from a warning.
+  const deprecated = 'npm warn deprecated uuid@3.4.0: Please upgrade  to version 7 or higher.  Older versions may use Math.random() in certain circumstances, which is known to be problematic.  See https://v8.dev/blog/math-random for details.';
+  const notBlamed = {
+    registry: installFailure(`${deprecated}\nnpm error code E403\nnpm error 403 403 Forbidden - GET https://registry.npmjs.org/@acme%2fsecret - you do not have permission`, { code: 1, pm: 'npm' }),
+    pnpm: installFailure(' WARN  deprecated eslint@8.57.1: This version is no longer supported. Please see https://eslint.org/version-support for other options.\n ERR_PNPM_FETCH_403  GET https://registry.npmjs.org/@acme%2fsecret: Forbidden - 403', { code: 1, pm: 'pnpm' }),
+    postinstall: installFailure('npm error command sh -c prisma generate\nnpm error Error: Can\'t reach database server at `127.0.0.1:5432`\nnpm error See https://pris.ly/d/client-constructor for more\nnpm error connect ECONNREFUSED 127.0.0.1:5432', { code: 1, pm: 'npm' }),
+    unnamed: installFailure(`${deprecated}\nnpm error code E403\nnpm error 403 403 Filtered - GET (a URL npm did not print)`, { code: 1, pm: 'npm' }),
+    yarnWarning: installFailure('warning eslint@8.57.1: This version is no longer supported. Please see https://eslint.org/version-support for other options.\nerror An unexpected error occurred: "Request failed \\"403 Filtered\\"".', { code: 1, pm: 'yarn' }),
+    earlier: installFailure(`${deprecated}\nnpm error sharp: Downloading https://cdn.example.org/libvips-8.14.5-linux-x64.tar.br\nnpm error sharp: Installation error: tunneling socket could not be established, statusCode=403`, { code: 1, pm: 'npm' }),
+  };
+  check('U12 a link elsewhere in the output is never blamed: a registry 403 (npm, pnpm) or a refused 127.0.0.1 next to a deprecation notice or a help link gets the plain sentence; after the proxy\'s refusal a host may come from another line, never from a warning',
+    notBlamed.registry === rt.sayInstallFailed('npm') && notBlamed.pnpm === rt.sayInstallFailed('pnpm') && notBlamed.postinstall === rt.sayInstallFailed('npm')
+      && notBlamed.unnamed === rt.sayOffAllowlist('') && notBlamed.yarnWarning === rt.sayOffAllowlist('') && notBlamed.earlier === rt.sayOffAllowlist('cdn.example.org'),
+    JSON.stringify(notBlamed));
+
   const retries = [
     installRetry({ pm: 'npm', lock: true }, 'npm ci --no-audit --no-fund', 'npm error `npm ci` can only install packages when your package.json and package-lock.json or npm-shrinkwrap.json are in sync.'),
     installRetry({ pm: 'npm' }, 'npm install --no-audit --no-fund', 'npm error code ERESOLVE\nnpm error ERESOLVE unable to resolve dependency tree'),
@@ -1580,6 +1598,23 @@ async function u18() {
       && /https:\/\/\[redacted\]@example\.com/.test(line) && !line.includes(key) && !line.includes('abcdefgh12345678') && !line.includes('\x1b') && leaky.reason === 'killed'
       && lines.every((l) => l.length <= JOURNAL_LINE) && longest <= 400,
     `${lines.length} lines, longest journal line ${longest}: ${line.slice(0, 500)}`);
+
+  // Credential shapes a project's own output may carry: npm's _authToken, a token as a URL's user name,
+  // NAME_TOKEN=… variables, and GitHub, npm and GitLab tokens anywhere by their prefix.
+  const secrets = ['npm_abcdefghijklmnopqrstuvwxyz0123456789', 'ghp_abcdefghijklmnopqrstuvwxyz0123456789', 'github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz',
+    'glpat-abcdefghij0123456789', 'gho_ZYXWVUTSRQPONMLKJIHG0123', 'x'.repeat(36)];
+  const credLine = rt.journalSafe([
+    `//registry.npmjs.org/:_authToken=${secrets[0]}`,
+    `fatal: could not read from https://${secrets[1]}@github.com/acme/private.git`,
+    `GITHUB_TOKEN=ghp_${secrets[5]} NPM_TOKEN=${secrets[0]}`,
+    `cloning with ${secrets[2]} and ${secrets[3]}`,
+    `remote: https://x-access-token@github.com/acme/x, then ${secrets[4]}`,
+  ].join('\n'), { max: 2000, lines: 10 });
+  check('U18 journalSafe also redacts npm\'s _authToken, a URL\'s user name without a password, NAME_TOKEN=… variables, and GitHub (ghp_, gho_, github_pat_), npm (npm_) and GitLab (glpat-) tokens',
+    secrets.every((x) => !credLine.includes(x)) && !credLine.includes('x-access-token') && /:_authToken=\[redacted\]/.test(credLine)
+      && /https:\/\/\[redacted\]@github\.com\/acme\/private\.git/.test(credLine) && /GITHUB_TOKEN=\[redacted\] NPM_TOKEN=\[redacted\]/.test(credLine)
+      && /cloning with \[redacted\] and \[redacted\]/.test(credLine) && /https:\/\/\[redacted\]@github\.com\/acme\/x, then \[redacted\]/.test(credLine),
+    credLine);
 
   // Right before the baseline look of a GitHub task: the host cgroup now, then the inside view with the folder sizes.
   const snapBox = lookBox({ code: 0, post: { ...facts, sizes: { '/work/app/node_modules': 0.75 * 2 ** 30, '/home/ring/.npm': 0.25 * 2 ** 30 } }, usage: usageOf({ memStart: 2 * 2 ** 30, pidsStart: 60, pidsPeak: 60 }) });

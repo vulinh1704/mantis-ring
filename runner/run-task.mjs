@@ -184,9 +184,12 @@ export function journalSafe(text, { max = 600, lines = 8 } = {}) {
   let s = String(text ?? '').replace(ANSI, '').replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, ' ');
   const key = process.env.VULTR_INFERENCE_API_KEY;
   if (key && key.length >= 8) s = s.split(key).join('[redacted]');
+  // A name may follow an underscore (npm's `_authToken=`, `GITHUB_TOKEN=`); GitHub, npm and GitLab
+  // tokens are known by their prefix; a URL's user part goes, with or without a password.
   s = s.replace(/\b(Bearer|Basic|token)\s+[A-Za-z0-9._~+/=-]{8,}/gi, '$1 [redacted]')
-    .replace(/\b(authorization|api[_-]?key|access[_-]?token|auth[_-]?token|password|passwd|secret)(["']?\s*[:=]\s*["']?)[^\s"',;]+/gi, '$1$2[redacted]')
-    .replace(/(\b[a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]*@/gi, '$1[redacted]@');
+    .replace(/(?<![A-Za-z0-9])(_auth|authorization|api[_-]?key|access[_-]?token|auth[_-]?token|token|password|passwd|secret)(["']?\s*[:=]\s*["']?)[^\s"',;]+/gi, '$1$2[redacted]')
+    .replace(/\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|npm_[A-Za-z0-9]{20,}|glpat-[A-Za-z0-9_-]{20,})/g, '[redacted]')
+    .replace(/(\b[a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+(?::[^\s/@]*)?@/gi, '$1[redacted]@');
   const out = s.split('\n').map((l) => l.replace(/\s+/g, ' ').trim()).filter(Boolean).slice(-lines).join(' | ');
   return out.length > max ? `…${out.slice(-max)}` : out;
 }
@@ -670,6 +673,9 @@ const NETWORK_FAILURE = /ENOTFOUND|EAI_AGAIN|getaddrinfo|tunneling socket|status
 const PROXY_REFUSAL = /tunneling socket|statusCode=403|403 Filtered|Filtered - 403|Bad response: 403|Received HTTP code 403 from proxy|ENOTFOUND|EAI_AGAIN/i;
 // Hosts that tools name in their help text, never the host that failed.
 const HELP_HOSTS = ['docs.npmjs.com', 'yarnpkg.com', 'classic.yarnpkg.com', 'pnpm.io', 'nodejs.org'];
+// Lines that only warn or inform: npm's `npm warn`/`notice`/`info`, yarn's `warning` and `info`,
+// pnpm's `WARN`. A deprecation notice links to a page (https://v8.dev/…) that no install fetched.
+const NOTICE_LINE = /^\s*(?:npm\s+(?:warn|notice|info)\b|warning\b|info\b|WARN\b)/i;
 
 /** The hosts off the allowlist that a piece of output names: after ENOTFOUND/EAI_AGAIN, and in URLs. */
 function offHosts(text) {
@@ -682,8 +688,11 @@ function offHosts(text) {
 /**
  * The host an install tried to reach outside the allowlist: its name, '' when the proxy refused a host
  * that the output does not name, or null when the failure was not about the network outside. The
- * host on the line that carries the failure (the 403, the failed lookup) wins; then the last one off
- * the allowlist anywhere in the output, leaving out the hosts of help text.
+ * host on the line that carries the failure (the 403, the failed lookup) wins. Only when the proxy
+ * refused or a name did not resolve may a host elsewhere in the output be the one: then the last one
+ * off the allowlist, leaving out warning and notice lines and the hosts of help text. A 403 from the
+ * allowlisted registry, or a refused connection to 127.0.0.1, says nothing about the allowlist, so a
+ * link elsewhere in that output (a deprecation notice, a tool's help page) is never named.
  */
 export function offAllowlistHost(output) {
   const t = installTail(output);
@@ -694,9 +703,9 @@ export function offAllowlistHost(output) {
     const here = offHosts(lines[i]);
     if (here.length) return here.at(-1);
   }
-  const anywhere = offHosts(t).filter((h) => !HELP_HOSTS.includes(h));
-  if (anywhere.length) return anywhere.at(-1);
-  return PROXY_REFUSAL.test(t) ? '' : null;
+  if (!PROXY_REFUSAL.test(t)) return null;
+  const anywhere = offHosts(lines.filter((l) => !NOTICE_LINE.test(l)).join('\n')).filter((h) => !HELP_HOSTS.includes(h));
+  return anywhere.length ? anywhere.at(-1) : '';
 }
 
 /**

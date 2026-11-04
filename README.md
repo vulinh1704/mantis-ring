@@ -58,7 +58,7 @@ The demo runs on a Vultr VM at https://104-156-252-200.sslip.io, with every task
 
 ## First real runs
 
-All of them ran on the VM under gVisor, on commit `0c2e46d`, on the Lumen sample: 2 pages × mobile and desktop × light and dark × English and Vietnamese, 16 screens. Lumen is built from Mantis's buggy-app test fixture, which has 13 planted UI bugs; the model is never told about them. After each run, `bench/grade-lumen.mjs` checks the planted bugs on the host against Mantis's answer key, which never enters a sandbox.
+All of them ran on the VM under gVisor, on commit `0c2e46d`, on the Lumen sample: 2 pages × mobile and desktop × light and dark × English and Vietnamese, 16 screens. Lumen is built from Mantis's buggy-app test fixture, which has 13 planted UI bugs. The model never sees the answer key or which bugs were planted: it gets only the issues Mantis measured at the start. After each run, `bench/grade-lumen.mjs` checks the planted bugs on the host against Mantis's answer key, which never enters a sandbox.
 
 **T2, one run with the default models** ([bench/2026-11-04-lumen-t2/receipt.md](bench/2026-11-04-lumen-t2/receipt.md)):
 - `REAL RUN · Vultr VX1 sea · 2026-11-03 20:43 UTC`. Fix model `deepseek-v4.1-flash-1017`, vision model `qwen3.8-27b`, gate on.
@@ -88,7 +88,7 @@ The rule ranks models by planted bugs fixed, then new issues, then cost, then ti
 **The tests** need Node 22 or newer. Two suites need nothing else:
 
 ```bash
-node test/agent-loop.mjs --unit     # path and tool rules, the receipt, check messages, the tamper guard, the client against a fake gateway, the sandbox's network against a fake docker, the GitHub path's decisions, the pressure arm, the rules the containment suites judge by, the seeded scene and when the loop stops it, the Atlas sample, what its grader refuses, an Atlas receipt, how bench/table.mjs grades an Atlas run, how a failed look says why, and speech for the video's voice with its spend guard (125 checks)
+node test/agent-loop.mjs --unit     # path and tool rules, the receipt, check messages, the tamper guard, the client against a fake gateway, the sandbox's network against a fake docker, the GitHub path's decisions, the pressure arm, the rules the containment suites judge by, the seeded scene and when the loop stops it, the Atlas sample, what its grader refuses, an Atlas receipt, how bench/table.mjs grades an Atlas run, how a failed look says why, which host an install failure may name, what the journal redacts, and speech for the video's voice with its spend guard (127 checks)
 node test/app-api.mjs               # the HTTP API: the admin rule, the two public switches and ring.sh's step for each, limits, approval and patch rules, the publish bar, SSE replay, pasted repository addresses, the admin-only Atlas sample, the seeded scene and the bodies it refuses, the longest running task in /status.json, the admin speech route's caps and ring.sh tts (85 checks)
 ```
 
@@ -125,7 +125,7 @@ scripts/ring.sh get <id>                   # the full record and the receipt
 scripts/ring.sh bundle <id> <dir>          # every file of the task
 scripts/ring.sh publish <id>               # only a run that passes the publish bar
 scripts/ring.sh selftest agent-loop        # or containment, or scenes; sandboxes under gVisor
-scripts/ring.sh tts chatterbox passage.txt sample.wav default   # the video's voice: the VM speaks at most 800 characters ($0.05 a call, $0.50 a day at most); the key stays there
+scripts/ring.sh tts chatterbox passage.txt sample.wav default   # the video's voice: the VM speaks at most 800 characters, and only if an estimate made before the call fits $0.05 and today's $0.50 of speech; the key stays there
 ```
 
 With `--selftest`, `deploy.sh` also runs `ring-selftest`, a wrapper the bootstrap script installs, which runs the containment and scene suites with `RING_RUNTIME=runsc`. After each deploy it checks from outside that both public switches are still off; once the owner opens them, `RING_ALLOW_PUBLIC=sample` accepts open sample runs (GitHub runs must still be closed), `github` the other way round, and `yes` accepts both. `ring.sh config` reads the same values, one switch at a time: it sends a patch that opens `publicSampleRuns` only with `RING_ALLOW_PUBLIC=sample` (or `yes`), one that opens `publicGithubRuns` only with `github` (or `yes`), and closing them needs nothing. The first step is `RING_ALLOW_PUBLIC=sample scripts/ring.sh config '{"publicSampleRuns":true}'`, and later deploys then run with `RING_ALLOW_PUBLIC=sample`. The owner link is for the owner only. The admin channel can never approve a run.
@@ -140,7 +140,7 @@ It asks for the check to pass and names no way to get there. The system prompt, 
 
 ### The Atlas sample
 
-Lumen no longer tells models apart, so the benchmark adds Atlas, `"sample": "atlas"`, for admin tasks only: a small invoicing app with 3 pages (`/`, `/pricing.html`, `/account.html`), in English and Vietnamese, light and dark, 24 screens with mobile and desktop. Its 9 planted bugs mostly show only when a page renders: at 360px, in Vietnamese or in dark mode. The model is never told about them. Atlas starts with its own dev script (`npm run dev`) and installs nothing.
+Lumen no longer tells models apart, so the benchmark adds Atlas, `"sample": "atlas"`, for admin tasks only: a small invoicing app with 3 pages (`/`, `/pricing.html`, `/account.html`), in English and Vietnamese, light and dark, 24 screens with mobile and desktop. Its 9 planted bugs mostly show only when a page renders: at 360px, in Vietnamese or in dark mode. As on Lumen, the model never sees which bugs were planted, only the issues Mantis measured at the start. Atlas starts with its own dev script (`npm run dev`) and installs nothing.
 
 `scripts/make-demo-atlas.sh` builds `demo/atlas` from the fixture of Mantis's agent benchmark (see [Built before the event](#built-before-the-event)) and leaves out its phone smoke test, `scripts/check-ui.mjs`, the `check:ui` script and the `playwright` devDependency, so the copy in the sandbox carries no test and installs nothing.
 

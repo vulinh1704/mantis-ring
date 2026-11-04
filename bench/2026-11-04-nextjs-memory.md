@@ -68,7 +68,7 @@ The old runner counted every exit code of 128 or more as a timeout.
 ## After the fix
 
 **Summary:**
-- **next-shadcn-admin-dashboard** was measured in all 3 runs, at no more than 2.35 GB.
+- **next-shadcn-admin-dashboard** was measured in both runs (`t_2d99fb20…` and `t_81a842db…`), at no more than 2.35 GB.
 - **ray-so** was measured in 1 of 2. It sits at the edge of the 3 GB: 2.89 GB at most in the run that passed, and out of memory in the other one, after the live log had warned.
 
 On `86c0e9d`:

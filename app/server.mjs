@@ -49,8 +49,8 @@ const STALE_SANDBOX_MS = 2 * CAP_RANGES.wallClockSec[1] * 1000;
 const PROBE_CAPS = { maxUsd: 0.25, maxPromptTokens: 400_000 };   // the whole probe costs < $0.02 (§5.3)
 const PROBE_TIMEOUT_MS = 15 * 60_000;
 // POST /admin/speech, the video's voice: one passage of at most 800 characters (about a minute of
-// speech) per call, one call at a time, built-in voices only. A call may cost at most $0.05 by speech()'s
-// upper-bound estimate, and speech at most $0.50 a UTC day, inside the admin and total caps.
+// speech) per call, one call at a time, built-in voices only. A call goes out only if speech()'s pre-call
+// estimate fits $0.05 and what is left of $0.50 of speech a UTC day, inside the admin and total caps.
 const SPEECH = Object.freeze({ maxChars: 800, callUsd: 0.05, dayUsd: 0.5, timeoutMs: 180_000, maxBytes: 16 * 2 ** 20 });
 const SPEECH_FIELDS = ['model', 'input', 'voice', 'format', 'language', 'speed', 'seed'];
 const DIFF_SHOWN_BYTES = 200 * 1024;

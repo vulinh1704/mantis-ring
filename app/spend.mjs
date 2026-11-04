@@ -255,7 +255,7 @@ export class Spend {
   /**
    * The guard for one speech call (POST /admin/speech): guardFor()'s checks for an admin call whose own
    * cap is `callUsd` (today's admin budget and the total cap included), then today's speech budget
-   * `dayUsd`, all against speech()'s upper-bound estimate. after() records the call as kind 'speech'.
+   * `dayUsd`, all against speech()'s pre-call estimate. after() records the call as kind 'speech'.
    * @param {{id: string, callUsd: number, dayUsd: number}} o
    * @returns {import('../agent/inference.mjs').Guard & {spent(): object}}
    */

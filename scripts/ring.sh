@@ -31,7 +31,7 @@
 #                             white space becomes single spaces) with a priced speech model of the catalogue, such
 #                             as chatterbox or qwen3-tts-12hz-1.7b, and a built-in voice. The audio comes back into
 #                             <out-file>, whose extension picks the format (.mp3 .wav .flac .opus); the key stays on
-#                             the VM. One call costs at most $0.05 and speech at most $0.50 a day (see spend)
+#                             the VM. A call goes out only if its estimate fits $0.05 and today's $0.50 (see spend)
 # Environment, for tests only: RING_SSH (a program to use instead of ssh; it must be executable) and
 # RING_HOST. With RING_TEST=1 the script refuses the real ssh and the real VM.
 set -euo pipefail
