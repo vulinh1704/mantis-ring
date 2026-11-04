@@ -124,7 +124,11 @@ Every failure in these steps is a `SetupError`. Its `publicMessage` is the one s
 
 **Next.js, measured on 4 Nov** ([bench/2026-11-04-nextjs-memory.md](../bench/2026-11-04-nextjs-memory.md)), with no model call:
 - **Before:** two Next.js 16 apps (next-shadcn-admin-dashboard, ray-so) failed every time with "the measurement timed out". It was memory: about 2 GB was in use before the look, and four pages at once took the sandbox past 3 GB within 3–6 s. The host's OOM killer then stopped the sandbox, and `docker exec` returned 128.
-- **After `86c0e9d`:** both were measured on 4 of 4 screens, at no more than 2.35 GB and 2.89 GB. ray-so came within 0.11 GB of the limit.
+- **After `86c0e9d`:**
+  - next-shadcn-admin-dashboard was measured on 4 of 4 screens in all 3 runs, at no more than 2.35 GB.
+  - ray-so was measured in 1 of 2 runs, at 2.89 GB. In the other, it used 2.24 GB before the look; the live log warned, and the look ran out of memory on the desktop screens.
+  - The page then said "the sandbox ran out of memory".
+  - A larger memory limit would give such apps a margin. That is the owner's call.
 - **The proxy's refusal** of `cdn.sheetjs.com` (omni-tools) is now named in the install's sentence.
 
 ## The tools
