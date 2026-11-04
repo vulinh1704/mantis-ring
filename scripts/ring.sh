@@ -18,8 +18,10 @@
 #   cancel <id>               POST /admin/tasks/<id>/cancel
 #   bundle <id> <localdir>    every file of the task, unpacked into <localdir>
 #   publish <id>              POST /admin/publish/<id>
-#   config ['<json>']         GET, or POST with a patch, /admin/config. A patch that opens publicSampleRuns or
-#                             publicGithubRuns needs RING_ALLOW_PUBLIC=yes; closing them never does
+#   config ['<json>']         GET, or POST with a patch, /admin/config. A patch that opens publicSampleRuns
+#                             needs RING_ALLOW_PUBLIC=sample (or yes), one that opens publicGithubRuns needs
+#                             RING_ALLOW_PUBLIC=github (or yes), and yes alone lets one patch open both, as in
+#                             deploy.sh; the old publicRuns needs yes. Closing them never needs anything
 #   spend                     /admin/spend
 #   selftest <suite>          POST /admin/selftest (agent-loop | containment | scenes); streams its output
 #                             and exits with the suite's own exit code
@@ -36,7 +38,7 @@ S=("$SSH_BIN" -i ~/.ssh/vultr_ring_deploy -o IdentitiesOnly=yes -o BatchMode=yes
 APP=http://127.0.0.1:8080
 
 die() { printf 'ring.sh: %s\n' "$*" >&2; exit 1; }
-usage() { sed -n '8,28p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '8,30p' "$0" | sed 's/^# \{0,1\}//'; }
 if [ -n "${RING_SSH:-}" ] && [ ! -x "$RING_SSH" ]; then die "RING_SSH is set but is not an executable file: $RING_SSH"; fi
 if [ "${RING_TEST:-}" = 1 ]; then
   [ "$HOST_ADDR" != "$REAL_HOST" ] || die "RING_TEST=1, but the host is the real VM: set RING_HOST"
@@ -111,12 +113,23 @@ case "$cmd" in
   config)
     if [ "$#" -ge 1 ]; then
       need_json "$1"
-      # D-5: opening public runs spends tokens for anyone, so it takes a second, deliberate step.
-      # Closing them (false) never does. The old switch publicRuns counts too.
-      if node -e 'const p = JSON.parse(process.argv[1]); const keys = ["publicSampleRuns", "publicGithubRuns", "publicRuns"];
-        process.exit(p !== null && typeof p === "object" && keys.some((k) => Object.hasOwn(p, k) && p[k] !== false) ? 0 : 1)' "$1"; then
-        [ "${RING_ALLOW_PUBLIC:-}" = yes ] || die "this patch opens public runs (publicSampleRuns or publicGithubRuns). They stay closed (D-5) unless the owner says so: set RING_ALLOW_PUBLIC=yes to send it"
-      fi
+      # D-5: opening public runs spends tokens for anyone, so it takes a second, deliberate step, one
+      # switch at a time: RING_ALLOW_PUBLIC=sample may open the sample's runs, github the GitHub runs,
+      # and yes both (deploy.sh reads it the same way). Closing them (false) never needs it. The old
+      # switch publicRuns opened both kinds, so a value other than false needs yes.
+      allow=${RING_ALLOW_PUBLIC:-}
+      opens=$(node -e 'const p = JSON.parse(process.argv[1]); const o = p !== null && typeof p === "object" && !Array.isArray(p) ? p : {};
+        const on = (k) => Object.hasOwn(o, k) && o[k] !== false;
+        console.log([on("publicSampleRuns") && "sample", on("publicGithubRuns") && "github", on("publicRuns") && "both"].filter(Boolean).join(" "))' "$1") \
+        || die "could not read the patch: $1"
+      for kind in $opens; do
+        case "$kind:$allow" in
+          sample:sample | sample:yes | github:github | github:yes | both:yes) ;;
+          sample:*) die "this patch opens public runs of the sample (publicSampleRuns). They stay closed (D-5) unless the owner says so: set RING_ALLOW_PUBLIC=sample (or yes) to send it" ;;
+          github:*) die "this patch opens public runs on GitHub repositories (publicGithubRuns). They stay closed (D-5) unless the owner says so: set RING_ALLOW_PUBLIC=github (or yes) to send it" ;;
+          *) die "this patch sets the old publicRuns, which opened both kinds of public run: send publicSampleRuns or publicGithubRuns instead (or set RING_ALLOW_PUBLIC=yes)" ;;
+        esac
+      done
       post /admin/config "$1"
     else
       get /admin/config

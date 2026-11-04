@@ -13,6 +13,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { FAKE_KEY, startFakeGateway } from './fake-gateway.mjs';
 
 const results = [];
@@ -583,6 +584,38 @@ try {
       && rewritten.publicSampleRuns === true && !('publicRuns' in rewritten) && rewritten.maxRunning === 1
       && both.cfg.publicSampleRuns === false && both.cfg.publicGithubRuns === false,
     `read: sample ${oldOn.cfg.publicSampleRuns}, GitHub ${oldOn.cfg.publicGithubRuns}; rewritten ${JSON.stringify(rewritten)}; with both keys: sample ${both.cfg.publicSampleRuns}`);
+
+  // scripts/ring.sh config opens one switch at a time (D-5), against a stand-in for ssh that only
+  // logs what it would send. RING_TEST=1 makes the script refuse the real ssh and the real VM.
+  const fakeSsh = path.join(stateDir, 'fake-ssh');
+  const sshLog = path.join(stateDir, 'fake-ssh.log');
+  await writeFile(sshLog, '');
+  await writeFile(fakeSsh, `#!/bin/sh\nfor last; do :; done\nprintf '%s\\n' "$last" >> '${sshLog}'\ncat >> '${sshLog}'\nprintf '\\n' >> '${sshLog}'\necho '{"ok":true}'\n`, { mode: 0o755 });
+  const ringSh = fileURLToPath(new URL('../scripts/ring.sh', import.meta.url));
+  const ringConfig = async (allow, patch) => {
+    const before = (await readFile(sshLog, 'utf8')).length;
+    const env = { PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin', HOME: stateDir, LANG: 'C.UTF-8', RING_TEST: '1', RING_HOST: '192.0.2.1', RING_SSH: fakeSsh };
+    if (allow !== undefined) env.RING_ALLOW_PUBLIC = allow;
+    const r = spawnSync('bash', [ringSh, 'config', patch], { encoding: 'utf8', env, timeout: 20_000 });
+    const sent = (await readFile(sshLog, 'utf8')).slice(before);
+    return { code: r.status, sent: sent.includes('/admin/config') && sent.includes(patch), err: oneLine(r.stderr) };
+  };
+  const cases = [
+    [undefined, '{"publicSampleRuns":true}', false], ['sample', '{"publicSampleRuns":true}', true], ['yes', '{"publicSampleRuns":true}', true],
+    ['sample', '{"publicGithubRuns":true}', false], ['github', '{"publicGithubRuns":true}', true], ['github', '{"publicSampleRuns":true}', false],
+    ['sample', '{"publicSampleRuns":true,"publicGithubRuns":true}', false], ['yes', '{"publicSampleRuns":true,"publicGithubRuns":true}', true],
+    ['sample', '{"publicRuns":true}', false], ['bogus', '{"publicSampleRuns":true}', false],
+    [undefined, '{"publicSampleRuns":false,"publicGithubRuns":false}', true], [undefined, '{"maxRunning":2}', true],
+  ];
+  const wrong = [];
+  for (const [allow, patch, want] of cases) {
+    const r = await ringConfig(allow, patch);
+    if (r.sent !== want || (r.code === 0) !== want) wrong.push(`RING_ALLOW_PUBLIC=${allow ?? '(unset)'} ${patch}: exit ${r.code}, ${r.sent ? 'sent' : 'not sent'} ${r.err}`);
+  }
+  const refusedGithub = await ringConfig('sample', '{"publicGithubRuns":true}');
+  check('scripts/ring.sh config: RING_ALLOW_PUBLIC=sample opens only publicSampleRuns, github only publicGithubRuns, yes both; the old publicRuns needs yes; closing needs nothing',
+    wrong.length === 0 && /RING_ALLOW_PUBLIC=github/.test(refusedGithub.err),
+    wrong.join(' | ') || `${cases.length} patches as expected; refused with: ${refusedGithub.err}`);
 
   const pubTry = await admin('POST', `/admin/publish/${id ?? 'x'}`, { body: {} });
   check('POST /admin/publish/:id refuses a TEST RUN receipt (409) and publishes nothing', pubTry.status === 409 && published.length === 0, `${pubTry.status} ${oneLine(pubTry.json?.error ?? pubTry.text)}`);

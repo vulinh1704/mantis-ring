@@ -14,7 +14,8 @@
 #   --force     restart even while a task or a self-test runs, or when the VM's queue cannot be read
 #   --selftest  afterwards, with no task running, run ring-selftest (containment and scenes; every check must pass)
 # Once the owner opens public runs (D-5): RING_ALLOW_PUBLIC=sample accepts open sample runs while
-# GitHub runs must still be closed, and RING_ALLOW_PUBLIC=yes accepts both open.
+# GitHub runs must still be closed, github the other way round, and yes accepts both open (the same
+# values that let scripts/ring.sh config open each switch).
 # Environment, for tests only: RING_SSH, RING_RSYNC (programs to use instead of ssh and rsync; they
 # must be executable), RING_HOST, RING_URL. With RING_TEST=1 the script refuses to run unless both
 # programs are test stand-ins and the host is not the real VM, so a broken fake can never fall
@@ -110,7 +111,7 @@ for arg in "$@"; do
     --dirty) dirty=yes ;;
     --force) force=yes ;;
     --selftest) selftest=yes ;;
-    -h | --help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h | --help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "usage: scripts/deploy.sh [--dirty] [--force] [--selftest]" >&2; exit 64 ;;
   esac
 done
@@ -223,6 +224,8 @@ case "${RING_ALLOW_PUBLIC:-}" in
   yes) ;;
   sample)
     [ "$github_runs" = false ] || die "$URL/api/config says publicGithubRuns is '$github_runs': runs on GitHub repositories must stay closed with RING_ALLOW_PUBLIC=sample (D-5). Close them with scripts/ring.sh config, or set RING_ALLOW_PUBLIC=yes once the owner opens them." ;;
+  github)
+    [ "$sample_runs" = false ] || die "$URL/api/config says publicSampleRuns is '$sample_runs': runs of the sample must stay closed with RING_ALLOW_PUBLIC=github (D-5). Close them with scripts/ring.sh config, or set RING_ALLOW_PUBLIC=yes once the owner opens them." ;;
   *)
     [ "$sample_runs" = false ] && [ "$github_runs" = false ] \
       || die "$URL/api/config says publicSampleRuns is '$sample_runs' and publicGithubRuns is '$github_runs': public runs must stay closed (D-5). Close them with scripts/ring.sh config, or set RING_ALLOW_PUBLIC=sample or yes once the owner opens them." ;;
