@@ -224,11 +224,24 @@
     if (FINISHED.has(S.task.state) && 'receipt' in task) renderReceipt(S);
   }
 
+  /** The seeded scene's record (admin only): a script played the model. null for every other run. */
+  function seededOf(t) {
+    const s = t && t.seeded;
+    return s && typeof s === 'object' && typeof s.label === 'string' ? s : null;
+  }
+
   function renderHead(S) {
     const t = S.task;
     const label = t.source && t.source.label ? t.source.label : 'project';
     $('t-title').textContent = `Run · ${label}`;
-    const parts = [`model ${t.model} on ${t.provider || PROVIDER}`, `cover-up gate ${t.gate ? 'on' : 'off'}`];
+    // A seeded run shows its label at the top right for the whole run, and the stand-in in place of a model.
+    const seeded = seededOf(t);
+    const tag = $('t-seeded');
+    tag.textContent = seeded ? seeded.label : '';
+    tag.hidden = !seeded;
+    $('t-chips').replaceChildren(...(seeded ? [el('li', 'chip', seeded.model || 'scripted stand-in (no LLM)')] : []));
+    $('t-chips').hidden = !seeded;
+    const parts = [seeded ? 'no inference call' : `model ${t.model} on ${t.provider || PROVIDER}`, `cover-up gate ${t.gate ? 'on' : 'off'}`];
     // A bench run that gave the model another task message says so (public runs are always neutral).
     if (typeof t.promptVariant === 'string' && t.promptVariant !== 'neutral') parts.push(`${t.promptVariant} task message (bench arm)`);
     if (Number.isFinite(t.cells)) parts.push(`${t.cells} screens`);
@@ -557,6 +570,8 @@
 
   function modelText(d) {
     const calls = Array.isArray(d.calls) && d.calls.length ? ` · ${d.calls.join(', ')}` : '';
+    // The seeded stand-in: no model, no tokens, no cost to report.
+    if (d.scripted) return `Turn ${d.turn ?? '?'} · ${d.model} · ${d.provider || 'no inference call'}${calls}`;
     const ending = d.finishReason && d.finishReason !== 'tool_calls' && d.finishReason !== 'stop' ? ` · ended: ${d.finishReason}` : '';
     return `Turn ${d.turn ?? '?'} · ${d.model} on ${d.provider || PROVIDER} · ${msText(d.ms)} · ${num(d.promptTokens)} in / ${num(d.completionTokens)} out tokens · ${usd(d.usd)}${calls}${ending}`;
   }
@@ -645,8 +660,10 @@
 
     const head = el('div', 'receipt-head');
     const label = String(r.label || '');
-    head.append(el('h2', null, 'Receipt'), el('span', `pill ${label.startsWith('REAL RUN') ? 'is-ok' : 'is-info'}`, label || 'no label'));
+    const seeded = r.seeded && typeof r.seeded === 'object' ? r.seeded : null;
+    head.append(el('h2', null, 'Receipt'), el('span', `pill ${label.startsWith('REAL RUN') ? 'is-ok' : seeded ? 'is-warn' : 'is-info'}`, label || 'no label'));
     box.append(head, el('p', 'receipt-line', r.line));
+    if (seeded) box.append(el('p', 'notice is-warn', `SEEDED: ${seeded.note || 'a scripted stand-in played the model, so no LLM was called.'}`));
     const v = VERDICTS[r.verdict];
     if (v) {
       const p = el('p');
@@ -672,7 +689,7 @@
       ['Screens compared', Number.isFinite(k.cellsExpected) ? `${num(k.cellsCompared)} of ${num(k.cellsExpected)}` : num(k.cellsCompared ?? (r.matrix && r.matrix.cells))],
       ['Time', secs(r.time && r.time.totalSec)],
       ['Tokens', num(tokens)],
-      ['Model cost', usd(r.usd)],
+      ['Model cost', seeded ? 'no model call' : usd(r.usd)],
     ]) {
       const f = el('div', 'fact');
       f.append(el('span', 'label', name), el('span', 'value', value));
@@ -695,7 +712,7 @@
       box.append(table(['Role', 'Model', 'Provider', 'Calls', 'Tokens in / out / reasoning', 'Cost (list price)'], r.models.map((m) => [
         m.role, m.id, m.provider || PROVIDER, num(m.calls), `${num(m.promptTokens)} / ${num(m.completionTokens)} / ${num(m.reasoningTokens)}`, usd(m.usd),
       ])));
-      box.append(el('p', 'muted', 'Costs are list prices from the Vultr catalogue; billing may differ.'));
+      if (!seeded) box.append(el('p', 'muted', 'Costs are list prices from the Vultr catalogue; billing may differ.'));
     }
 
     if (r.vision && r.vision.model && r.vision.verdict !== 'skipped') {
@@ -703,7 +720,8 @@
     }
 
     if (r.summary && r.summary.text) {
-      box.append(el('h3', null, "The model's summary"), el('p', 'muted', 'In its own words, not measured:'), el('blockquote', 'quote', r.summary.text));
+      box.append(el('h3', null, seeded ? "The script's summary" : "The model's summary"), el('p', 'muted', seeded ? 'Written into the script, not measured:' : 'In its own words, not measured:'),
+        el('blockquote', 'quote', r.summary.text));
     }
 
     const images = Object.keys(IMAGES).filter((name) => Array.isArray(t.files) && t.files.includes(name));

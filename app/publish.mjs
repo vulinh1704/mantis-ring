@@ -3,12 +3,14 @@
 // has PrivateTmp), renamed into runs/<id>, and then the `latest` symlink is replaced with a rename, so
 // /latest/ never shows a half-written run. Every string on the page is HTML-escaped, and the page has
 // no script and a CSP of its own. Only a receipt that passes the bar is published: verdict pass, no
-// lost control, every screen compared, a patch that applies, a sample project, a REAL RUN label, a
-// sandbox confirmed destroyed, the gate on and the neutral task message (never a bench arm). Nothing
-// is ever published automatically (D-9); an approval of the published run only renders the same run
-// again with its approval.
+// lost control, every screen compared, a patch that applies, the public sample, a REAL RUN label, a
+// sandbox confirmed destroyed, the gate on and the neutral task message (never a bench arm, a run of
+// the admin-only Atlas sample or a SEEDED run). Nothing is ever published automatically (D-9); an
+// approval of the published run only renders the same run again with its approval.
 import { chmodSync, constants, copyFileSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { isSeededLabel } from '../agent/seeded.mjs';
+import { isPublicSample } from './config.mjs';
 import { NETWORK, esc, readSelftests, runtimeName, sizeText, usdText, utcText } from './status.mjs';
 
 const TASK_ID = /^t_[0-9a-f]{32}$/;
@@ -44,7 +46,18 @@ export function notPublishable(task, receipt) {
   if (receipt.diff?.applies === false) why.push('its patch does not apply to the original files');
   if (receipt.diff?.truncated) why.push('its patch was cut at 1 MB');
   if (!String(receipt.label ?? '').startsWith('REAL RUN')) why.push(`its label is "${String(receipt.label ?? '').slice(0, 80)}" (only a REAL RUN is published)`);
-  if (task?.source?.kind !== 'sample' || (receipt.source && receipt.source.kind !== 'sample')) why.push('only sample-project runs are published');
+  if (task?.source?.kind !== 'sample' || (receipt.source && receipt.source.kind !== 'sample')) {
+    why.push('only sample-project runs are published');
+  } else {
+    // /latest/ shows the sample a judge can run: never the admin-only bench sample (Atlas).
+    const names = [task?.source?.name, receipt.source?.name].filter((n) => n !== undefined && n !== null);
+    const adminOnly = names.find((n) => !isPublicSample(n));
+    if (adminOnly !== undefined) why.push(`it ran on ${String(adminOnly).slice(0, 40)}, an admin-only bench sample (only runs of the public sample are published)`);
+  }
+  // A seeded run is a scripted scene for the video: no model fixed anything in it.
+  if (task?.seeded || receipt.seeded || isSeededLabel(receipt.label)) {
+    why.push('it is a SEEDED run, where a scripted stand-in played the model (no LLM), so it is never published');
+  }
   if (receipt.containment?.destroyed !== true) why.push('its sandbox was not confirmed destroyed');
   // /latest/ shows what a public run does: the gate on and the neutral task message. A bench arm (the
   // gate off, or the pressure message) is never published. Receipts from before the pressure arm

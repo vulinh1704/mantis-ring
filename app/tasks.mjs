@@ -8,9 +8,10 @@ import { randomBytes } from 'node:crypto';
 import { appendFileSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { PROMPT_VARIANTS } from '../agent/prompt.mjs';
+import { SEEDED_SCRIPTS, seededInfo } from '../agent/seeded.mjs';
 import {
   CAP_RANGES, GITHUB_WALL_CLOCK_SEC, LOCALES, SAMPLES, SCHEMES, VIEWPORTS,
-  checkCaps, checkSampling, isModelId, samplingFor,
+  checkCaps, checkSampling, isModelId, isPublicSample, samplingFor,
 } from './config.mjs';
 
 export const TASK_ID = /^t_[0-9a-f]{32}$/;
@@ -480,7 +481,10 @@ export class RunStats {
 const REPO = /^https:\/\/github\.com\/([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/([A-Za-z0-9._-]{1,100}?)(?:\.git)?\/?$/;
 const ROUTE = /^\/[A-Za-z0-9._~!$&'()*+;=:@%/-]{0,100}$/;
 const LABEL = /^[A-Za-z0-9 ._:+-]{1,80}$/;
-const ADMIN_KEYS = new Set(['sample', 'repo', 'routes', 'viewports', 'schemes', 'locales', 'model', 'visionModel', 'gate', 'caps', 'sampling', 'label', 'priority', 'promptVariant']);
+const ADMIN_KEYS = new Set(['sample', 'repo', 'routes', 'viewports', 'schemes', 'locales', 'model', 'visionModel', 'gate', 'caps', 'sampling', 'label', 'priority', 'promptVariant', 'seeded']);
+/** The answer to a sample that does not exist, and to an admin-only sample asked for by a public request. */
+export const SAY_NO_SAMPLE = 'That sample does not exist. Pick one from the list.';
+export const SAY_SEEDED_ALONE = 'A seeded run uses the scripted stand-in with the gate on, no vision model and the neutral task message: leave out model, visionModel, gate, promptVariant and sampling.';
 export const SAY_BAD_REPO = 'Only public repositories on github.com are supported, written as https://github.com/owner/name.';
 export const SAY_REPO_PAGE = "Give the repository's own address, https://github.com/owner/name, not a link to a branch, folder, file or other page in it.";
 export const SAY_BAD_MATRIX = 'Routes must be paths like /pricing (up to 3); languages must come from the list.';
@@ -529,8 +533,13 @@ function pick(v, allowed, max, sentence) {
  * input limits and the admin maxima. Returns the task fields; throws TaskInputError with one sentence.
  * A public body may name only the project, routes and languages: everything else is fixed, so a
  * public task always has the gate on and the neutral task message, whatever else the body says.
+ * An admin-only sample (Atlas) does not exist for a public body: it gets the unknown-sample sentence.
+ * An admin body may ask for a seeded run ({"seeded": "cover-up"}, agent/seeded.mjs): a scripted
+ * stand-in instead of a model, on its script's sample, with the gate on, no vision model and the
+ * neutral task message; a body that also names one of those is refused rather than half obeyed.
  * @returns {{source:object, matrix:object, model:string, sampling:object, visionModel:string|null,
- *            gate:boolean, caps:object, label:string|null, priority:boolean, promptVariant:'neutral'|'pressure'}}
+ *            gate:boolean, caps:object, label:string|null, priority:boolean, promptVariant:'neutral'|'pressure',
+ *            seeded:{script:string, label:string, model:string, note:string}|null}}
  */
 export function taskFromBody(body, { admin = false, cfg }) {
   if (!isObject(body)) throw new TaskInputError('Send a JSON object.');
@@ -544,8 +553,9 @@ export function taskFromBody(body, { admin = false, cfg }) {
 
   let source, matrix;
   if (hasSample) {
-    const sample = typeof body.sample === 'string' && Object.hasOwn(SAMPLES, body.sample) ? SAMPLES[body.sample] : null;
-    if (!sample) throw new TaskInputError('That sample does not exist. Pick one from the list.');
+    const known = typeof body.sample === 'string' && Object.hasOwn(SAMPLES, body.sample);
+    if (!known || (!admin && !isPublicSample(body.sample))) throw new TaskInputError(SAY_NO_SAMPLE);
+    const sample = SAMPLES[body.sample];
     source = { kind: 'sample', name: body.sample, label: sample.label };
     matrix = { routes: [...sample.routes], viewports: [...sample.viewports], schemes: [...sample.schemes], locales: [...sample.locales] };
   } else {
@@ -566,20 +576,31 @@ export function taskFromBody(body, { admin = false, cfg }) {
     const model = cfg.fixModel;
     return {
       source, matrix, model, sampling: samplingFor(model, cfg), visionModel: cfg.visionModel ?? null,
-      gate: true, caps: capsFor(source, cfg.caps), label: null, priority: false, promptVariant: 'neutral',
+      gate: true, caps: capsFor(source, cfg.caps), label: null, priority: false, promptVariant: 'neutral', seeded: null,
     };
   }
 
   // Admin only: screen sizes, schemes, model choice, the gate switch, caps, sampling, label, priority,
-  // and the task message's variant (the bench's pressure arm).
+  // the task message's variant (the bench's pressure arm), and the seeded scene.
   matrix.viewports = pick(body.viewports, VIEWPORTS, VIEWPORTS.length, `viewports must come from: ${VIEWPORTS.join(', ')}.`) ?? matrix.viewports;
   matrix.schemes = pick(body.schemes, SCHEMES, SCHEMES.length, `schemes must come from: ${SCHEMES.join(', ')}.`) ?? matrix.schemes;
 
-  const model = body.model ?? cfg.fixModel;
-  if (!isModelId(model) || !cfg.allowedModels.includes(model)) throw new TaskInputError(`model must be one of allowedModels: ${cfg.allowedModels.join(', ')}.`);
+  let seeded = null;
+  if (body.seeded !== undefined && body.seeded !== null) {
+    if (typeof body.seeded !== 'string' || !SEEDED_SCRIPTS.includes(body.seeded)) throw new TaskInputError(`seeded must be one of: ${SEEDED_SCRIPTS.join(', ')}.`);
+    const info = seededInfo(body.seeded);
+    if (source.kind !== 'sample' || source.name !== info.sample) throw new TaskInputError(`A seeded run plays its script on the ${info.sample} sample only.`);
+    const given = (k) => body[k] !== undefined && body[k] !== null;
+    if (given('model') || (given('visionModel') && body.visionModel !== false) || (given('gate') && body.gate !== true)
+      || (given('promptVariant') && body.promptVariant !== 'neutral') || given('sampling')) throw new TaskInputError(SAY_SEEDED_ALONE);
+    seeded = { script: info.script, label: info.label, model: info.model, note: info.note };
+  }
 
-  let visionModel = cfg.visionModel ?? null;
-  if (body.visionModel !== undefined) {
+  const model = seeded ? seeded.model : body.model ?? cfg.fixModel;
+  if (!seeded && (!isModelId(model) || !cfg.allowedModels.includes(model))) throw new TaskInputError(`model must be one of allowedModels: ${cfg.allowedModels.join(', ')}.`);
+
+  let visionModel = seeded ? null : cfg.visionModel ?? null;
+  if (!seeded && body.visionModel !== undefined) {
     if (body.visionModel === null || body.visionModel === false) visionModel = null;
     else if (isModelId(body.visionModel) && (cfg.allowedModels.includes(body.visionModel) || body.visionModel === cfg.visionModel)) visionModel = body.visionModel;
     else throw new TaskInputError('visionModel must be null or a model from allowedModels.');
@@ -596,8 +617,8 @@ export function taskFromBody(body, { admin = false, cfg }) {
     }
   }
 
-  let sampling = samplingFor(model, cfg, { bench: true });
-  if (body.sampling !== undefined) {
+  let sampling = seeded ? {} : samplingFor(model, cfg, { bench: true });
+  if (!seeded && body.sampling !== undefined) {
     try {
       sampling = { ...sampling, ...checkSampling(body.sampling) };
     } catch (err) {
@@ -613,7 +634,7 @@ export function taskFromBody(body, { admin = false, cfg }) {
   if (!PROMPT_VARIANTS.includes(promptVariant)) throw new TaskInputError(`promptVariant must be one of: ${PROMPT_VARIANTS.join(', ')}.`);
 
   return {
-    source, matrix, model, sampling, visionModel, gate: body.gate ?? true, caps, label: body.label ?? null, priority: body.priority ?? false, promptVariant,
+    source, matrix, model, sampling, visionModel, gate: body.gate ?? true, caps, label: body.label ?? null, priority: body.priority ?? false, promptVariant, seeded,
   };
 }
 

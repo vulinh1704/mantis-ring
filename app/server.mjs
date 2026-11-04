@@ -18,7 +18,9 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { chat, newTally } from '../agent/inference.mjs';
 import { APP_LABEL, Sandbox, childEnv } from '../runner/sandbox.mjs';
 import * as configModule from './config.mjs';
-import { CAP_RANGES, ConfigError, HEAVY_SLOTS, MAX_QUEUED, PROVIDER, PUBLIC_DIR, PUBLIC_URL, RUNTIME, SAMPLES, STATE_DIR, samplingFor } from './config.mjs';
+import {
+  CAP_RANGES, ConfigError, HEAVY_SLOTS, MAX_QUEUED, PROVIDER, PUBLIC_DIR, PUBLIC_URL, RUNTIME, SAMPLES, STATE_DIR, isPublicSample, samplingFor,
+} from './config.mjs';
 import { PublishError, notPublishable, publishLatest, refreshPlaceholder } from './publish.mjs';
 import { Spend } from './spend.mjs';
 import * as statusModule from './status.mjs';
@@ -46,8 +48,9 @@ const STALE_SANDBOX_MS = 2 * CAP_RANGES.wallClockSec[1] * 1000;
 const PROBE_CAPS = { maxUsd: 0.25, maxPromptTokens: 400_000 };   // the whole probe costs < $0.02 (§5.3)
 const PROBE_TIMEOUT_MS = 15 * 60_000;
 const DIFF_SHOWN_BYTES = 200 * 1024;
+// `seeded` (null, or the seeded scene's script, label and stand-in) lets the run page show its label from the start.
 const PUBLIC_KEYS = ['id', 'createdAt', 'updatedAt', 'startedAt', 'finishedAt', 'origin', 'state', 'source', 'matrix', 'model',
-  'visionModel', 'gate', 'promptVariant', 'position', 'step', 'stepTimes', 'sandbox', 'result', 'approvedAt', 'approvedWith', 'publishedAt'];
+  'visionModel', 'gate', 'promptVariant', 'seeded', 'position', 'step', 'stepTimes', 'sandbox', 'result', 'approvedAt', 'approvedWith', 'publishedAt'];
 const MIN_ETA_RUNS = 3;              // an ETA needs this many comparable finished runs (as /api/config's etaText)
 const MAX_PASSPHRASE_TRIES = 5;      // wrong approval passphrases per task before approving it is refused
 const NORMAL_ENDS = ['finish', 'checks', 'turns', 'time', 'no-tools'];
@@ -442,14 +445,15 @@ export function createApp(deps = {}) {
   }
 
   /**
-   * Whether a finished run predicts the next public one: the sample with its own matrix, the neutral
-   * task message, the default limits that set its length (checks, turns, wall clock) and a normal
-   * end. Smoke tests on one screen, pressure-arm runs, runs stopped by their budget or by an inference
-   * error, and GitHub runs do not count.
+   * Whether a finished run predicts the next public one: the public sample with its own matrix, the
+   * neutral task message, a model (not the seeded stand-in), the default limits that set its length
+   * (checks, turns, wall clock) and a normal end. Smoke tests on one screen, pressure-arm runs, seeded
+   * runs, runs of an admin-only sample (Atlas), runs stopped by their budget or by an inference error,
+   * and GitHub runs do not count.
    */
   function comparableRun(rec, receipt) {
-    const s = rec.source?.kind === 'sample' && Object.hasOwn(SAMPLES, rec.source.name) ? SAMPLES[rec.source.name] : null;
-    if (!s || (rec.promptVariant ?? 'neutral') !== 'neutral') return false;
+    const s = rec.source?.kind === 'sample' && isPublicSample(rec.source.name) ? SAMPLES[rec.source.name] : null;
+    if (!s || rec.seeded || (rec.promptVariant ?? 'neutral') !== 'neutral') return false;
     const same = (a, b) => Array.isArray(a) && a.length === b.length && a.every((x, i) => x === b[i]);
     if (!['routes', 'viewports', 'schemes', 'locales'].every((k) => same(rec.matrix?.[k], s[k]))) return false;
     const def = config.get().caps ?? {};
@@ -464,13 +468,14 @@ export function createApp(deps = {}) {
     store.create({
       id, origin, label: spec.label, state: 'queued',
       source: spec.source, matrix: spec.matrix, model: spec.model, sampling: spec.sampling,
-      visionModel: spec.visionModel, gate: spec.gate, promptVariant, caps: spec.caps,
+      visionModel: spec.visionModel, gate: spec.gate, promptVariant, seeded: spec.seeded ?? null, caps: spec.caps,
       position: null, step: 'queue', stepTimes: {}, sandbox: null, result: null,
       startedAt: null, finishedAt: null, approvedAt: null, publishedAt: null,
       private: { ipKey: key, ownerTokenSha256: sha256(ownerToken) },
     });
     emit(id, 'step', { step: 'queue', status: 'start' });
-    journal(id, `created origin=${origin} source=${spec.source.kind}:${spec.source.label} model=${spec.model} gate=${spec.gate ? 'on' : 'off'} prompt=${promptVariant}${spec.label ? ` label=${spec.label}` : ''}`);
+    journal(id, `created origin=${origin} source=${spec.source.kind}:${spec.source.label} model=${spec.model} gate=${spec.gate ? 'on' : 'off'} prompt=${promptVariant}`
+      + `${spec.seeded ? ` seeded=${spec.seeded.script}` : ''}${spec.label ? ` label=${spec.label}` : ''}`);
     try {
       queue.enqueue(id, { priority: spec.priority, run: (signal) => runOne(id, signal) });
     } catch (err) {
@@ -493,7 +498,7 @@ export function createApp(deps = {}) {
     }
     return {
       id: rec.id, source, matrix: rec.matrix, model: rec.model, sampling: rec.sampling, visionModel: rec.visionModel, gate: rec.gate,
-      promptVariant: rec.promptVariant ?? 'neutral', caps: rec.caps,
+      promptVariant: rec.promptVariant ?? 'neutral', seeded: rec.seeded?.script ?? null, caps: rec.caps,
     };
   }
 
@@ -524,6 +529,7 @@ export function createApp(deps = {}) {
     // The vision model gets its own sampling from modelSampling (§4.9), not the fix model's.
     const visionSampling = rec.visionModel ? samplingFor(rec.visionModel, config.get(), { bench: rec.origin === 'admin' }) : {};
     return runFix(task, {
+      // A seeded task (task.seeded) never calls this: the loop answers from its script instead.
       chat,
       createSandbox: sandboxStarter(id, { store, journal }),
       emit: (type, data) => loopEvent(id, type, data),
@@ -535,7 +541,7 @@ export function createApp(deps = {}) {
       runtime: RUNTIME,
       heavy: queue.heavy,
       // visionCheck with this task's model client, tally and spend guard; the loop's input cannot replace them.
-      vision: rec.visionModel && vision ? (input) => vision({ ...input, sampling: visionSampling, chat, tally, guard }) : null,
+      vision: rec.visionModel && vision && !rec.seeded ? (input) => vision({ ...input, sampling: visionSampling, chat, tally, guard }) : null,
       // The loop starts its own lines with task=<id>.
       log: (line) => (String(line).startsWith('task=') ? log(oneLine(line, 400)) : journal(id, line)),
     });
@@ -1027,7 +1033,8 @@ export function createApp(deps = {}) {
       sendJson(c.res, 200, {
         publicSampleRuns: cfg.publicSampleRuns === true, publicGithubRuns: cfg.publicGithubRuns === true,
         provider: PROVIDER, fixModel: cfg.fixModel, visionModel: cfg.visionModel,
-        samples: Object.entries(SAMPLES).map(([id, s]) => ({ id, label: s.label, etaText })),
+        // The samples a public run may use: an admin-only one (Atlas) is never listed.
+        samples: Object.entries(SAMPLES).filter(([id]) => isPublicSample(id)).map(([id, s]) => ({ id, label: s.label, etaText })),
         githubWallClockSec: githubWallClockSec(cfg.caps),   // the longest a GitHub run may take once it starts
         latest: readLatest(),   // null until a run is published
       });

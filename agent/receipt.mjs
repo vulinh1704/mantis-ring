@@ -4,6 +4,7 @@
 // published as the "Latest verified run". Pure functions: the loop gathers the facts, this file
 // only shapes and checks them, so tests and the publisher can use it without a sandbox.
 import { createHash } from 'node:crypto';
+import { SEEDED_LABEL } from './seeded.mjs';
 import { diffLines } from './workspace.mjs';
 
 export const MANTIS_VERSION = '0.7.1';
@@ -78,7 +79,7 @@ export function verdictOf(receipt) {
  * The publish bar (§3.3): a pass (recomputed from the counts, so a stored verdict cannot vouch for
  * itself), with no lost control and every screen compared, on a sample project, in a sandbox
  * confirmed destroyed, labelled REAL RUN (gVisor on the VM and the real Vultr endpoint). A TEST RUN
- * is never publishable.
+ * is never publishable, and neither is a SEEDED run, where a script played the model.
  * @param {object} receipt
  * @returns {boolean}
  */
@@ -87,6 +88,7 @@ export function isPublishable(receipt) {
   return verdictOf(receipt) === 'pass' && (stored === null || stored === 'pass')
     && receipt?.source?.kind === 'sample'
     && receipt?.containment?.destroyed === true
+    && !receipt?.seeded
     && typeof receipt?.label === 'string' && receipt.label.startsWith('REAL RUN');
 }
 
@@ -96,8 +98,12 @@ export const TRUST_NOTES = {
   'repo-sandbox': "Measured inside the repo's own sandbox: the repo's code ran next to the checker, so this result is not independently verified.",
 };
 
-/** "REAL RUN · Vultr VX1 sea · <UTC>" only for runsc + the real endpoint; otherwise a TEST RUN label. */
-function runLabel(inferenceUrl, runtime, startedAt) {
+/**
+ * "REAL RUN · Vultr VX1 sea · <UTC>" only for runsc + the real endpoint; otherwise a TEST RUN label.
+ * A seeded run (a script played the model) always carries SEEDED_LABEL, wherever it ran.
+ */
+function runLabel(inferenceUrl, runtime, startedAt, seeded) {
+  if (seeded) return SEEDED_LABEL;
   let host = 'unknown inference host';
   try { host = new URL(inferenceUrl).host || host; } catch { /* keep the placeholder */ }
   if (host === REAL_INFERENCE_HOST && runtime === 'runsc') return `REAL RUN · Vultr VX1 sea · ${startedAt.slice(0, 16).replace('T', ' ')} UTC`;
@@ -120,8 +126,11 @@ function runLabel(inferenceUrl, runtime, startedAt) {
  *   phasesMs: Record<string, number>, patch: string, patchApplies: boolean|null, patchTruncated?: boolean,
  *   proof: string|null, vision: object|null, summary: string,
  *   containment: {runtime: string, sandbox: string, limits: object, network: string, destroyed: boolean, goneCheck: string, goneAt: string|null},
- *   inferenceUrl: string, promptVersion: string, promptVariant?: 'neutral'|'pressure' }} input
- *   promptVariant: the task message the model got (default neutral; pressure is the bench's admin-only arm)
+ *   inferenceUrl: string, promptVersion: string, promptVariant?: 'neutral'|'pressure',
+ *   seeded?: {script: string, model: string, note: string}|null }} input
+ *   promptVariant: the task message the model got (default neutral; pressure is the bench's admin-only arm).
+ *   seeded: set when a script played the model (agent/seeded.mjs): the receipt then carries SEEDED_LABEL
+ *   and a `seeded` block, and is never publishable
  * @returns {object}
  */
 export function buildReceipt(input) {
@@ -139,11 +148,16 @@ export function buildReceipt(input) {
   const phases = Object.fromEntries(PHASES.map((p) => [p, secs(input.phasesMs?.[p])]));
   const vision = input.vision ?? { model: null, verdict: 'skipped', agree: null, pairs: [] };
   const trust = input.source?.kind === 'sample' ? 'sample' : 'repo-sandbox';
+  const s = input.seeded;
+  const seeded = s && typeof s === 'object'
+    ? { script: String(s.script ?? ''), model: String(s.model ?? ''), note: String(s.note ?? '') }
+    : null;
 
   const receipt = {
     schema: RECEIPT_SCHEMA,
     taskId: input.taskId,
-    label: runLabel(input.inferenceUrl, containment.runtime, startedAt),
+    label: runLabel(input.inferenceUrl, containment.runtime, startedAt, seeded),
+    ...(seeded ? { seeded } : {}),
     startedAt,
     finishedAt,
     source: { ...input.source, commit: input.source?.commit ?? null },
@@ -229,6 +243,7 @@ export function receiptMarkdown(receipt) {
   const out = [];
   out.push(`# Mantis Ring receipt · ${r.taskId ?? 'unknown task'}`, '');
   out.push(`${r.label ?? ''}`, '');
+  if (r.seeded) out.push(`SEEDED (script ${code(r.seeded.script)}): ${r.seeded.note}`, '');
   out.push(`**${r.line ?? receiptLine(null)}**`, '');
   out.push('Final run re-measured by Mantis (no LLM) and compared with the baseline run R0.', '');
   if (r.trust === 'repo-sandbox') out.push(`Note: ${TRUST_NOTES['repo-sandbox']}`, '');

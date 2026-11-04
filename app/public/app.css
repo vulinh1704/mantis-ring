@@ -160,6 +160,17 @@ p { margin: 0 0 12px; }
 .task-head .badge { flex: none; margin-top: 6px; }
 .task-head h1 { font-size: clamp(1.5rem, 4vw, 1.9rem); letter-spacing: -0.01em; }
 .task-head p { margin: 6px 0 0; }
+.run-chips { margin-top: 10px; }
+/* A seeded run's label: top right, and it stays in view while the page scrolls (the whole scene). */
+.seeded-tag {
+  position: sticky; top: 10px; z-index: 5;
+  width: fit-content; max-width: min(100%, 440px); margin: 0 0 12px auto; padding: 8px 12px;
+  border: 1px solid var(--warn); border-radius: 9px; background: var(--warn-soft); color: var(--warn);
+  font: 650 0.88rem/1.4 var(--sans); box-shadow: var(--shadow);
+}
+@media (max-width: 720px) {
+  .seeded-tag { position: static; max-width: 100%; }
+}
 
 .stepbar {
   list-style: none; margin: 0 0 16px; padding: 0;

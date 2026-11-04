@@ -13,6 +13,8 @@
 // - every cap (checks, turns, tool calls, tokens, money, wall clock) is enforced here;
 // - edits that were never measured never reach the patch.
 // The sandbox is destroyed on every exit path, and a hard timer destroys it at the deadline.
+// A seeded task (task.seeded, admin only) takes its turns from a script instead of a model
+// (agent/seeded.mjs): everything else above is the same and real, and no model is ever called.
 // Spec: BUILD-SPEC.md §1.7 and §2.
 import { BudgetError, INFERENCE_URL, PROVIDER, priceOf } from './inference.mjs';
 import { PINNED_AT } from './prices.mjs';
@@ -21,6 +23,7 @@ import {
   noChangeMessage, nudgeMessage, systemPrompt, taskMessage,
 } from './prompt.mjs';
 import { buildReceipt, diffStats, receiptLine, receiptMarkdown } from './receipt.mjs';
+import { seededChat, seededInfo } from './seeded.mjs';
 import { FILE_TOOL_NAMES, TOOL_SCHEMAS, ToolError, WRITE_TOOL_NAMES, fileTools, parseToolCall } from './tools.mjs';
 import { changedSince, initWorkspace, isClean, patchApplies, patchSince, revertTo, snapshot, stageAll, tamperHits } from './workspace.mjs';
 import { LIMITS, Sandbox, networkText } from '../runner/sandbox.mjs';
@@ -344,6 +347,13 @@ function checkTask(task, deps) {
   if (task.promptVariant !== undefined && task.promptVariant !== null && !PROMPT_VARIANTS.includes(task.promptVariant)) {
     throw new Error(`task.promptVariant must be one of ${PROMPT_VARIANTS.join(', ')}`);
   }
+  if (task.seeded !== undefined && task.seeded !== null) {
+    // The script's edits are exact strings of one sample, and the scene is the gate rolling a cover-up back.
+    const info = seededInfo(task.seeded);
+    if (s.kind !== 'sample' || s.name !== info.sample) throw new Error(`a seeded run plays its script on the ${info.sample} sample only`);
+    if (task.gate !== true) throw new Error('a seeded run needs the gate on');
+    if ((task.promptVariant ?? 'neutral') !== 'neutral') throw new Error('a seeded run gets the neutral task message');
+  }
   if (typeof deps?.chat !== 'function' || typeof deps.createSandbox !== 'function' || typeof deps.store?.put !== 'function') {
     throw new Error('runFix needs deps.chat, deps.createSandbox and deps.store.put');
   }
@@ -356,6 +366,10 @@ class FixRun {
     this.deps = deps ?? {};
     this.caps = null;
     this.variant = 'neutral'; // the task message's variant, set from task.promptVariant once the task is checked
+    // A seeded task: seededInfo() of its script, and the stand-in that answers in place of the model.
+    // Otherwise null and deps.chat. Set once the task is checked.
+    this.seeded = null;
+    this.chat = null;
     // Set by run(): start, hard deadline, soft stop, the time a final check needs, the time kept for
     // wrap-up, and the least time before the soft stop that a model call may start with.
     this.t0 = 0; this.deadline = 0; this.soft = 0; this.finalCheckMargin = 0; this.reserveMs = 0; this.minCallMs = 0;
@@ -487,6 +501,9 @@ class FixRun {
       this.caps = resolveCaps(this.task?.caps, { github: this.task?.source?.kind === 'github' });
       checkTask(this.task, this.deps);
       this.variant = this.task.promptVariant ?? 'neutral';
+      // A seeded task never reaches deps.chat: its turns come from the script, with no key, tally or guard.
+      this.seeded = this.task.seeded ? seededInfo(this.task.seeded) : null;
+      this.chat = this.seeded ? seededChat(this.task.seeded) : this.deps.chat;
     } catch (err) {
       error = `The task settings are invalid: ${firstLine(err.message)}`;
       this.journal(error);
@@ -700,6 +717,7 @@ class FixRun {
 
     // The same system prompt and tools in every arm; the pressure arm changes only the task message.
     if (this.variant !== 'neutral') this.journal(`task message: the ${this.variant} variant (an admin bench arm)`);
+    if (this.seeded) this.say(`SEEDED: a scripted stand-in plays the model (script ${this.seeded.script}, no LLM, no inference call); the loop, Mantis, the rollback and the sandbox are real`);
     this.push({ role: 'system', content: systemPrompt({ maxChecks: caps.maxChecks }) });
     this.push({
       role: 'user',
@@ -767,10 +785,11 @@ class FixRun {
     let res;
     for (;;) {
       try {
-        res = await abortable(deps.chat({
+        // this.chat is deps.chat, or the seeded stand-in, which gets neither the tally nor the guard.
+        res = await abortable(this.chat({
           model: task.model, messages: this.messages, tools: TOOL_SCHEMAS, toolChoice,
           maxTokens: caps.maxCompletionTokens, reasoning: caps.reasoning, ...sampling,
-          signal, timeoutMs: Math.min(300_000, left), tally: deps.tally, guard: deps.guard,
+          signal, timeoutMs: Math.min(300_000, left), tally: this.seeded ? null : deps.tally, guard: this.seeded ? null : deps.guard,
         }), this.ac.signal);
         break;
       } catch (err) {
@@ -820,7 +839,8 @@ class FixRun {
     const usage = res?.usage ?? {};
     const after = tallyNumbers(deps.tally);
     this.emit('model', {
-      turn: this.turns, check: this.checks, model: res?.model ?? task.model, provider: PROVIDER, ms: num(res?.ms) || ms,
+      turn: this.turns, check: this.checks, model: res?.model ?? task.model, provider: this.seeded ? this.seeded.provider : PROVIDER,
+      ...(this.seeded ? { scripted: true } : {}), ms: num(res?.ms) || ms,
       promptTokens: num(usage.prompt_tokens), completionTokens: num(usage.completion_tokens),
       reasoningTokens: num(usage.completion_tokens_details?.reasoning_tokens),
       usd: before.usd === null || after.usd === null ? null : round6(after.usd - before.usd),
@@ -1281,7 +1301,7 @@ class FixRun {
    * to the PNG bytes. vision.mjs is loaded only here, so a problem in it can only skip the vision check.
    */
   async prepareVision() {
-    if (!this.RF || !this.task.visionModel || typeof this.deps.vision !== 'function') return null;
+    if (!this.RF || !this.task.visionModel || this.seeded || typeof this.deps.vision !== 'function') return null;
     const t = Date.now();
     try {
       const { pickPairs } = await import('./vision.mjs');
@@ -1400,6 +1420,8 @@ class FixRun {
     const delta = deltaOf(this.tally0, end); // everything this task used: the totals
     const date = new Date(this.t0).toISOString().slice(0, 10);
     const models = [modelRow('fix', task.model, deltaOf(this.tally0, mid), date)];
+    // The stand-in made no call: no provider, no price (its row reads 0 calls, $0).
+    if (this.seeded) Object.assign(models[0], { id: this.seeded.model, provider: this.seeded.provider, price: null });
     if (task.visionModel && vision.verdict !== 'skipped') models.push(modelRow('vision', task.visionModel, deltaOf(mid, end), date));
     const s = task.source;
     const receipt = buildReceipt({
@@ -1413,12 +1435,14 @@ class FixRun {
       phasesMs: this.phases, patch: this.patch, patchApplies: this.patchOk, patchTruncated: this.patchTruncated,
       proof: this.proof, vision, summary: this.summary, containment: this.containment,
       inferenceUrl: INFERENCE_URL, promptVersion: PROMPT_VERSION, promptVariant: this.variant,
+      seeded: this.seeded ? { script: this.seeded.script, model: this.seeded.model, note: this.seeded.note } : null,
     });
     this.receipt = receipt;
     await this.save('receipt.json', `${JSON.stringify(receipt, null, 2)}\n`);
     await this.save('receipt.md', receiptMarkdown(receipt));
     await this.save('patch.diff', this.storedPatch);
-    this.say(`receipt: ${receipt.line} · verdict ${receipt.verdict} · ${receipt.usd === null ? 'cost n/a' : `$${receipt.usd.toFixed(4)} (list price)`}`);
+    const cost = this.seeded ? 'no model call (scripted stand-in)' : receipt.usd === null ? 'cost n/a' : `$${receipt.usd.toFixed(4)} (list price)`;
+    this.say(`receipt: ${receipt.line} · verdict ${receipt.verdict} · ${cost}${this.seeded ? ` · ${receipt.label}` : ''}`);
     // §2.7.5: `receipt`, then `done` (emitted by run() once the transcript is stored).
     this.emit('receipt', {
       line: receipt.line, verdict: receipt.verdict, fixed: receipt.counts.fixed, new: receipt.counts.new, coverUps: receipt.counts.coverUps,
@@ -1437,7 +1461,10 @@ class FixRun {
  *   source: {kind:'sample', name:string, dir:string, label:string} | {kind:'github', owner:string, name:string, label:string},
  *   matrix: Matrix, model:string, sampling:{temperature?:number, topP?:number, seed?:number},
  *   visionModel: string|null, gate: boolean, caps: Partial<Caps>,
- *   promptVariant?: 'neutral'|'pressure' }} FixTask  promptVariant: the task message (default neutral; pressure is admin only)
+ *   promptVariant?: 'neutral'|'pressure', seeded?: string|null }} FixTask
+ *   promptVariant: the task message (default neutral; pressure is admin only). seeded: a script of
+ *   agent/seeded.mjs (admin only) whose stand-in answers instead of the model; it needs its sample, the
+ *   gate on and the neutral message, and deps.chat is never called
  * @typedef {{ status:'done'|'failed'|'timeout'|'cancelled', receipt: object|null, error?: string }} FixResult
  */
 

@@ -16,7 +16,12 @@ export const RUNTIME = process.env.RING_RUNTIME || undefined;
 export const PUBLIC_URL = (process.env.RING_PUBLIC_URL || 'https://104-156-252-200.sslip.io').replace(/\/+$/, '');
 export const PROVIDER = 'Vultr Serverless Inference';
 
-/** Sample projects anyone may run (§4.6). 16 cells; the model is never told their bugs were planted. */
+/**
+ * Sample projects (§4.6). The model is never told their bugs were planted. Lumen (16 cells) is the
+ * one anyone may run. Atlas (24 cells, demo/atlas) is the bench's harder sample, `adminOnly`: a
+ * public request for it is refused as an unknown sample, /api/config never lists it, and its runs
+ * never set the public ETA or reach /latest/. bench/grade-atlas.mjs grades its runs on the host.
+ */
 export const SAMPLES = {
   lumen: {
     label: 'Lumen (sample site)',
@@ -24,7 +29,19 @@ export const SAMPLES = {
     routes: ['/', '/settings.html'],
     viewports: ['mobile', 'desktop'], schemes: ['light', 'dark'], locales: ['en', 'vi'],
   },
+  atlas: {
+    label: 'Atlas (invoicing app)',
+    dir: fileURLToPath(new URL('../demo/atlas/', import.meta.url)),
+    routes: ['/', '/pricing.html', '/account.html'],
+    viewports: ['mobile', 'desktop'], schemes: ['light', 'dark'], locales: ['en', 'vi'],
+    adminOnly: true,
+  },
 };
+
+/** Whether a public run may use this sample: it exists and is not admin-only. */
+export function isPublicSample(name) {
+  return typeof name === 'string' && Object.hasOwn(SAMPLES, name) && SAMPLES[name].adminOnly !== true;
+}
 
 /** What a task may ask Mantis to measure. Public tasks always get mobile + desktop and both schemes. */
 export const LOCALES = ['en', 'vi', 'de', 'fr', 'es', 'ja', 'ko', 'zh', 'pt', 'pseudo'];
