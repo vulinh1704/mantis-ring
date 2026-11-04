@@ -29,7 +29,7 @@ import { changedSince, initWorkspace, isClean, patchApplies, patchSince, revertT
 import { usageText } from '../runner/cgroup.mjs';
 import { LIMITS, Sandbox, networkText } from '../runner/sandbox.mjs';
 import {
-  baseUrl, bringIn, describePlan, devServerUp, inspectProject, installDeps, look, lookFailureLines, sandboxSnapshot, startCommand, startDevServer,
+  baseUrl, bringIn, describePlan, devServerUp, inspectProject, installDeps, look, lookFailureLines, memoryWarning, sandboxSnapshot, startCommand, startDevServer,
 } from '../runner/run-task.mjs';
 
 /** Caps of a public task (§2.4). Admin tasks may raise them up to ADMIN_MAX. */
@@ -669,9 +669,13 @@ class FixRun {
     this.phase = 'baseline';
     // A GitHub project shares the sandbox's memory with the browser: the journal keeps what is in use
     // before the first look (the host cgroup, the processes, the tmpfs folders and the largest ones).
+    // When little is left, the live log says so before the look (memoryWarning()).
     if (s.kind === 'github') {
       try {
-        for (const line of await sandboxSnapshot(this.box)) this.journal(`before the baseline look: ${line}`);
+        const snap = await sandboxSnapshot(this.box);
+        for (const line of snap.lines) this.journal(`before the baseline look: ${line}`);
+        const warning = memoryWarning(snap.usage);
+        if (warning) this.say(warning);
       } catch (err) {
         if (this.ac.signal.aborted) throw new Stopped();
         this.journal(`before the baseline look: not read (${firstLine(err?.message)})`);
@@ -1045,6 +1049,21 @@ class FixRun {
     this.say(`dev server up again at ${baseUrl(this.matrixArgs)}`);
   }
 
+  /**
+   * After a look that was stopped (the sandbox's memory or process limit, a sandbox that stopped, a
+   * signal): true when the sandbox no longer runs a command. Under gVisor the host's OOM killer takes
+   * the whole sandbox kernel, and `docker exec` then fails at once (exit 128 on 4 Nov).
+   */
+  async sandboxLost(err) {
+    if (!['memory', 'pids', 'sandbox', 'killed'].includes(err?.reason)) return false;
+    try {
+      const r = await this.box.exec('true', { timeoutMs: 15_000 });
+      return r.code !== 0;
+    } catch {
+      return true;
+    }
+  }
+
   /** Cover-up issues of a check that were not already there in the accepted state (gate OFF keeps old ones). */
   coverUpsAdded(L) {
     const now = (L.report.issues ?? []).filter((i) => i.type === 'cover-up');
@@ -1097,6 +1116,9 @@ class FixRun {
         } else {
           failReason = lookReason(err);
           for (const line of lookFailureLines(err)) this.journal(`check ${k}: look failed: ${line}`);
+          // The sandbox's memory or process limit can take the whole sandbox down; then nothing can be
+          // rolled back or measured, and the run ends with that reason rather than as an internal error.
+          if (await this.sandboxLost(err)) throw failure(`The run stopped at check ${k}: ${failReason}.`, err);
         }
       }
     }
@@ -1263,6 +1285,7 @@ class FixRun {
       if (err instanceof Stopped || this.ac.signal.aborted) throw new Stopped();
       if (err instanceof NoTime) return tooLate();
       for (const line of lookFailureLines(err)) this.journal(`verify look failed: ${line}`);
+      if (await this.sandboxLost(err)) throw failure(`The run stopped while the final files were measured: ${lookReason(err)}.`, err);
       this.say(`verify look failed (${lookReason(err)}): the final files are what check ${k} measured`);
       return prev;
     } finally {

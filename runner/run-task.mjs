@@ -1012,16 +1012,32 @@ export async function postmortem(box) {
 }
 
 /**
- * The sandbox right before a look, as journal lines: the host cgroup now (memory and processes, of
- * their limits), then the inside view with the size of node_modules, .next and the npm cache.
+ * The sandbox right before a look: journal lines (the host cgroup now, with memory and processes of
+ * their limits, then the inside view with the size of node_modules, .next and the npm cache), and
+ * the host cgroup's reading itself (null where it cannot be read).
  * @param {Sandbox} box
- * @returns {Promise<string[]>}
+ * @returns {Promise<{lines: string[], usage: import('./cgroup.mjs').Usage|null}>}
  */
 export async function sandboxSnapshot(box) {
   const w = typeof box.watchUsage === 'function' ? await box.watchUsage().catch(() => null) : null;
   const u = w ? w.stop() : null;
   const host = u && u.reads > 0 ? `host cgroup now: ${usageNow(u)}` : 'host cgroup: not read';
-  return [host, ...(await insideLines(box, { sizes: true }))];
+  return { lines: [host, ...(await insideLines(box, { sizes: true }))], usage: u && u.reads > 0 ? u : null };
+}
+
+/**
+ * Below this much free memory before the first look, the live log says that measuring may run out
+ * of memory. On 4 Nov a look of a Next.js 16 app, one group at a time, took 0.57 GB and 0.61 GB more
+ * than the sandbox held before it.
+ */
+export const LOW_MEMORY_BYTES = 2 ** 30;
+
+/** The live log's sentence when the sandbox has less than LOW_MEMORY_BYTES free before the first look, else null. */
+export function memoryWarning(u) {
+  if (!u || !(u.reads > 0) || !Number.isFinite(u.memMax) || !(u.memMax > 0) || !Number.isFinite(u.memPeak)) return null;
+  if (u.memMax - u.memPeak >= LOW_MEMORY_BYTES) return null;
+  return `memory is short: before the first look the sandbox already uses ${gbText(u.memPeak)} of its ${gbText(u.memMax)} `
+    + "(the project's files and dependencies count too), so measuring may run out of memory";
 }
 
 /** One reading of the host cgroup: "memory 2.10 GB of 3.00 GB, 85 processes of 512". */

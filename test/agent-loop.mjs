@@ -9,7 +9,10 @@
 // suites judge what they measure (test/measure.mjs). U15 checks the seeded gate scene (the stand-in's
 // turns, the SEEDED label, no publish, no place in the bench's tables, the stop when the scene does not
 // play). U16 checks the admin-only Atlas sample and what its host-side grader refuses. U17 checks an
-// Atlas run's receipt (never publishable) and how bench/table.mjs grades it. Without flags it also runs the
+// Atlas run's receipt (never publishable) and how bench/table.mjs grades it. U18 checks how a failed look
+// says why (only the time limit is a timeout; the signal, the host cgroup, the post-mortem), the
+// memory the GitHub path saves (the warm-up, one group at a time, no install caches) and the
+// live log's memory warning. Without flags it also runs the
 // sandbox scenarios (§6.2, S1-S12) on the Lumen sample with a one-cell matrix: an honest fix, a
 // cover-up with the gate on and off, a measurement tamper, paths out of the project, every cap (the
 // soft stop of a model call included), malformed tool-call arguments, an inference error, a dev server
@@ -1493,9 +1496,11 @@ async function u17() {
  * U18: a look that fails says why, with no Docker. Only the time limit is a timeout (124, the host's
  * own timer, or 137 once the limit has passed); any other exit code of 128 or more names its signal,
  * and the host cgroup or Docker names the cause where they show one (the memory limit, the process
- * limit, a sandbox that stopped). The journal line keeps the exit code, the signal, the end of stderr
+ * limit, a sandbox that stopped). The journal lines keep the exit code, the signal, the end of stderr
  * and the post-mortem, with credentials redacted; the public sentence stays one plain sentence. The
- * host cgroup reader keeps what it saw before the cgroup went away.
+ * host cgroup reader keeps what it saw before the cgroup went away. On the GitHub path a look opens
+ * one group at a time, the warm-up asks for the page's own scripts and stylesheets, an install's
+ * download caches go, and the live log warns when less than 1 GiB is free before the first look.
  */
 async function u18() {
   const rt = await load('../runner/run-task.mjs');
@@ -1577,11 +1582,24 @@ async function u18() {
   // Right before the baseline look of a GitHub task: the host cgroup now, then the inside view with the folder sizes.
   const snapBox = lookBox({ code: 0, post: { ...facts, sizes: { '/work/app/node_modules': 0.75 * 2 ** 30, '/home/ring/.npm': 0.25 * 2 ** 30 } }, usage: usageOf({ memStart: 2 * 2 ** 30, pidsStart: 60, pidsPeak: 60 }) });
   const snap = await snapshot(snapBox);
-  check('U18 snapshot: the host cgroup now (memory and processes of their limits), then the processes, the tmpfs folders with the sizes of node_modules and the npm cache, and the dev server',
-    snap[0] === 'host cgroup now: memory 2.00 GB of 3.00 GB, 60 processes of 512' && /^2 processes, 70 threads/.test(snap[1] ?? '')
-      && /tmpfs: \/work 1\.50 GB of 2\.00 GB · sizes: \/work\/app\/node_modules 0\.75 GB, \/home\/ring\/\.npm 0\.25 GB · sandbox kernel: 0\.10 GB available of 3\.00 GB/.test(snap[2] ?? '')
-      && /^dev server running/.test(snap[3] ?? '') && snapBox.posts === 1 && JSON.stringify(await snapshot({})) === '["host cgroup: not read"]',
-    snap.join(' | '));
+  const s = snap.lines;
+  check('U18 snapshot: the host cgroup now (memory and processes of their limits), then the processes, the tmpfs folders with the sizes of node_modules and the npm cache, and the dev server; the reading itself comes back too',
+    s[0] === 'host cgroup now: memory 2.00 GB of 3.00 GB, 60 processes of 512' && /^2 processes, 70 threads/.test(s[1] ?? '')
+      && /tmpfs: \/work 1\.50 GB of 2\.00 GB · sizes: \/work\/app\/node_modules 0\.75 GB, \/home\/ring\/\.npm 0\.25 GB · sandbox kernel: 0\.10 GB available of 3\.00 GB/.test(s[2] ?? '')
+      && /^dev server running/.test(s[3] ?? '') && snapBox.posts === 1 && snap.usage?.memPeak === 2 * 2 ** 30
+      && JSON.stringify(await snapshot({})) === '{"lines":["host cgroup: not read"],"usage":null}',
+    s.join(' | '));
+
+  // The live log warns before the first look when less than 1 GiB is free (ray-so on 4 Nov: 2.28 GB of 3 GB before, 2.89 GB at most during it).
+  const warnings = {
+    raySo: rt.memoryWarning(usageOf({ memPeak: 2.28 * 2 ** 30 })),
+    shadcn: rt.memoryWarning(usageOf({ memPeak: 1.78 * 2 ** 30 })),
+    unread: rt.memoryWarning({ reads: 0 }), none: rt.memoryWarning(null), noLimit: rt.memoryWarning(usageOf({ memMax: Infinity, memPeak: 2.9 * 2 ** 30 })),
+  };
+  check('U18 memoryWarning: with less than 1 GiB free before the first look the live log says that measuring may run out of memory, naming what is used of what; not otherwise, nor without a reading or a limit',
+    warnings.raySo === "memory is short: before the first look the sandbox already uses 2.28 GB of its 3.00 GB (the project's files and dependencies count too), so measuring may run out of memory"
+      && warnings.shadcn === null && warnings.unread === null && warnings.none === null && warnings.noLimit === null && rt.LOW_MEMORY_BYTES === 2 ** 30,
+    JSON.stringify(warnings));
 
   const plain = (s) => /^[A-Z][^\n]{10,250}\.$/.test(s) && !/\.\s+[A-Z]/.test(s);
   const sentences = Object.fromEntries(['timeout', 'memory', 'pids', 'sandbox', 'killed', 'unreachable', 'nope'].map((r) => [r, loop.baselineFailure({ reason: r })]));
