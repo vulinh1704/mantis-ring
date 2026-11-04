@@ -17,7 +17,7 @@ Visitor ──HTTPS──► Vultr VM (VX1, Seattle)
                    ├─ Docker + gVisor (runsc): one sandbox per task, destroyed when the task ends
                    │    Node 22, git, Chromium headless shell, Mantis CLI 0.7.1
                    │    no host environment · read-only root · 3 GB RAM, 2 CPUs, 512 processes · uid 10001
-                   │    its own network ring-task-<id> (no route out) ─► ring-proxy (allowlist) ─► npm, GitHub
+                   │    its own network ring-task-<id> (no route out, no VM address) ─► ring-proxy (allowlist) ─► npm, GitHub
                    └─ files: task records, receipts, spend ledger (private) · published runs (/latest/)
 Operator (WSL) ──SSH as deploy──► curl http://127.0.0.1:8080/admin/…   (scripts/ring.sh)
 ```
@@ -29,7 +29,7 @@ Operator (WSL) ──SSH as deploy──► curl http://127.0.0.1:8080/admin/…
    - `--read-only`, with tmpfs for `/work` (2 GB), `/tmp` (512 MB) and the home directory (1 GB);
    - `--memory 3g` with no swap, `--cpus 2`, `--pids-limit 512`, `--cap-drop ALL`, `no-new-privileges`;
    - an unprivileged user (uid 10001);
-   - on an internal network of its own, `ring-task-<id>`, made for it and removed with it (see [The sandbox's network](#the-sandboxs-network)). No other sandbox is on it, so two tasks that run at once cannot reach each other. Its single exit is `ring-proxy`, which lets through `registry.npmjs.org`, `github.com`, `codeload.github.com` and `objects.githubusercontent.com` and refuses every other host. HTTPS (`CONNECT`) goes only to port 443 of those four hosts; tinyproxy's `ConnectPort` limits `CONNECT` alone, so a plain HTTP request may name any port of them. The proxy's address on that network is written into the sandbox's `/etc/hosts` (`--add-host`), because under gVisor Docker's embedded DNS cannot be reached and the name would not resolve;
+   - on an internal network of its own, `ring-task-<id>`, made for it and removed with it (see [The sandbox's network](#the-sandboxs-network)). No other sandbox is on it, so two tasks that run at once cannot reach each other, and the VM has no address on it, so the sandbox cannot reach the VM's own services either. Its single exit is `ring-proxy`, which lets through `registry.npmjs.org`, `github.com`, `codeload.github.com` and `objects.githubusercontent.com` and refuses every other host. HTTPS (`CONNECT`) goes only to port 443 of those four hosts; tinyproxy's `ConnectPort` limits `CONNECT` alone, so a plain HTTP request may name any port of them. The proxy's address on that network is written into the sandbox's `/etc/hosts` (`--add-host`), because under gVisor Docker's embedded DNS cannot be reached and the name would not resolve;
    - no environment from the host. The inference key stays in the app's process;
    - `--runtime runsc` on the VM. The loop reads the runtime back from Docker, logs it and puts it on the receipt.
 3. **Bring in, install, serve** (`runner/run-task.mjs`). The sample is copied in as a tar stream of our own files. A GitHub repository is cloned inside the sandbox through the proxy (`git clone --depth 1`), from a URL rebuilt out of the checked owner and name, so the host never fetches a URL a user typed. It is then inspected, installed (at most 5 minutes) and started inside the sandbox, as described in [A GitHub repository](#a-github-repository). Lumen is static, so it gets a small static server.
@@ -48,13 +48,19 @@ Every task has a wall clock: 15 minutes for the sample, 20 for a GitHub reposito
 
 Before commit `08030d6`, every sandbox joined one shared network, `ring-internal`, so two tasks running at once could reach each other's dev servers. Now each sandbox has a network of its own (`runner/sandbox.mjs`):
 
-1. `Sandbox.create()` makes `ring-task-<id>` with `--internal` (no route out), labelled `mantis-ring=task`, with the container's own labels and `mantis-ring.sandbox=<name>`.
+1. `Sandbox.create()` makes `ring-task-<id>` with `--internal` (no route out), `-o com.docker.network.bridge.inhibit_ipv4=true` (the bridge gets no IPv4 address, so the VM has none on the network) and `--ipv6=false`, labelled `mantis-ring=task`, with the container's own labels and `mantis-ring.sandbox=<name>`.
 2. The running `ring-proxy` joins it (`docker network connect`). The proxy's address on that network goes into the sandbox's `/etc/hosts`.
 3. The container starts on that network only. A failure at any step removes whatever was made before the error is raised.
 4. `destroy()` removes the container, then takes the proxy off the network, then removes the network, and resolves only when `docker network ls` no longer lists it. If the container will not go, the proxy still leaves, which cuts the container's only way out. The agent loop tries the clean-up once more, by name and by the task's label, whenever `destroy()` failed.
 5. When `create()` itself fails, the loop removes whatever carries the task's label before the task fails. A `docker run` that passes its 120 s limit is cut off on the host only: the daemon can still finish the container after `destroy()` found it gone, and then its network cannot go either. The task never got that box, so nothing else would remove it before the app restarts. The app's `createSandbox` (`sandboxStarter()`) also destroys the box when a step after `create()` fails, such as writing the task record.
 
 On the VM the proxy has an address on `ring-egress` (its way out) and one on each running task's network. It relays only to the four allowlisted hosts (`CONNECT` only to their port 443), so a request through it to another sandbox, by address or by name, gets 403.
+
+**What a sandbox can reach: only the proxy.** With `inhibit_ipv4`, Docker lists no gateway for the network and hands out its first address like any other, so the proxy, which joins first, gets `.1` and the sandbox `.2`. On its network the sandbox finds the proxy: port 8888 answers, and so does its ICMP echo, while 22, 80, 443, 8080 and 9000 there were refused when tried on 4 Nov. The VM has no IPv4 address on the network, and the sandbox has no default route, so every other address of the VM fails at once with ENETUNREACH: the public one, those of Docker's other bridges (`ring-egress` among them), and the IPv6 ones. The bridge still gets an IPv6 link-local address (`--ipv6=false` does not stop that), but under gVisor the sandbox has no IPv6 address, so that fails too. `containment.mjs` measures all of this on every run (see [Containment, measured](#containment-measured)). Through the proxy, the sandbox reaches only the four allowlisted hosts.
+
+Before `f493868`, the networks were made with `--internal` alone and the bridge held the gateway address `.1`. On the VM, a sandbox connected to sshd (22) and Caddy (80, 443) there and got its ping answered; 8080 and 9000 timed out, because the app listens on loopback only and ufw drops the rest. On Docker 29.9.2, `-o com.docker.network.bridge.gateway_mode_ipv4=isolated` left the bridge without an address just as `inhibit_ipv4` does; Ring uses `inhibit_ipv4`.
+
+**What the proxy can reach.** `ring-proxy` runs under runc on `ring-egress`, an ordinary Docker network with a route out, where the VM holds the gateway address. From inside the proxy on 4 Nov, ports 22, 80 and 443 answered at that address and at the VM's public address, and 8080 and 9000 timed out. The proxy relays only to the four allowlisted hosts, but code that took over tinyproxy could reach the VM's sshd (keys only) and Caddy. Only a host firewall rule for the `ring-egress` bridge (root) would close that, and none is in place.
 
 **Nothing piles up.** Each network takes one of Docker's address pools (about 30 on a stock daemon), so none may leak. The app removes its own containers and networks at startup and shutdown. At startup and every hour it also removes every sandbox container that Docker created more than 80 minutes ago, the app's or a self-test's alike. That is twice the longest wall clock a task may have and four times the self-test limit, so such a container is an orphan: from a `docker run` that gave up while the daemon still made it, or from a self-test killed with SIGKILL. Then it removes any sandbox network, by label and name, that no sandbox runs on and that is older than 10 minutes; younger ones are left alone, because a sandbox may be starting on one. `containment.mjs` and the agent-loop scenarios sweep the networks the same way before they start. A self-test stopped by a signal destroys its sandboxes and their networks before it exits; it first waits for a sandbox that is still starting, which then removes itself, and starts no new one. `/admin/health` counts the app's networks. `scripts/setup.sh` no longer creates `ring-internal`; when it restarts the proxy, it removes `ring-internal` and every unused sandbox network. On the VM, `ring-internal` stays, with only the proxy on it, until `ring-setup` runs again.
 
@@ -220,7 +226,7 @@ Each finished task gets `receipt.json` (schema `mantis-ring/receipt@1`, built by
 
 ## Containment, measured
 
-`node test/containment.mjs` checks each claim against a fresh sandbox (16 checks):
+`node test/containment.mjs` checks each claim against a fresh sandbox (18 checks):
 
 | Claim | How it is checked |
 |---|---|
@@ -228,6 +234,8 @@ Each finished task gets `receipt.json` (schema `mantis-ring/receipt@1`, built by
 | Unprivileged | `id -u` is not 0 |
 | Read-only root | `touch /usr/local/bin/x` fails |
 | No direct internet | A TCP connect to 1.1.1.1:443 fails |
+| The VM has no address on the network | On the host, the bridge of the sandbox's network has no IPv4 address. The detail names who holds which address on the network (the proxy holds `.1`) and the bridge's IPv6 state |
+| Cannot reach the VM | From the sandbox, all at once, a TCP connect to ports 22, 80, 443, 8080 and 9000 on every address the VM has (Node's list on the host: the public one, Docker's other bridges, the IPv6 ones, link-local ones through the sandbox's own interface), and an ICMP echo to each IPv4 one. None may answer. The network's gateway address is tried too, unless a container holds it. The proxy must answer a TCP connect and its echo, so a probe that reaches nothing at all fails |
 | Allowlisted egress only | `git ls-remote` works for github.com and is refused for gitlab.com |
 | No exfiltration | `fetch('https://example.com')` fails |
 | Tasks cannot reach each other | Two sandboxes start at once, each with a server on port 3000 on IPv4 and, where the sandbox has an address, IPv6. Each is alone on its own network. Neither reaches any address of the other (Docker's IPv4 address and every address the other lists itself, link-local IPv6 included) with a TCP connect or an HTTP request, nor with an ICMP echo. Through the proxy, a request by address, a `CONNECT` to the other's port 443 (the one port tinyproxy allows for `CONNECT`, so the allowlist is what refuses it) and a request by name all get 403. Each still reaches the proxy, and the check requires the proxy to answer its ICMP echo, which shows that ping works in the sandbox |
@@ -236,7 +244,7 @@ Each finished task gets `receipt.json` (schema `mantis-ring/receipt@1`, built by
 | Time limit | A task whose dev server never answers is stopped and its container removed |
 | Cleanup | No container is left after a task, and none of the suite's five sandbox networks is left or still has the proxy on it |
 
-The two-sandbox check also prints a note that is not part of any check: whether a sandbox can open a connection to the VM itself through its network's gateway address. On the VM it can (README, Known limits).
+Up to `0af372a`, the two-sandbox check printed a note that was not part of any check: a sandbox could open a connection to the VM through its network's gateway address. The two VM checks above replace it.
 
 `node test/scenes.mjs` plays the containment scenes with three fixtures from `test/fixtures/` (test data, run only inside a fresh sandbox; 20 checks):
 - a hostile repository that hunts for secrets, calls hosts off the allowlist (the cloud metadata address included), runs `rm -rf` on the whole filesystem and spawns processes without end;
@@ -249,6 +257,7 @@ All three take `RING_RUNTIME=runsc` to run the sandboxes in gVisor, and a full r
 - **`2e01f41`** (3 Nov, 21:53–21:59 UTC), under gVisor on the VM: 16/16, 17/17 and 91/91. The first scenes run that night gave 16/17. In the endless-spawn scene, gVisor stopped the whole sandbox at the process cap after 9 s, instead of holding it there until the 20 s limit. The same commit then passed 17/17.
 - **`468c5f6`** (22:36–22:43 UTC), the GitHub path: containment 16/16 and agent-loop 104/104. Scenes gave 16/17 inside `deploy.sh --selftest`, because the same scene was stopped after 1 s, and 17/17 on the rerun.
 - **`0af372a`** (23:40–23:46 UTC), the fixes from the review: containment 16/16, scenes 20/20 on the first run, agent-loop 109/109. In the two-sandbox check both sandboxes got the proxy's ICMP echo, and the `CONNECT` to the other's port 443 got 403. No IPv6 address turned up in either sandbox under gVisor, so only IPv4 was tried. The install that prints 25 MiB finished, and the host's event loop waited 11 ms at most meanwhile.
+- **`cab9964`** (4 Nov, 00:14–00:20 UTC), no VM address on a sandbox's network: containment 18/18, scenes 20/20, agent-loop 109/109. The bridge of the sandbox's network had no IPv4 address, `.1` was the proxy's, and the sandbox had only `172.20.0.2`. Every address of the VM failed with ENETUNREACH on all five ports, and a ping to each IPv4 one could not be sent (unreachable), while the proxy answered on 8888 and to ping. Just before, an uncommitted run of the new checks on the VM tried networks made three ways. With `--internal` alone, the sandbox connected to 22, 80 and 443 at the gateway 172.20.0.1 and got its ping answered. With `inhibit_ipv4`, and with `gateway_mode_ipv4=isolated`, the bridge had no IPv4 address and nothing of the VM answered.
 - **The flake:** the containment fork bomb already accepts that outcome under gVisor, but the scene does not yet.
 - **Before the per-sandbox networks,** on `0c2e46d`, the suites passed 13/13, 17/17 and 83/83.
 
