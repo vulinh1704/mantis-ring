@@ -18,3 +18,12 @@ export const PINNED_PRICES = Object.freeze({
   'qwen3.8-flash-next': Object.freeze({ promptPer1M: 0.1, completionPer1M: 0.2 }),
   'mimo-v2.6-flash': Object.freeze({ promptPer1M: 0.1, completionPer1M: 0.25 }),
 });
+
+/**
+ * The two text-to-speech models the video's voice is chosen from (POST /admin/speech), in USD per
+ * second of audio generated. The catalogue bills speech by the second, before `speed`, rounded up.
+ */
+export const PINNED_SPEECH_PRICES = Object.freeze({
+  chatterbox: Object.freeze({ perSecond: 0.00028 }),
+  'qwen3-tts-12hz-1.7b': Object.freeze({ perSecond: 0.00028 }),
+});

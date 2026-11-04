@@ -6,6 +6,8 @@
 // estimate, the task's own caps, then today's cap for the task's origin, then the total cap. It fails
 // closed: a call to a model without a known price is refused (BudgetError 'price'), except that public
 // tasks fall back to a daily token budget; a ledger that cannot be read or written stops all spending.
+// A speech call (POST /admin/speech, the video's voice) is an admin line with kind 'speech', the
+// seconds of audio billed and the characters spoken; speechGuard() adds its own per-call and daily caps.
 import { appendFileSync, mkdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { BudgetError } from '../agent/inference.mjs';
@@ -93,6 +95,7 @@ export class Spend {
     this.ledgerError = null; // set when the ledger cannot be read or written: all spending stops
     this.days = new Map(); // day -> { public: totals, admin: totals }
     this.rows = new Map(); // "day origin model" -> totals by day × origin × model
+    this.speechDays = new Map(); // day -> { calls, usd, seconds } of the speech calls (kind 'speech')
     this.allUsd = 0;
     try {
       mkdirSync(dir, { recursive: true });
@@ -135,6 +138,18 @@ export class Spend {
   /** All-time list-price USD in the ledger, both origins (compare with caps.totalUsd). */
   total() {
     return money(this.allUsd);
+  }
+
+  /**
+   * Today's speech calls (UTC day): how many, their USD (the list price, or the provider's own cost
+   * when that is higher) and the seconds of audio billed. They also count in today() and total(), as
+   * admin spend.
+   * @returns {{day: string, calls: number, usd: number, seconds: number}}
+   */
+  speechToday() {
+    const day = utcDay(this.now());
+    const s = this.speechDays.get(day) ?? { calls: 0, usd: 0, seconds: 0 };
+    return { day, calls: s.calls, usd: money(s.usd), seconds: Math.round(s.seconds * 1000) / 1000 };
   }
 
   /**
@@ -207,7 +222,7 @@ export class Spend {
         if (spend.dayTotals(origin).usd + est.usd > dayCap) throw new BudgetError('day', `today's ${origin} budget of ${dollars(dayCap)} is used up`);
         if (spend.allUsd + est.usd > caps.totalUsd) throw new BudgetError('total', `the total budget of ${dollars(caps.totalUsd)} is used up`);
       },
-      after(model, usage, usd) {
+      after(model, usage, usd, speech) {
         const ms = spend.now();
         const e = {
           ts: new Date(ms).toISOString(), day: utcDay(ms), taskId: id, origin,
@@ -216,6 +231,14 @@ export class Spend {
           reasoningTokens: count(usage?.completion_tokens_details?.reasoning_tokens),
           usd: typeof usd === 'number' && Number.isFinite(usd) && usd >= 0 ? round(usd) : null,
         };
+        // speech() passes the seconds billed and the characters spoken; `estimated` marks a charge of
+        // the pre-call estimate (a call that was never answered, or answered without its usage).
+        if (speech && typeof speech === 'object') {
+          e.kind = 'speech';
+          e.audioSeconds = typeof speech.seconds === 'number' && Number.isFinite(speech.seconds) && speech.seconds >= 0 ? speech.seconds : null;
+          e.chars = count(speech.chars);
+          if (speech.estimated === true) e.estimated = true;
+        }
         spent.calls++;
         spent.promptTokens += e.promptTokens;
         spent.completionTokens += e.completionTokens;
@@ -230,10 +253,40 @@ export class Spend {
   }
 
   /**
+   * The guard for one speech call (POST /admin/speech): guardFor()'s checks for an admin call whose own
+   * cap is `callUsd` (today's admin budget and the total cap included), then today's speech budget
+   * `dayUsd`, all against speech()'s upper-bound estimate. after() records the call as kind 'speech'.
+   * @param {{id: string, callUsd: number, dayUsd: number}} o
+   * @returns {import('../agent/inference.mjs').Guard & {spent(): object}}
+   */
+  speechGuard({ id, callUsd, dayUsd } = {}) {
+    for (const [name, v] of [['callUsd', callUsd], ['dayUsd', dayUsd]]) {
+      if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) throw new TypeError(`speechGuard: ${name} must be a number above 0`);
+    }
+    const base = this.guardFor({ id, origin: 'admin', caps: { maxUsd: callUsd, maxPromptTokens: 0 } });
+    const spend = this;
+    return {
+      before(model, est) {
+        if (typeof est?.usd === 'number' && est.usd > callUsd) {
+          throw new BudgetError('task', `this call could cost up to ${dollars(est.usd)}, more than the ${dollars(callUsd)} one speech call may cost`);
+        }
+        base.before(model, est); // a model without a price (usd null) is refused here
+        const used = spend.speechDays.get(utcDay(spend.now()))?.usd ?? 0;
+        if (used + est.usd > dayUsd) {
+          throw new BudgetError('day', `today's speech budget of ${dollars(dayUsd)} has ${dollars(dayUsd - used)} left, less than this call could cost (${dollars(est.usd)})`);
+        }
+      },
+      after: (model, usage, usd, speech) => base.after(model, usage, usd, { ...(speech && typeof speech === 'object' ? speech : {}) }),
+      spent: () => base.spent(),
+    };
+  }
+
+  /**
    * Totals by UTC day × origin × model (GET /admin/spend), oldest first. usd sums the calls with a
-   * known price; unpricedCalls and unpricedTokens count the others.
+   * known price; unpricedCalls and unpricedTokens count the others. A speech model's row also has
+   * audioSeconds, the seconds of audio billed.
    * @returns {{day: string, origin: string, model: string, calls: number, promptTokens: number, completionTokens: number,
-   *   reasoningTokens: number, usd: number, unpricedCalls: number, unpricedTokens: number}[]}
+   *   reasoningTokens: number, usd: number, unpricedCalls: number, unpricedTokens: number, audioSeconds?: number}[]}
    */
   breakdown() {
     return [...this.rows.values()]
@@ -290,6 +343,15 @@ export class Spend {
       } else t.usd += e.usd;
     }
     if (e.usd !== null) this.allUsd += e.usd;
+    if (e.kind === 'speech') {
+      const seconds = typeof e.audioSeconds === 'number' && Number.isFinite(e.audioSeconds) && e.audioSeconds > 0 ? e.audioSeconds : 0;
+      const s = this.speechDays.get(e.day) ?? { calls: 0, usd: 0, seconds: 0 };
+      s.calls++;
+      if (e.usd !== null) s.usd += e.usd;
+      s.seconds += seconds;
+      this.speechDays.set(e.day, s);
+      row.audioSeconds = (row.audioSeconds ?? 0) + seconds;
+    }
   }
 
   append(e) {

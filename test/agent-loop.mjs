@@ -12,7 +12,9 @@
 // Atlas run's receipt (never publishable) and how bench/table.mjs grades it. U18 checks how a failed look
 // says why (only the time limit is a timeout; the signal, the host cgroup, the post-mortem), the
 // memory the GitHub path saves (the warm-up, one group at a time, no install caches) and the
-// live log's memory warning. Without flags it also runs the
+// live log's memory warning. U19 checks speech() for the video's voice (the request, what it charges
+// and when, the refusals, the key kept out of errors) and the spend ledger's speech guard. Without
+// flags it also runs the
 // sandbox scenarios (§6.2, S1-S12) on the Lumen sample with a one-cell matrix: an honest fix, a
 // cover-up with the gate on and off, a measurement tamper, paths out of the project, every cap (the
 // soft stop of a model call included), malformed tool-call arguments, an inference error, a dev server
@@ -28,7 +30,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import { FAKE_KEY, callTools, httpError, say, sleep, startFakeGateway, toolCall, toolResults, usage } from './fake-gateway.mjs';
+import { FAKE_KEY, callTools, httpError, say, sleep, speechAnswer, startFakeGateway, toolCall, toolResults, usage, wavBytes } from './fake-gateway.mjs';
 
 let args;
 try {
@@ -1711,6 +1713,141 @@ async function u18() {
     sandboxLines({}).join(' | '));
 }
 
+/** speech() (the video's voice) against the fake gateway, and the spend ledger's speech guard. */
+async function u19() {
+  const inf = await load('../agent/inference.mjs');
+  const spendModule = await load('../app/spend.mjs');
+  if (!inf || !spendModule) return;
+  const { speech, speechPriceOf, speechEstimate, wavSeconds, loadPricing, InferenceError, BudgetError } = inf;
+  const PASSAGE = "This is Mantis Ring: a UI-fixing agent that can't cheat, sandboxed on Vultr.";
+  const thrown = [];
+  /** Run speech() and return [result, error]; every error is kept for the key-leak check. */
+  const attempt = async (o) => {
+    try { return [await speech({ model: 'fake-speech', input: PASSAGE, format: 'wav', ...o }), null]; } catch (err) { thrown.push(err); return [null, err]; }
+  };
+  /** A guard that only records what speech() hands it. */
+  const recorder = () => {
+    const hooks = [];
+    return { hooks, guard: { before: (model, est) => hooks.push({ at: 'before', model, est }), after: (model, u, usd, s) => hooks.push({ at: 'after', model, usd, s }) } };
+  };
+
+  await loadPricing();
+  const prices = Object.fromEntries(['fake-speech', 'chatterbox', 'qwen3-tts-12hz-1.7b', 'fake-coder', 'fake-speech-unpriced'].map((m) => [m, speechPriceOf(m)]));
+  check('U19 speechPriceOf: a speech model of the catalogue at its price a second; chatterbox and qwen3-tts pinned at $0.00028; none for a chat model or an unpriced one',
+    prices['fake-speech']?.perSecond === 0.0003 && prices['fake-speech'].source === 'catalog' && prices.chatterbox?.perSecond === 0.00028
+      && prices.chatterbox.source === 'pinned' && prices['qwen3-tts-12hz-1.7b']?.perSecond === 0.00028 && prices['fake-coder'] === null && prices['fake-speech-unpriced'] === null,
+    JSON.stringify(prices));
+
+  // A call: the request, the audio, and what the guard gets.
+  gw.setSpeech(null);
+  const before = gw.speeches().length;
+  const rec = recorder();
+  const [ok, eOk] = await attempt({ voice: 'default', language: 'English', seed: 7, guard: rec.guard });
+  const req = gw.speeches().at(-1);
+  check('U19 speech() posts the OpenAI request shape to /v1/audio/speech with the key, and returns the audio as it came',
+    !eOk && gw.speeches().length === before + 1 && req?.auth === true && req.body?.model === 'fake-speech' && req.body?.input === PASSAGE && req.body?.voice === 'default'
+      && req.body?.response_format === 'wav' && req.body?.language === 'English' && req.body?.seed === 7 && !('stream_format' in (req.body ?? {}))
+      && Buffer.isBuffer(ok?.audio) && ok.audio.equals(speechAnswer(req.body).audio) && ok.contentType === 'audio/wav',
+    eOk ? eOk.message : `${ok?.audio?.length} bytes, ${ok?.contentType}; body ${JSON.stringify(req?.body)}`);
+  const seconds = Math.ceil(PASSAGE.length / 15);
+  const [hookBefore, hookAfter] = rec.hooks;
+  check('U19 guard.before gets the upper bound (characters / 5 + 5 s at the list price, no tokens); guard.after the seconds and cost the provider reported',
+    hookBefore?.at === 'before' && hookBefore.est.promptTokens === 0 && hookBefore.est.maxCompletionTokens === 0
+      && hookBefore.est.seconds === Math.ceil(PASSAGE.length / 5) + 5 && Math.abs(hookBefore.est.usd - speechEstimate(PASSAGE.length, 0.0003).usd) < 1e-12
+      && hookAfter?.at === 'after' && hookAfter.s?.seconds === seconds && hookAfter.s?.chars === PASSAGE.length && Math.abs(hookAfter.usd - seconds * 0.0003) < 1e-9
+      && ok?.usdFrom === 'provider' && ok?.seconds === seconds && rec.hooks.length === 2,
+    JSON.stringify(rec.hooks));
+
+  // No usage headers: a WAV is charged its own length, anything else the estimate.
+  gw.setSpeech((body) => {
+    const answer = speechAnswer(body, { seconds: 3 });
+    delete answer.headers['x-usage-seconds'];
+    delete answer.headers['x-usage-cost'];
+    return answer;
+  });
+  const recWav = recorder();
+  const [okWav] = await attempt({ guard: recWav.guard });
+  const recMp3 = recorder();
+  const [okMp3] = await attempt({ format: 'mp3', guard: recMp3.guard });
+  check('U19 without usage headers a WAV is charged its own length at the list price, and other audio the estimate (marked estimated)',
+    okWav?.usdFrom === 'audio' && okWav.seconds === 3 && Math.abs(recWav.hooks[1]?.usd - 3 * 0.0003) < 1e-12
+      && okMp3?.usdFrom === 'estimate' && recMp3.hooks[1]?.usd === recMp3.hooks[0]?.est?.usd && recMp3.hooks[1]?.s?.estimated === true,
+    `wav: ${okWav?.usdFrom} ${okWav?.seconds} s $${recWav.hooks[1]?.usd}; mp3: ${okMp3?.usdFrom} $${recMp3.hooks[1]?.usd}`);
+
+  // The provider refuses: no retry, nothing charged, the key redacted.
+  gw.setSpeech(httpError(400, `unknown voice "nobody" for key ${FAKE_KEY} (Authorization: Bearer ${FAKE_KEY})`, { errorType: 'invalid_request' }));
+  const rec400 = recorder();
+  const n400 = gw.speeches().length;
+  const [, e400] = await attempt({ voice: 'nobody', guard: rec400.guard });
+  gw.setSpeech(httpError(429, 'Rate limit exceeded. Please retry later.', { errorType: 'rate_limit_exceeded', headers: { 'retry-after': '7' } }));
+  const [, e429] = await attempt({ guard: recorder().guard });
+  check('U19 a 400 or a 429 from the provider: an InferenceError with its status and sentence (a 429 says when to try again), sent once, nothing charged',
+    e400 instanceof InferenceError && e400.status === 400 && e400.type === 'invalid_request' && /unknown voice/.test(e400.message) && rec400.hooks.length === 1
+      && e429 instanceof InferenceError && e429.status === 429 && /try again in 7 s/.test(e429.message) && gw.speeches().length === n400 + 2,
+    `${e400?.message} | ${e429?.message} | ${gw.speeches().length - n400} requests`);
+
+  // Refused before anything is sent: the guard, and the caller's own mistakes.
+  const n0 = gw.speeches().length;
+  const [, eBudget] = await attempt({ guard: { before() { throw new BudgetError('day', 'test: the speech budget is used up'); }, after() {} } });
+  const [, ePcm] = await attempt({ format: 'pcm' });
+  const [, eVoice] = await attempt({ voice: 'Bad Voice' });
+  const [, eEmpty] = await attempt({ input: '   ' });
+  check('U19 guard.before throwing BudgetError, a pcm format, a bad voice name or empty text: no speech request is sent',
+    eBudget instanceof BudgetError && [ePcm, eVoice, eEmpty].every((e) => e instanceof InferenceError && e.type === 'invalid_request') && gw.speeches().length === n0,
+    `${gw.speeches().length - n0} requests; ${[eBudget, ePcm, eVoice, eEmpty].map((e) => e?.message ?? 'no error').join(' | ')}`);
+
+  // Audio past maxBytes is refused but still charged; a call that never answers is charged the estimate.
+  gw.setSpeech(null);
+  const recBig = recorder();
+  const [, eBig] = await attempt({ maxBytes: 1000, guard: recBig.guard });
+  gw.setSpeech(sleep(3000));
+  const recSlow = recorder();
+  const [, eSlow] = await attempt({ timeoutMs: 300, guard: recSlow.guard });
+  gw.setSpeech(null);
+  check('U19 audio over maxBytes is refused yet charged what the provider reports; a call that times out is charged the estimate, marked estimated',
+    eBig instanceof InferenceError && /larger than 1000 bytes/.test(eBig.message) && recBig.hooks[1]?.at === 'after' && recBig.hooks[1].usd > 0 && recBig.hooks[1].s?.estimated !== true
+      && eSlow instanceof InferenceError && eSlow.type === 'timeout' && recSlow.hooks[1]?.usd === recSlow.hooks[0]?.est?.usd && recSlow.hooks[1]?.s?.estimated === true,
+    `${eBig?.message} → $${recBig.hooks[1]?.usd}; ${eSlow?.message} → $${recSlow.hooks[1]?.usd}`);
+
+  const streamed = wavBytes(1);
+  streamed.writeUInt32LE(0xffffffff, 40); // a WAV written while it streams does not know its length
+  check("U19 wavSeconds reads a WAV's length, and a streamed WAV's from what came; anything else is null",
+    wavSeconds(wavBytes(2.5)) === 2.5 && wavSeconds(streamed) === 1 && wavSeconds(Buffer.from('ID3 this is not a WAV file, only some bytes of text')) === null && wavSeconds(Buffer.alloc(8)) === null,
+    `${wavSeconds(wavBytes(2.5))}, streamed ${wavSeconds(streamed)}`);
+
+  // The ledger's speech guard: its own call and day caps, the line it writes, and a restart.
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'ring-u19-'));
+  try {
+    const { Spend } = spendModule;
+    const ledger = new Spend({ dir });
+    const refused = (fn) => { try { fn(); return null; } catch (err) { return err; } };
+    const est = (usd) => ({ promptTokens: 0, maxCompletionTokens: 0, usd, seconds: 65 });
+    const first = ledger.speechGuard({ id: 'speech-u19-1', callUsd: 0.05, dayUsd: 0.5 });
+    const overCall = refused(() => first.before('fake-speech-pricey', est(0.65)));
+    const unpriced = refused(() => first.before('fake-speech-unpriced', est(null)));
+    const fits = refused(() => first.before('fake-speech', est(0.02)));
+    first.after('fake-speech', {}, 0.49, { seconds: 1633, chars: 300 });
+    const second = ledger.speechGuard({ id: 'speech-u19-2', callUsd: 0.05, dayUsd: 0.5 });
+    const overDay = refused(() => second.before('fake-speech', est(0.02)));
+    const line = JSON.parse(readFileSync(path.join(dir, 'spend.jsonl'), 'utf8').trim().split('\n').at(-1));
+    const again = new Spend({ dir }).speechToday();
+    const row = ledger.breakdown().find((r) => r.model === 'fake-speech');
+    check("U19 the speech guard refuses a call over its cap or without a price, and one past today's speech budget; a call is an admin line of kind speech, counted again after a restart",
+      overCall instanceof BudgetError && overCall.scope === 'task' && unpriced instanceof BudgetError && unpriced.scope === 'price' && fits === null
+        && overDay instanceof BudgetError && overDay.scope === 'day' && /speech budget/.test(overDay.message)
+        && line.kind === 'speech' && line.origin === 'admin' && line.taskId === 'speech-u19-1' && line.audioSeconds === 1633 && line.chars === 300 && line.usd === 0.49
+        && again.calls === 1 && again.usd === 0.49 && again.seconds === 1633 && ledger.today().adminUsd === 0.49 && row?.audioSeconds === 1633,
+      `${[overCall, unpriced, fits, overDay].map((e) => (e ? `${e.scope}: ${e.message}` : 'allowed')).join(' | ')}; line ${JSON.stringify(line)}; after a restart ${JSON.stringify(again)}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+
+  // "Bearer [redacted]" may appear; the key, or a Bearer followed by anything else, may not.
+  const leaks = thrown.filter((e) => [e?.message, e?.stack, String(e), JSON.stringify(e ?? {})].some((s) => String(s).includes(FAKE_KEY) || /bearer\s+(?!\[redacted\])/i.test(String(s))));
+  check('U19 the API key never appears in speech errors (the provider echoed it in one)', thrown.length >= 7 && leaks.length === 0 && /\[redacted\]/.test(e400?.message ?? ''),
+    `${thrown.length} errors checked, ${leaks.length} leaked; ${e400?.message}`);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Sandbox scenarios (Docker; runc locally, runsc on the VM)
 // ---------------------------------------------------------------------------------------------
@@ -2358,6 +2495,7 @@ try {
   await group('U16', u16);
   await group('U17', u17);
   await group('U18', u18);
+  await group('U19', u19);
   if (!args.unit) await scenarios();
 
   const failed = results.filter((r) => !r.pass);

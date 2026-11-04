@@ -1,14 +1,14 @@
-// Vultr Serverless Inference client (OpenAI-compatible chat completions with tool calling).
-// Runs only in the orchestrator, outside every sandbox. The API key comes from the service's
-// environment (systemd reads /etc/mantis-ring/secrets.env); it is read only inside chat() and ping(),
-// never passed to a container or logged, and never put in an error message: errors carry at most 300
-// characters of the provider's own text, with the key redacted, and never the request.
+// Vultr Serverless Inference client (OpenAI-compatible chat completions with tool calling, and speech
+// for the video's voice). Runs only in the orchestrator, outside every sandbox. The API key comes from
+// the service's environment (systemd reads /etc/mantis-ring/secrets.env); it is read only inside chat(),
+// speech() and ping(), never passed to a container or logged, and never put in an error message: errors
+// carry at most 300 characters of the provider's own text, with the key redacted, and never the request.
 // Every call has a completion-token cap, a wall-clock timeout, a bounded retry policy and a budget
 // check before each attempt. Usage and list-price cost go into a running tally. A price that is not
 // known is never counted as $0: the tally's usd becomes null ("cost n/a"), and the spend guard decides
 // whether such a call may run at all.
 import { setTimeout as delay } from 'node:timers/promises';
-import { PINNED_PRICES } from './prices.mjs';
+import { PINNED_PRICES, PINNED_SPEECH_PRICES } from './prices.mjs';
 
 /** Base URL of the API. The environment override is for tests only (a local fake gateway). */
 export const INFERENCE_URL = (process.env.VULTR_INFERENCE_URL || 'https://api.vultrinference.com/v1').replace(/\/+$/, '');
@@ -82,15 +82,17 @@ export class BudgetError extends Error {
 // Prices
 
 let catalog = null; // model id -> { prompt, completion } in USD per token, from the live catalogue
+let speechCatalog = null; // speech model id -> USD per second of audio, from the same catalogue
 let catalogLoading = null; // the fetch in flight, shared by concurrent callers
 let catalogFailedAt = 0; // when the last fetch failed
 
 /**
  * Per-token list prices from the public model catalogue (GET /models, which needs no key), fetched
  * once and cached for the life of the process. A model is listed only when both its prompt and its
- * completion token price are given: a missing price is unknown, never 0. On failure this resolves to
- * {} (or the earlier catalogue) and priceOf() falls back to the pinned prices; a failed fetch is tried
- * again at most every 5 minutes, or at once with `force`. Never throws.
+ * completion token price are given: a missing price is unknown, never 0. Speech models, billed by the
+ * second of audio, are kept apart for speechPriceOf(). On failure this resolves to {} (or the earlier
+ * catalogue) and priceOf() falls back to the pinned prices; a failed fetch is tried again at most
+ * every 5 minutes, or at once with `force`. Never throws.
  * @returns {Promise<Record<string, {prompt: number, completion: number}>>}
  */
 export async function loadPricing({ force = false } = {}) {
@@ -108,6 +110,7 @@ async function fetchCatalog() {
     // The catalogue answers an empty list when it is unavailable: that is a failure, not "no prices".
     if (!Array.isArray(data) || data.length === 0) throw new Error('catalogue is empty');
     const prices = {};
+    const speechPrices = {};
     for (const m of data) {
       if (typeof m?.id !== 'string' || !MODEL_ID.test(m.id)) continue;
       const all = [...(m.input_modalities ?? []), ...(m.output_modalities ?? [])].flatMap((x) => x?.pricing ?? []);
@@ -115,8 +118,13 @@ async function fetchCatalog() {
       const prompt = price('prompt');
       const completion = price('completion');
       if (prompt !== null && completion !== null) prices[m.id] = { prompt, completion };
+      // A speech model: output type "speech", priced per second of audio ({type: completion, unit: second}).
+      const spoken = (m.output_modalities ?? []).find((x) => x?.type === 'speech');
+      const perSecond = perToken((spoken?.pricing ?? []).find((p) => p?.type === 'completion' && p?.unit === 'second')?.cost_usd);
+      if (spoken && perSecond !== null) speechPrices[m.id] = perSecond;
     }
     catalog = prices;
+    speechCatalog = speechPrices;
     catalogFailedAt = 0;
     return catalog;
   } catch {
@@ -157,6 +165,20 @@ export function priceOf(model) {
   return null;
 }
 
+/**
+ * The list price of a speech model in USD per second of audio generated (billed before `speed`,
+ * rounded up): from the live catalogue once loadPricing() has read it, otherwise pinned on 4 Nov;
+ * null for any model that neither lists as a priced speech model, a chat model included. The id must
+ * match exactly.
+ * @returns {{perSecond: number, source: 'catalog'|'pinned'} | null}
+ */
+export function speechPriceOf(model) {
+  if (typeof model !== 'string' || !MODEL_ID.test(model)) return null;
+  if (speechCatalog && Object.hasOwn(speechCatalog, model)) return { perSecond: speechCatalog[model], source: 'catalog' };
+  if (Object.hasOwn(PINNED_SPEECH_PRICES, model)) return { perSecond: PINNED_SPEECH_PRICES[model].perSecond, source: 'pinned' };
+  return null;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Tally
 
@@ -165,8 +187,9 @@ export function priceOf(model) {
  *   usd: number|null, ms: number, price: {promptPer1M: number, completionPer1M: number, source: 'catalog'|'pinned'}|null}} TallyRow
  * @typedef {{calls: number, promptTokens: number, completionTokens: number, reasoningTokens: number,
  *   usd: number|null, ms: number, byModel: Record<string, TallyRow>}} Tally
- * @typedef {{ before(model: string, est: {promptTokens: number, maxCompletionTokens: number, usd: number|null}): void,
- *   after(model: string, usage: object, usd: number|null): void }} Guard   // before() throws BudgetError
+ * @typedef {{ before(model: string, est: {promptTokens: number, maxCompletionTokens: number, usd: number|null, seconds?: number}): void,
+ *   after(model: string, usage: object, usd: number|null, speech?: {seconds: number|null, chars: number, estimated?: boolean}): void }} Guard
+ *   before() throws BudgetError; speech() alone passes `seconds` and the `speech` argument
  */
 
 /**
@@ -517,6 +540,215 @@ export function stripForResend(messages) {
     const { reasoning, reasoning_content, reasoning_details, ...rest } = m;
     return rest;
   });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Speech: the video's voice, for POST /admin/speech only
+
+/** The audio formats speech() asks for, and the type each is served as. pcm is left out: raw samples, no header. */
+export const SPEECH_FORMATS = Object.freeze({ mp3: 'audio/mpeg', wav: 'audio/wav', flac: 'audio/flac', opus: 'audio/ogg' });
+const SPEECH_PACE = 5; // characters a second in the estimate: a third of ordinary English speech (about 15)
+const SPEECH_PAD_S = 5; // seconds the estimate adds for the silence at either end
+const SPEECH_MAX_BYTES = 16 * 2 ** 20;
+const SPEECH_TIMEOUT_MS = 180_000;
+const VOICE = /^[a-z][a-z0-9_]{0,39}$/;
+const LANGUAGE = /^[A-Za-z][A-Za-z -]{0,34}$/;
+
+/**
+ * The upper bound speech() gives the guard before a call: the seconds a passage of `chars` characters
+ * could be billed for at a third of ordinary speaking pace, plus 5, and their price at `perSecond`.
+ * @returns {{seconds: number, usd: number}}
+ */
+export function speechEstimate(chars, perSecond) {
+  const seconds = Math.ceil(Math.max(0, chars) / SPEECH_PACE) + SPEECH_PAD_S;
+  return { seconds, usd: Math.round(seconds * perSecond * 1e10) / 1e10 }; // the ledger's precision
+}
+
+/** The length in seconds of a WAV file (RIFF, a fmt chunk, then a data chunk), or null when it is not one. */
+export function wavSeconds(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length < 44 || buf.toString('latin1', 0, 4) !== 'RIFF' || buf.toString('latin1', 8, 12) !== 'WAVE') return null;
+  let byteRate = 0;
+  for (let pos = 12; pos + 8 <= buf.length;) {
+    const id = buf.toString('latin1', pos, pos + 4);
+    let size = buf.readUInt32LE(pos + 4);
+    const start = pos + 8;
+    if (id === 'fmt ' && start + 12 <= buf.length) byteRate = buf.readUInt32LE(start + 8);
+    if (id === 'data') {
+      if (!byteRate) return null;
+      // A WAV written while it streams may not know its own length (0 or 0xFFFFFFFF): count what came.
+      if (size === 0 || size > buf.length - start) size = buf.length - start;
+      return size / byteRate;
+    }
+    pos = start + size + (size % 2);
+  }
+  return null;
+}
+
+/**
+ * One text-to-speech call: POST /audio/speech in OpenAI's request shape, answered with the audio
+ * itself. The provider bills by the second of audio generated (before `speed`, rounded up) and reports
+ * the seconds and the cost in its X-Usage-Seconds and X-Usage-Cost headers.
+ *  - Before the call, guard.before(model, {promptTokens: 0, maxCompletionTokens: 0, usd, seconds}) gets
+ *    the upper bound of speechEstimate() at the model's list price. A model without a speech price gets
+ *    usd null, which the spend guard refuses.
+ *  - Afterwards, guard.after(model, {}, usd, {seconds, chars}) gets what was billed: the larger of
+ *    X-Usage-Cost and X-Usage-Seconds at the list price; without those headers, a WAV's own length at
+ *    the list price; otherwise the estimate. A call that was sent and never answered (a timeout, or the
+ *    caller left) is charged the estimate, marked `estimated`, so no call ever counts as free.
+ *  - One attempt, no retry: a 429 says when to try again. The answer is read up to `maxBytes`.
+ * @param {{model: string, input: string, voice?: string, format?: 'mp3'|'wav'|'flac'|'opus', language?: string,
+ *   speed?: number, seed?: number, maxBytes?: number, timeoutMs?: number, signal?: AbortSignal, guard?: Guard}} o
+ *   Defaults: format mp3, maxBytes 16 MiB, timeoutMs 180000; voice, language, speed and seed are the provider's.
+ * @returns {Promise<{audio: Buffer, contentType: string, format: string, seconds: number|null, usd: number|null,
+ *   usdFrom: 'provider'|'seconds'|'audio'|'estimate', estimate: {seconds: number, usd: number|null}, ms: number}>}
+ * @throws {InferenceError|BudgetError}
+ */
+export async function speech(o = {}) {
+  const {
+    model, input, voice, format = 'mp3', language, speed, seed, maxBytes = SPEECH_MAX_BYTES, timeoutMs = SPEECH_TIMEOUT_MS, signal, guard,
+  } = o ?? {};
+  const problem = checkSpeechOptions({ model, input, voice, format, language, speed, seed, maxBytes, timeoutMs, signal, guard });
+  if (problem) throw new InferenceError(`invalid speech request: ${problem}`, { type: 'invalid_request' });
+  if (signal?.aborted) throw abortedError(signal);
+  const key = process.env.VULTR_INFERENCE_API_KEY;
+  if (!key) throw new InferenceError('VULTR_INFERENCE_API_KEY is not set for the orchestrator', { type: 'no_key' });
+  if (!KEY_URL_OK) throw new InferenceError(BAD_URL_TEXT, { type: 'bad_url' });
+
+  await loadPricing();
+  const price = speechPriceOf(model);
+  const chars = input.length;
+  const estimate = { seconds: speechEstimate(chars, 0).seconds, usd: price ? speechEstimate(chars, price.perSecond).usd : null };
+  guard?.before(model, { promptTokens: 0, maxCompletionTokens: 0, usd: estimate.usd, seconds: estimate.seconds });
+
+  const body = { model, input, response_format: format };
+  if (voice !== undefined) body.voice = voice;
+  if (language !== undefined) body.language = language;
+  if (speed !== undefined) body.speed = speed;
+  if (seed !== undefined) body.seed = seed;
+  const charge = (usd, seconds, more = {}) => {
+    try {
+      guard?.after(model, {}, usd, { seconds, chars, ...more });
+    } catch { /* after() records and never throws; a broken guard must not hide the real outcome */ }
+  };
+  const chargeEstimate = () => charge(estimate.usd, estimate.seconds, { estimated: true });
+
+  const timeout = AbortSignal.timeout(timeoutMs);
+  const started = Date.now();
+  let res;
+  try {
+    res = await fetch(`${INFERENCE_URL}/audio/speech`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      redirect: 'error', // the key goes to this host only
+      signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+    });
+  } catch (err) {
+    if (signal?.aborted || timeout.aborted) chargeEstimate(); // sent and never answered: it may still be billed
+    if (signal?.aborted) throw abortedError(signal);
+    if (timeout.aborted) throw new InferenceError(`${PROVIDER} did not answer within ${+(timeoutMs / 1000).toFixed(1)} s`, { retryable: true, type: 'timeout' });
+    throw new InferenceError(`could not reach ${PROVIDER}: ${networkReason(err)}`, { retryable: true, type: 'network' });
+  }
+
+  // What the provider says it billed: the larger of its own cost and its seconds at the list price.
+  const billedSeconds = headerNumber(res.headers.get('x-usage-seconds'));
+  const billedCost = headerNumber(res.headers.get('x-usage-cost'));
+  const atListPrice = billedSeconds !== null && price ? billedSeconds * price.perSecond : null;
+  const reported = billedCost === null && atListPrice === null ? null : Math.max(billedCost ?? 0, atListPrice ?? 0);
+
+  if (!res.ok) {
+    const text = await readCapped(res, 64 * 1024).then((b) => b.toString('utf8'), () => '');
+    if (reported !== null) charge(reported, billedSeconds);
+    const { message, type } = errorBody(text);
+    const wait = res.status === 429 ? ` (try again in ${Math.round(retryAfterMs(res.headers.get('retry-after')) / 1000)} s)` : '';
+    throw new InferenceError(`${PROVIDER} answered ${res.status}${type ? ` (${type})` : ''}: ${message || 'no message'}${wait}`, {
+      status: res.status, retryable: res.status === 429 || res.status >= 500, type,
+    });
+  }
+
+  let audio;
+  try {
+    audio = await readCapped(res, maxBytes);
+  } catch (err) {
+    // The provider made the audio, so it has billed it: charge what it says, else the estimate.
+    if (reported !== null) charge(reported, billedSeconds);
+    else chargeEstimate();
+    if (err instanceof RangeError) throw new InferenceError(`the audio is larger than ${maxBytes} bytes`, { status: res.status, type: 'bad_response' });
+    if (signal?.aborted) throw abortedError(signal);
+    if (timeout.aborted) throw new InferenceError(`${PROVIDER} did not finish the audio within ${+(timeoutMs / 1000).toFixed(1)} s`, { retryable: true, type: 'timeout' });
+    throw new InferenceError(`the audio could not be read: ${networkReason(err)}`, { retryable: true, type: 'network' });
+  }
+
+  let usd, seconds, usdFrom;
+  const wav = format === 'wav' ? wavSeconds(audio) : null;
+  if (reported !== null) {
+    [usd, seconds, usdFrom] = [reported, billedSeconds, billedCost !== null ? 'provider' : 'seconds'];
+  } else if (wav !== null && price) {
+    seconds = Math.ceil(wav * (speed ?? 1)); // billed before speed
+    [usd, usdFrom] = [seconds * price.perSecond, 'audio'];
+  } else {
+    [usd, seconds, usdFrom] = [estimate.usd, estimate.seconds, 'estimate'];
+  }
+  if (typeof usd === 'number') usd = Math.round(usd * 1e10) / 1e10; // the ledger's precision, without float noise
+  charge(usd, seconds, usdFrom === 'estimate' ? { estimated: true } : {});
+
+  const served = String(res.headers.get('content-type') ?? '').split(';')[0].trim().toLowerCase();
+  if (!served.startsWith('audio/') && served !== 'application/octet-stream') {
+    throw new InferenceError(`${PROVIDER} answered ${res.status} with ${providerText(served) || 'no content type'} instead of audio`, { status: res.status, type: 'bad_response' });
+  }
+  if (audio.length === 0) throw new InferenceError(`${PROVIDER} answered ${res.status} without any audio`, { status: res.status, type: 'bad_response' });
+  return {
+    audio, contentType: served.startsWith('audio/') ? served : SPEECH_FORMATS[format], format, seconds, usd, usdFrom, estimate, ms: Date.now() - started,
+  };
+}
+
+/** Caller mistakes in a speech request, caught before anything is sent. Returns a problem or null. */
+function checkSpeechOptions(o) {
+  if (typeof o.model !== 'string' || !MODEL_ID.test(o.model)) return 'model must be a model id';
+  if (typeof o.input !== 'string' || o.input.trim() === '') return 'input must be the text to speak';
+  if (o.voice !== undefined && (typeof o.voice !== 'string' || !VOICE.test(o.voice))) return 'voice must be a voice name';
+  if (typeof o.format !== 'string' || !Object.hasOwn(SPEECH_FORMATS, o.format)) return `format must be one of ${Object.keys(SPEECH_FORMATS).join(', ')}`;
+  if (o.language !== undefined && (typeof o.language !== 'string' || !LANGUAGE.test(o.language))) return 'language must be auto, a language code or a language name';
+  if (o.speed !== undefined && !(typeof o.speed === 'number' && o.speed >= 0.25 && o.speed <= 4)) return 'speed must be a number from 0.25 to 4';
+  if (o.seed !== undefined && !(Number.isInteger(o.seed) && o.seed >= 0)) return 'seed must be a non-negative integer';
+  if (!(Number.isInteger(o.maxBytes) && o.maxBytes > 0)) return 'maxBytes must be a positive integer';
+  if (!(typeof o.timeoutMs === 'number' && o.timeoutMs > 0 && Number.isFinite(o.timeoutMs))) return 'timeoutMs must be a positive number';
+  if (o.signal !== undefined && o.signal !== null && !(o.signal instanceof AbortSignal)) return 'signal must be an AbortSignal';
+  if (o.guard !== undefined && o.guard !== null && (typeof o.guard.before !== 'function' || typeof o.guard.after !== 'function')) {
+    return 'guard must have before() and after()';
+  }
+  return null;
+}
+
+/** A usage header ("21", "0.00588") as a number of at least 0, or null. */
+function headerNumber(v) {
+  if (typeof v !== 'string' || v.trim() === '') return null;
+  const n = Number(v.trim());
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+/** A response body as one Buffer; a RangeError past `max` bytes, and the rest is never read. */
+async function readCapped(res, max) {
+  if (!res.body) return Buffer.alloc(0);
+  const declared = Number(res.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > max) {
+    await res.body.cancel().catch(() => {});
+    throw new RangeError(`the body is over ${max} bytes`);
+  }
+  const reader = res.body.getReader();
+  const chunks = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > max) {
+      await reader.cancel().catch(() => {});
+      throw new RangeError(`the body is over ${max} bytes`);
+    }
+    chunks.push(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
+  }
+  return Buffer.concat(chunks, size);
 }
 
 // ---------------------------------------------------------------------------------------------

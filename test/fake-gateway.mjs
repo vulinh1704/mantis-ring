@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 // A stand-in for Vultr Serverless Inference in tests: an OpenAI-compatible HTTP server on 127.0.0.1
-// that answers chat completions from a script instead of a model. Tests point VULTR_INFERENCE_URL at
-// it (and set a fake key) BEFORE importing agent/inference.mjs, so the real chat(), guard and tally
-// run end to end and no token is ever spent. Every request is recorded for assertions; the
-// Authorization header is only compared with the fake key, never stored.
+// that answers chat completions from a script instead of a model, and POST /v1/audio/speech with a WAV
+// of silence (or a scripted answer). Tests point VULTR_INFERENCE_URL at it (and set a fake key) BEFORE
+// importing agent/inference.mjs, so the real chat(), speech(), guard and tally run end to end and no
+// token is ever spent. Every request is recorded for assertions; the Authorization header is only
+// compared with the fake key, never stored.
 //
 // Usage in a test:
 //   const gw = await startFakeGateway([callTools([{ name: 'read_file', args: { path: 'index.html' } }])]);
@@ -39,11 +40,65 @@ export const FAKE_CATALOG = {
       output_modalities: [{ type: 'text', pricing: [] }],
       supported_parameters: ['reasoning', 'max_completion_tokens', 'temperature', 'response_format'],
     },
+    // Speech models in the real catalogue's shape (4 Nov): priced per second of audio, as a string.
+    fakeSpeechModel('fake-speech', '0.0003'),
+    fakeSpeechModel('fake-speech-pricey', '0.01'),
+    fakeSpeechModel('fake-speech-unpriced', null),
   ],
 };
 
 /** fake-coder's prices in USD per 1M tokens, for assertions on the tally. */
 export const FAKE_PRICES = { 'fake-coder': { promptPer1M: 0.15, completionPer1M: 0.60 } };
+/** The fake speech models' prices in USD per second of audio (fake-speech-unpriced has none). */
+export const FAKE_SPEECH_PRICES = { 'fake-speech': 0.0003, 'fake-speech-pricey': 0.01 };
+
+function fakeSpeechModel(id, perSecond) {
+  return {
+    id, object: 'model', name: `${id} (tests)`, owned_by: 'mantis-ring-tests',
+    input_modalities: [{ type: 'text', supported_inputs: { max_prompt_length: { value: 4800, unit: 'character' } } }],
+    output_modalities: [{
+      type: 'speech', streaming: true,
+      supported_parameters: { voice: { type: 'enum', values: ['default', 'clone'] }, response_format: { type: 'enum', values: ['mp3', 'opus', 'flac', 'wav', 'pcm'] } },
+      pricing: perSecond === null ? [] : [{ type: 'completion', unit: 'second', cost_usd: perSecond }],
+    }],
+  };
+}
+
+const SPEECH_TYPES = { mp3: 'audio/mpeg', wav: 'audio/wav', flac: 'audio/flac', opus: 'audio/ogg' };
+
+/** A 16-bit mono PCM WAV with `seconds` of silence. */
+export function wavBytes(seconds, sampleRate = 24000) {
+  const dataSize = Math.round(seconds * sampleRate) * 2;
+  const b = Buffer.alloc(44 + dataSize);
+  b.write('RIFF', 0, 'latin1');
+  b.writeUInt32LE(36 + dataSize, 4);
+  b.write('WAVE', 8, 'latin1');
+  b.write('fmt ', 12, 'latin1');
+  b.writeUInt32LE(16, 16);
+  b.writeUInt16LE(1, 20); // PCM
+  b.writeUInt16LE(1, 22); // mono
+  b.writeUInt32LE(sampleRate, 24);
+  b.writeUInt32LE(sampleRate * 2, 28); // byte rate
+  b.writeUInt16LE(2, 32);
+  b.writeUInt16LE(16, 34);
+  b.write('data', 36, 'latin1');
+  b.writeUInt32LE(dataSize, 40);
+  return b;
+}
+
+/**
+ * The default answer to POST /v1/audio/speech, as the real service gives it: the audio itself (a WAV
+ * of silence for "wav", a few marker bytes otherwise), one second for every 15 characters, with
+ * X-Usage-Seconds and, for a priced model, X-Usage-Cost.
+ */
+export function speechAnswer(body, { seconds, headers = {} } = {}) {
+  const format = typeof body?.response_format === 'string' ? body.response_format : 'mp3';
+  const secs = seconds ?? Math.max(1, Math.ceil(String(body?.input ?? '').length / 15));
+  const audio = format === 'wav' ? wavBytes(secs) : Buffer.from(`FAKE ${format} AUDIO, ${secs} s`);
+  const perSecond = FAKE_SPEECH_PRICES[body?.model];
+  const usage = { 'x-usage-seconds': String(secs), ...(perSecond === undefined ? {} : { 'x-usage-cost': (secs * perSecond).toFixed(6) }) };
+  return { status: 200, headers: { 'content-type': SPEECH_TYPES[format] ?? 'application/octet-stream', ...usage, ...headers }, audio };
+}
 
 /** A tool call as the gateway returns it. `args` may be an object or a raw string (to send invalid JSON). */
 export function toolCall(name, args = {}, id = `call_${randomBytes(6).toString('hex')}`) {
@@ -175,9 +230,13 @@ function readBody(req) {
  * `{sleepMs, after}` (see sleep). `script` is an array of steps, one per chat request in order, or one
  * step function used for every request. A request past the end of the script gets a 400
  * (non-retryable), so a loop that talks longer than planned stops instead of hanging.
+ * POST /v1/audio/speech answers speechAnswer(body) unless setSpeech() gave a step: a function of the
+ * body, or an answer used as is: `{status, headers, audio: Buffer}` (the audio), `{status, headers, body}`
+ * (an error, see httpError) or `{sleepMs, after}`. setSpeech(null) goes back to the default.
  * @param {Array<Function|object>|Function} [script]
  * @param {{strict?: boolean, port?: number}} [o]  strict (default): answer 400 to protocol problems (chatProblems)
- * @returns {Promise<{url: string, requests: object[], chats: () => object[], setScript: (s) => void, close: () => Promise<void>}>}
+ * @returns {Promise<{url: string, requests: object[], chats: () => object[], speeches: () => object[], setScript: (s) => void,
+ *   setSpeech: (s) => void, close: () => Promise<void>}>}
  *   url has no /v1. requests: {n?, method, path, auth, at, body, problems}; `auth` is true when the
  *   request carried "Bearer <FAKE_KEY>". setScript replaces the script and clears `requests` in place.
  */
@@ -186,6 +245,7 @@ export async function startFakeGateway(script = [], { strict = true, port = 0 } 
   const timers = new Set();
   let steps = script;
   let chatCount = 0;
+  let speechStep = null;
 
   /** Resolves true when the client went away before `ms` passed. */
   const wait = (ms, res) => new Promise((resolve) => {
@@ -212,6 +272,21 @@ export async function startFakeGateway(script = [], { strict = true, port = 0 } 
     send(res, 200, completion(body, result, n));
   }
 
+  async function answerSpeech(res, body, result) {
+    if (typeof result?.sleepMs === 'number') {
+      const clientLeft = await wait(result.sleepMs, res);
+      if (!clientLeft) await answerSpeech(res, body, result.after ?? speechAnswer(body));
+      return;
+    }
+    if (Buffer.isBuffer(result?.audio)) {
+      if (res.destroyed || res.writableEnded) return;
+      res.writeHead(result.status ?? 200, { 'content-length': result.audio.length, ...(result.headers ?? {}) });
+      res.end(result.audio);
+      return;
+    }
+    send(res, result?.status ?? 500, result?.body ?? httpError(500, 'fake gateway: the speech step gave no answer').body, result?.headers ?? {});
+  }
+
   async function handle(req, res) {
     const url = new URL(req.url, 'http://127.0.0.1');
     const record = { method: req.method, path: url.pathname, auth: req.headers.authorization === `Bearer ${FAKE_KEY}`, at: Date.now(), body: null, problems: [] };
@@ -219,6 +294,18 @@ export async function startFakeGateway(script = [], { strict = true, port = 0 } 
     if (req.method === 'GET' && url.pathname === '/v1/models') return send(res, 200, FAKE_CATALOG);
     if (req.method === 'GET' && url.pathname === '/v1/health') {
       return record.auth ? send(res, 200, { status: 'ok' }) : send(res, 401, httpError(401, 'missing or wrong API key', { errorType: 'authentication_error' }).body);
+    }
+    if (req.method === 'POST' && url.pathname === '/v1/audio/speech') {
+      const text = await readBody(req);
+      try {
+        record.body = JSON.parse(text);
+      } catch {
+        record.problems.push('the body is not valid JSON');
+        return send(res, 400, httpError(400, 'fake gateway: the body is not valid JSON', { errorType: 'invalid_request' }).body);
+      }
+      if (!record.auth) return send(res, 401, httpError(401, 'missing or wrong API key', { errorType: 'authentication_error' }).body);
+      const result = typeof speechStep === 'function' ? await speechStep(record.body, { requests }) : speechStep ?? speechAnswer(record.body);
+      return answerSpeech(res, record.body, result);
     }
     if (req.method !== 'POST' || url.pathname !== '/v1/chat/completions') return send(res, 404, { error: { message: `fake gateway: no route ${req.method} ${url.pathname}` } });
 
@@ -253,10 +340,14 @@ export async function startFakeGateway(script = [], { strict = true, port = 0 } 
     url: `http://127.0.0.1:${server.address().port}`,
     requests,
     chats: () => requests.filter((r) => r.path === '/v1/chat/completions'),
+    speeches: () => requests.filter((r) => r.path === '/v1/audio/speech'),
     setScript(next) {
       steps = next;
       chatCount = 0;
       requests.length = 0;
+    },
+    setSpeech(next) {
+      speechStep = next ?? null;
     },
     async close() {
       for (const t of timers) clearTimeout(t);
