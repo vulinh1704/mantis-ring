@@ -3,7 +3,7 @@
 The B2 scan ([2026-11-04-b2-candidates.md](2026-11-04-b2-candidates.md)) found that both Next.js 16 repositories failed every time. The dev server answered, then `mantis look` ended within 5 s with an exit code of 128 or more. The page said "the measurement timed out", and the journal kept neither the exit code nor stderr. This note finds the cause on the VM and shows the fix.
 
 - **When:** 4 Nov, 10:04–10:38 UTC (17:04–17:38 ICT), one task at a time, the VM idle before each.
-- **Where:** the VM, every sandbox under gVisor (`runsc`), with the usual limits: 3 GB of memory with no swap (the tmpfs folders count too), 2 CPUs and 512 processes.
+- **Where:** the VM, every sandbox under gVisor (`runsc`), with the usual limits: 3 GB of memory with no swap (the tmpfs folders count too; since `061f5f4`: 4 GB), 2 CPUs and 512 processes.
 - **The tasks:** admin GitHub tasks with the default matrix (route `/`, mobile and desktop, light and dark, English: 4 screens), labelled `next-look:*` and `proxy-403:*`.
 
 ## No model was called
@@ -102,6 +102,7 @@ How the ray-so run went:
   - When that happens, the page says so. The live log warns before the first look whenever less than 1 GiB is free.
   - What remains is mostly the dev server (about 1 GB, with 4 or 5 Turbopack Node workers) and `node_modules` in RAM (0.63 GB). Ring cannot shrink either without changing the project or the sandbox.
 - **4 GB per sandbox would give heavy apps a margin.** The VM has 16 GB and runs at most 2 tasks, so 2 × 4 GB leaves room for the app (at most 2 GB), Docker and the proxy. That changes a published limit, so it is the owner's call: 3 GB appears in the docs, the live log, the video script and the containment check (`test/containment.mjs` checks against 3072 MB).
+- **Since `061f5f4`: 4 GB**, the owner's decision of 4 Nov. On `e9c598d`, ray-so was measured, at 2.85 GB at most of 4 GB, and the containment check reads its cap from `LIMITS.memory`, Docker and the host cgroup instead of 3072 MB. See [2026-11-04-sandbox-4gb.md](2026-11-04-sandbox-4gb.md).
 - **The samples are unchanged.** They keep Mantis's default concurrency and have no install, so B3 on Lumen runs as before. B2 (CoreUI React, a GitHub task) now opens one group at a time, so its looks take somewhat longer than the scan's 10.6 s.
 
 ## How to repeat

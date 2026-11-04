@@ -109,6 +109,7 @@ Nothing below was changed by this scan.
   - When a look fails, the page names the cause, and the live log warns when memory is short.
 - **Finding 2 is fixed:** omni-tools now gets "The install tried to reach cdn.sheetjs.com, which is outside the sandbox's allowlist (only npm and GitHub)."
 - **What this means for B2:** a GitHub task's looks now open one screen size at a time, so CoreUI's looks take somewhat longer than the 10.6 s above.
+- **Since `061f5f4`: 4 GB per sandbox.** Measured on `e9c598d`, one screen size at a time, CoreUI React's look took 10.2 s alone and 12.7 s next to a ray-so task; the whole task took 21.4 s and 26.1 s. So it is not slower after all. R0 found the same 16 errors and 2 warnings at `2609f59`. See [2026-11-04-sandbox-4gb.md](2026-11-04-sandbox-4gb.md).
 
 ## Recommendation
 
