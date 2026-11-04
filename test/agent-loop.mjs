@@ -1150,17 +1150,22 @@ async function u14() {
     Object.entries(b).map(([k, r]) => `${k} ${r.pass ? 'PASS' : 'FAIL'}`).join(', '));
 
   // The memory check against LIMITS.memory (4 GB): the cap Docker and the host cgroup report must be
-  // that one, and the allocation loop must stop within 512 MB under it. A sandbox still at 3 GB stops
-  // at 2,816 MB under gVisor (3 Nov), so it fails here even when Docker's number is not read.
+  // that one, and the allocation loop must stop within 512 MB under it. Under gVisor the host cgroup
+  // must have been read, since no exit code there shows an OOM kill; under runc it is compared when
+  // read. A sandbox still at 3 GB stops at 2,816 MB under gVisor (3 Nov), so it fails here even when
+  // Docker's number is not read.
   const GiB = 2 ** 30;
   const cap = m.sizeBytes('4g');
   const cgAtCap = { dir: `/cg/system.slice/docker-${id}.scope`, reads: 25, gone: false, error: '', memMax: cap, memStart: 0.1 * GiB, memPeak: cap - 4096,
     pidsMax: 512, pidsStart: 4, pidsPeak: 9, atMemLimit: 5, oom: 1, oomKill: 1, pidsRefused: 0, ms: 3100 };
-  const memBase = { capBytes: cap, runtime: 'runsc', code: 128, timedOut: false, heldMb: 3840, docker: { memory: cap, swap: cap }, usage: null };
+  const memBase = { capBytes: cap, runtime: 'runsc', code: 128, timedOut: false, heldMb: 3840, docker: { memory: cap, swap: cap }, usage: cgAtCap };
   const mv = {
-    gvisor: m.memoryCapVerdict(memBase),
-    runc: m.memoryCapVerdict({ ...memBase, runtime: undefined, code: 137, usage: cgAtCap, container: 'still running' }),
-    stillThree: m.memoryCapVerdict({ ...memBase, heldMb: 2816, docker: { memory: 3 * GiB, swap: 3 * GiB } }),
+    gvisor: m.memoryCapVerdict({ ...memBase, container: 'still running' }),
+    gvisorUnread: m.memoryCapVerdict({ ...memBase, usage: null }),
+    gvisorNoReading: m.memoryCapVerdict({ ...memBase, usage: { ...cgAtCap, reads: 0, error: 'no cgroup with memory.current found' } }),
+    runc: m.memoryCapVerdict({ ...memBase, runtime: undefined, code: 137 }),
+    runcUnread: m.memoryCapVerdict({ ...memBase, runtime: undefined, code: 137, usage: null }),
+    stillThree: m.memoryCapVerdict({ ...memBase, heldMb: 2816, docker: { memory: 3 * GiB, swap: 3 * GiB }, usage: { ...cgAtCap, memMax: 3 * GiB } }),
     stoppedEarly: m.memoryCapVerdict({ ...memBase, heldMb: 2816 }),
     swap: m.memoryCapVerdict({ ...memBase, docker: { memory: cap, swap: 2 * cap } }),
     cgroupThree: m.memoryCapVerdict({ ...memBase, usage: { ...cgAtCap, memMax: 3 * GiB } }),
@@ -1170,10 +1175,12 @@ async function u14() {
     runcOther: m.memoryCapVerdict({ ...memBase, runtime: undefined, code: 1 }),
     over: m.memoryCapVerdict({ ...memBase, heldMb: 4352 }),
   };
-  check('U14 the memory-cap verdict: it passes only at the cap LIMITS sets (4 GB): Docker gives exactly that with no swap, the host cgroup agrees where read, and the loop stopped (137, or any non-zero exit under gVisor) within 512 MB under the cap; a sandbox at 3 GB, swap, an early stop, no stop or an unread limit fail',
+  check('U14 the memory-cap verdict: it passes only at the cap LIMITS sets (4 GB): Docker gives exactly that with no swap, the host cgroup agrees (under gVisor it must have been read; under runc it is compared when read), and the loop stopped (137, or any non-zero exit under gVisor) within 512 MB under the cap; a sandbox at 3 GB, swap, an early stop, no stop, an unread Docker limit or an unread cgroup under gVisor fail',
     m.sizeBytes('4g') === 4 * GiB && m.sizeBytes('512m') === 512 * 2 ** 20 && Number.isNaN(m.sizeBytes('4 GB')) && Number.isNaN(m.sizeBytes(undefined))
-      && mv.gvisor.pass && /held 3840 MB of the 4096 MB cap/.test(mv.gvisor.detail) && /host cgroup not read/.test(mv.gvisor.detail)
-      && mv.runc.pass && /host cgroup memory: .*of 4\.00 GB, at the limit 5 times, 1 OOM, 1 OOM kill/.test(mv.runc.detail) && /container still running$/.test(mv.runc.detail)
+      && mv.gvisor.pass && /held 3840 MB of the 4096 MB cap/.test(mv.gvisor.detail) && /host cgroup memory: .*of 4\.00 GB, at the limit 5 times, 1 OOM, 1 OOM kill/.test(mv.gvisor.detail) && /container still running$/.test(mv.gvisor.detail)
+      && !mv.gvisorUnread.pass && /^the host cgroup was not read, and under gVisor it must be: exit 128/.test(mv.gvisorUnread.detail) && /host cgroup not read$/.test(mv.gvisorUnread.detail)
+      && !mv.gvisorNoReading.pass && /^the host cgroup was not read \(no cgroup with memory\.current found\), and under gVisor it must be: /.test(mv.gvisorNoReading.detail)
+      && mv.runc.pass && /host cgroup memory: .*of 4\.00 GB/.test(mv.runc.detail) && mv.runcUnread.pass && /host cgroup not read$/.test(mv.runcUnread.detail)
       && !mv.stillThree.pass && /not the 4096 MB of LIMITS\.memory/.test(mv.stillThree.detail) && !mv.stoppedEarly.pass && /not between 3584 and 4096 MB/.test(mv.stoppedEarly.detail)
       && !mv.swap.pass && /swap is allowed/.test(mv.swap.detail) && !mv.cgroupThree.pass && /memory\.max is 3072 MB/.test(mv.cgroupThree.detail)
       && !mv.unread.pass && !mv.timedOut.pass && !mv.exit0.pass && !mv.runcOther.pass && !mv.over.pass,

@@ -283,10 +283,11 @@ try {
 
   // The loop prints how many MB it holds after each 256 MB block, so the check can tell "stopped at the
   // cap" from "stopped by something else". The cap is LIMITS.memory (4 GB), read back from Docker and,
-  // while the loop runs, from the host cgroup. runc's OOM killer gives exit 137; gVisor stops the
-  // process inside its own kernel and docker exec reports other codes, so under runsc any non-zero exit
-  // before the time limit counts. Either way the loop must have held more than the cap less 512 MB, and
-  // no more than the cap (memoryCapVerdict in test/measure.mjs).
+  // while the loop runs, from the host cgroup, which under runsc must have been read. runc's OOM killer
+  // gives exit 137; under gVisor docker exec reports other codes (128 on 4 Nov, when the host cgroup's
+  // OOM killer fired and the container kept running), so under runsc any non-zero exit before the time
+  // limit counts. Either way the loop must have held more than the cap less 512 MB, and no more than
+  // the cap (memoryCapVerdict in test/measure.mjs).
   const limits = await run('docker', ['inspect', '-f', '{{.HostConfig.Memory}} {{.HostConfig.MemorySwap}}', box.name]);
   const [dockerMemory, dockerSwap] = limits.stdout.trim().split(' ').map(Number);
   const watch = await box.watchUsage().catch(() => null);

@@ -197,9 +197,12 @@ const mbOf = (bytes) => (Number.isFinite(bytes) ? `${Math.round(bytes / 2 ** 20)
  * (`capBytes`):
  * - Docker gives the container exactly that much memory, and no swap on top (HostConfig.Memory and
  *   HostConfig.MemorySwap);
- * - the host cgroup, when it was read, has that memory.max;
+ * - the host cgroup has that memory.max. Under gVisor it must have been read, since the exit code
+ *   there shows no OOM kill and the cgroup is the reading of the cap from outside the sandbox. Under
+ *   runc, where 137 is the cgroup's own OOM kill, it is compared when it was read;
  * - the loop was stopped before the check's time limit: exit 137 (runc's OOM killer), or under gVisor
- *   any other non-zero exit, since gVisor stops it inside its own kernel;
+ *   any other non-zero exit (128 on 4 Nov, when the host cgroup's OOM killer fired once and the
+ *   container kept running);
  * - it held more than the cap less 512 MB, and no more than the cap, when it stopped. So the cap
  *   stopped it, and not a lower limit: a sandbox still at 3 GB stops at 2,816 MB (4 Nov, under gVisor).
  * @param {{capBytes: number, runtime?: string, code: number|null, timedOut: boolean, heldMb: number,
@@ -213,6 +216,7 @@ export function memoryCapVerdict({ capBytes, runtime, code, timedOut, heldMb, do
   if (!docker || docker.memory !== capBytes) why.push(`Docker gives the sandbox ${docker ? mbOf(docker.memory) : 'an unknown amount'}, not the ${capMb} MB of LIMITS.memory`);
   if (docker && docker.swap !== docker.memory) why.push(`swap is allowed (memory and swap together ${mbOf(docker.swap)})`);
   if (read && usage.memMax !== capBytes) why.push(`the host cgroup's memory.max is ${mbOf(usage.memMax)}, not ${capMb} MB`);
+  if (!read && runtime === 'runsc') why.push(`the host cgroup was not read${usage?.error ? ` (${usage.error})` : ''}, and under gVisor it must be`);
   const stopped = !timedOut && (code === 137 || (runtime === 'runsc' && Number.isInteger(code) && code !== 0));
   if (!stopped) why.push(timedOut ? 'the loop was still running at the time limit' : `exit ${code} does not show a stop at the cap`);
   if (!(heldMb > capMb - 512 && heldMb <= capMb)) why.push(`it held ${heldMb} MB when it stopped, not between ${capMb - 512} and ${capMb} MB`);
