@@ -5,7 +5,8 @@
 // chat() against the fake gateway, run() with UTF-8 output, and the PNG helpers once they exist;
 // U11 drives the sandbox's own network (create, destroy, clean-up) against a fake docker; U12 checks
 // the GitHub path's decisions (package manager, start command, refusals, setup sentences).
-// U13 checks the bench's pressure arm (only the task message changes). Without flags it also runs the
+// U13 checks the bench's pressure arm (only the task message changes). U14 checks how the containment
+// suites judge what they measure (test/measure.mjs). Without flags it also runs the
 // sandbox scenarios (§6.2, S1-S11) on the Lumen sample with a one-cell matrix: an honest fix, a
 // cover-up with the gate on and off, a measurement tamper, paths out of the project, every cap (the
 // soft stop of a model call included), malformed tool-call arguments, an inference error, a dev server
@@ -1021,6 +1022,83 @@ async function u13() {
     `${refused.status}: ${refused.error}; sandboxes ${made}, model calls ${called}`);
 }
 
+/**
+ * U14: how containment.mjs and scenes.mjs judge what they measure (test/measure.mjs), with no Docker:
+ * which connect results count as "not reached", the host cgroup reader, and the process-cap verdicts,
+ * where a sandbox that stopped for a reason nobody measured must fail.
+ */
+async function u14() {
+  const m = await load('./measure.mjs');
+  if (!m) return;
+  const unreachedOnes = ['ENETUNREACH', 'EHOSTUNREACH', 'EADDRNOTAVAIL', 'timeout'].filter((c) => m.unreached(c));
+  const reachedOnes = ['ECONNREFUSED', 'ECONNRESET', 'connected', 'EPERM', 'error'].filter((c) => !m.unreached(c));
+  check('U14 a host counts as not reached only with no route, no such address or no answer; a refusal or a reset is an answer; any IPv6 address of the sandbox is listed',
+    unreachedOnes.length === 4 && reachedOnes.length === 5 && m.ipv6Of(['172.20.0.2']).length === 0
+      && JSON.stringify(m.ipv6Of(['172.20.0.2', 'fe80::42:acff:fe14:2'])) === '["fe80::42:acff:fe14:2"]',
+    `not reached: ${unreachedOnes.join(', ')}; reached: ${reachedOnes.join(', ')}`);
+
+  const id = 'a'.repeat(64);
+  const v2 = m.cgroupDirs(`0::/system.slice/docker-${id}.scope\n`, '/cg');
+  const v1 = m.cgroupDirs(`12:pids:/docker/${id}\n5:cpu,cpuacct:/docker/${id}\n0::/\n`, '/cg');
+  check('U14 /proc/<pid>/cgroup: the v2 folder first, then the v1 pids controller\'s; pids.events gives the refused-fork counter',
+    JSON.stringify(v2) === JSON.stringify([`/cg/system.slice/docker-${id}.scope`]) && v1.length === 2 && v1[1] === `/cg/pids/docker/${id}`
+      && m.parsePidsEvents('max 3\n') === 3 && m.parsePidsEvents('') === 0,
+    `${v2.join(', ')} | ${v1.join(', ')}`);
+
+  // A cgroup folder that fills up, refuses forks and then goes away, as Docker removes it.
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'ring-u14-'));
+  let seen = null;
+  try {
+    writeFileSync(path.join(dir, 'pids.max'), '512\n');
+    writeFileSync(path.join(dir, 'pids.current'), '10\n');
+    writeFileSync(path.join(dir, 'pids.events'), 'max 0\n');
+    const watch = m.watchPids(dir, { everyMs: 5 });
+    await wait(30);
+    writeFileSync(path.join(dir, 'pids.current'), '512\n');
+    writeFileSync(path.join(dir, 'pids.events'), 'max 4\n');
+    await wait(40);
+    rmSync(dir, { recursive: true, force: true });
+    await wait(30);
+    seen = watch.stop();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  check('U14 watchPids keeps what the cgroup showed before it went away: the limit, the most processes at once and the refused forks',
+    seen?.limit === 512 && seen?.peak === 512 && seen?.refusedForks === 4 && seen?.gone === true && seen?.reads > 2
+      && m.capMeasured(seen, 512) && !m.capMeasured(seen, 256) && !m.capMeasured({ ...seen, peak: 300, refusedForks: 0 }, 512),
+    m.pidsText(seen));
+
+  const atCap = { dir: `/cg/system.slice/docker-${id}.scope`, limit: 512, reads: 40, peak: 512, refusedForks: 3, gone: true, error: '' };
+  const below = { ...atCap, peak: 180, refusedForks: 0 };
+  const base = { limit: 512, runtime: 'runsc', ran: true, timedOut: false, secs: 1, progress: m.spawnProgress('ran spawn\n'), pids: 0, statsSecs: '0.1', stopped: { oom: false, exit: '128' }, execNote: 'exec exit 137' };
+  const v = {
+    unmeasured: m.spawnVerdict({ ...base, seen: null, cgWhy: 'no cgroup with pids.current found' }),
+    belowCap: m.spawnVerdict({ ...base, seen: below }),
+    byCgroup: m.spawnVerdict({ ...base, seen: atCap }),
+    byLoop: m.spawnVerdict({ ...base, progress: m.spawnProgress('ran spawn\nstarted 120 refused 0\nstarted 240 refused 17\n'), seen: null, cgWhy: 'x' }),
+    held: m.spawnVerdict({ ...base, timedOut: true, secs: 20, stopped: null, pids: 512, progress: m.spawnProgress('started 250 refused 9000\n'), seen: atCap }),
+    oom: m.spawnVerdict({ ...base, stopped: { oom: true, exit: '137' }, seen: atCap }),
+    runc: m.spawnVerdict({ ...base, runtime: undefined, seen: atCap }),
+  };
+  check('U14 the endless-spawn verdict: a gVisor stop with nothing measured fails as "stopped, cause not measured"; it passes with the cap in the host cgroup or refusals in the loop\'s progress line, or when held until the time limit',
+    !v.unmeasured.pass && /^stopped, cause not measured/.test(v.unmeasured.detail) && !v.belowCap.pass && /^stopped, cause not measured/.test(v.belowCap.detail)
+      && v.byCgroup.pass && /3 forks refused/.test(v.byCgroup.detail) && v.byLoop.pass && /240 started and 17 refused/.test(v.byLoop.detail)
+      && v.held.pass && !v.oom.pass && !v.runc.pass,
+    Object.entries(v).map(([k, r]) => `${k} ${r.pass ? 'PASS' : 'FAIL'}`).join(', '));
+
+  const bomb = { limit: 512, runtime: 'runsc', pids: 0, stderr: 'Error response from daemon: container is not running', startedAll: false, stopped: { oom: false, exit: '128' } };
+  const b = {
+    unmeasured: m.forkBombVerdict({ ...bomb, seen: null, cgWhy: 'x' }),
+    byCgroup: m.forkBombVerdict({ ...bomb, seen: atCap }),
+    byShell: m.forkBombVerdict({ ...bomb, stderr: 'sh: 1: Cannot fork', seen: null }),
+    runc: m.forkBombVerdict({ ...bomb, runtime: undefined, stopped: null, pids: 512, stderr: 'sh: 1: Cannot fork', seen: atCap }),
+    allStarted: m.forkBombVerdict({ ...bomb, startedAll: true, stopped: null, pids: 700, seen: null }),
+  };
+  check('U14 the fork-bomb verdict follows the same rule: an unmeasured gVisor stop fails; the cap in the host cgroup or a refused fork passes; 700 processes fail',
+    !b.unmeasured.pass && /^stopped, cause not measured/.test(b.unmeasured.detail) && b.byCgroup.pass && b.byShell.pass && b.runc.pass && !b.allStarted.pass,
+    Object.entries(b).map(([k, r]) => `${k} ${r.pass ? 'PASS' : 'FAIL'}`).join(', '));
+}
+
 // ---------------------------------------------------------------------------------------------
 // Sandbox scenarios (Docker; runc locally, runsc on the VM)
 // ---------------------------------------------------------------------------------------------
@@ -1635,6 +1713,7 @@ try {
   await group('U11', u11);
   await group('U12', u12);
   await group('U13', u13);
+  await group('U14', u14);
   if (!args.unit) await scenarios();
 
   const failed = results.filter((r) => !r.pass);

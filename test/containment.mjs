@@ -7,8 +7,9 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { STALE_NETWORK_MS, Sandbox, TASK_LABEL, run } from '../runner/sandbox.mjs';
+import { LIMITS, STALE_NETWORK_MS, Sandbox, TASK_LABEL, run } from '../runner/sandbox.mjs';
 import { runTask } from '../runner/run-task.mjs';
+import { FORK_REFUSED, UNREACHED, forkBombVerdict, ipv6Of, pidsCgroup, unreached, watchPids } from './measure.mjs';
 
 const results = [];
 const check = (name, pass, detail) => { results.push({ name, pass, detail }); console.log(`${pass ? 'PASS' : 'FAIL'}  ${name}${detail ? `  (${detail})` : ''}`); };
@@ -167,6 +168,7 @@ const firstHost = (subnet) => {
   return m ? `${m[1]}.${m[2]}.${m[3]}.${Number(m[4]) + 1}` : '';
 };
 const PRIVATE = /^(10\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)/;
+const UNREACHED_TEXT = UNREACHED.join(', ');
 /** What the ports of one address got: "22/80/443 timeout" when they agree, else "22 x, 80 y". */
 const byPort = (tries) => {
   const kinds = [...new Set(tries.map((t) => t.tcp))];
@@ -179,9 +181,11 @@ const byPort = (tries) => {
  * has (Node's list: the public one, Docker's other bridges, IPv6 ones). Docker's gateway address for
  * the network is tried too, unless a container holds it: with inhibit_ipv4 Docker does not keep it
  * for the bridge, and the first container on the network, the proxy, gets it. In the sandbox: a TCP
- * connect to each target on HOST_PORTS, all at once, and an ICMP echo to each IPv4 one. The proxy
- * must answer both a TCP connect and its echo, so a probe that cannot reach anything at all does not
- * pass.
+ * connect to each target on HOST_PORTS, all at once, and an ICMP echo to each IPv4 one. A connect
+ * counts as unreached only with no route, no such address or no answer (UNREACHED in measure.mjs);
+ * a refusal or a reset is an answer from the host, so it fails the check. The sandbox must have no
+ * IPv6 address, since the echo goes only to IPv4 targets. The proxy must answer both a TCP connect
+ * and its echo, so a probe that cannot reach anything at all does not pass.
  * @returns {Promise<{bridge: {pass: boolean, detail: string}, reach: {pass: boolean, detail: string}}>}
  */
 async function hostReach(b) {
@@ -219,9 +223,11 @@ async function hostReach(b) {
   const [pingProxy, ...pingHost] = icmp.code === 0 ? icmp.stdout.trim().split(/\s+/) : [];
   const tries = Array.isArray(r.tries) ? r.tries : [];
   const own = Array.isArray(r.own) ? r.own : [];
+  const own6 = ipv6Of(own);
+  const reached = tries.filter((t) => !unreached(t.tcp));
   // The host's own addresses must be known (Node listed at least one IPv4 address), and so must the gateway.
   const reachOk = !r.error && IPV4.test(gateway) && host.some((a) => IPV4.test(a.address)) && tries.length === targets.length * HOST_PORTS.length
-    && tries.every((t) => t.tcp !== 'connected') && r.proxy === 'connected'
+    && reached.length === 0 && own6.length === 0 && r.proxy === 'connected'
     && pingProxy === 'reply' && pingHost.length === v4.length && pingHost.every((x) => x !== 'reply');
   const label = (a) => {
     const what = [a === gateway ? 'gateway' : '', where.get(a) ?? '', IPV4.test(a) && !PRIVATE.test(a) ? 'public' : ''].filter(Boolean).join(', ');
@@ -233,8 +239,9 @@ async function hostReach(b) {
     return `${label(a)}: TCP ${mine.length ? byPort(mine) : 'not tried'}${i >= 0 ? `, ping ${pingHost[i] ?? 'not tried'}` : ''}`;
   });
   const reachDetail = r.error ? `the probe failed (${r.error})`
-    : `${holder ? `${gatewayName} ${gateway} is ${holder}'s, not the host's, so it is not tried; ` : ''}${rows.join('; ')}; `
-      + `the sandbox has ${own.join(' ') || 'no address'}${own.some((a) => !IPV4.test(a)) ? '' : ' (no IPv6)'}; ring-proxy:8888 ${r.proxy}, ping ${pingProxy ?? 'not tried'}`;
+    : `${reached.length ? `REACHED (an answer, not ${UNREACHED_TEXT}): ${reached.map((t) => `${t.address}:${t.port} ${t.tcp}`).join(', ')}; ` : ''}`
+      + `${holder ? `${gatewayName} ${gateway} is ${holder}'s, not the host's, so it is not tried; ` : ''}${rows.join('; ')}; `
+      + `the sandbox has ${own.join(' ') || 'no address'}${own6.length ? ` (IPv6 ${own6.join(' ')}: a sandbox must have none)` : ' (no IPv6)'}; ring-proxy:8888 ${r.proxy}, ping ${pingProxy ?? 'not tried'}`;
   return { bridge: { pass: seen && bridge4.length === 0, detail: bridgeDetail }, reach: { pass: reachOk, detail: reachDetail } };
 }
 
@@ -262,7 +269,7 @@ try {
   // bridge unless told otherwise (inhibit_ipv4), and a sandbox could then connect to the host there.
   const reach = await hostReach(box);
   check('the host has no IPv4 address on a sandbox\'s network (its bridge has none)', reach.bridge.pass, reach.bridge.detail);
-  check(`a sandbox cannot reach the VM host: no address of the host answers TCP on ports ${HOST_PORTS.join(', ')} or a ping (nor does the network's gateway address, when no container holds it), while the proxy answers both`,
+  check(`a sandbox cannot reach the VM host: no address of the host answers TCP on ports ${HOST_PORTS.join(', ')}, not even with a refusal or a reset, or a ping (nor does the network's gateway address, when no container holds it), the sandbox has no IPv6 address, and the proxy answers both`,
     reach.reach.pass, reach.reach.detail);
 
   const gh = await box.exec('git ls-remote https://github.com/vulinh1704/mantis HEAD', { timeoutMs: 30_000 });
@@ -344,27 +351,32 @@ try {
 check('both of their containers are gone after destroy()', pair.length === 2 && (await Promise.all(pair.map((b) => gone(b.name)))).every(Boolean), pair.map((b) => b.name).join(', '));
 
 // Fork bomb last, in its own sandbox: once the cap is hit nothing new can start inside, so the
-// process count is read from the host (the container's cgroup) instead.
+// process count is read from the host: docker stats afterwards, and the container's own cgroup
+// (pids.current and the refused-fork counter in pids.events) every 10 ms while the bomb runs,
+// and at once when the kernel reports a refused fork.
+// Under gVisor the cap also counts the sandbox kernel's own host threads (about two per process
+// inside), so the bomb reaches it after a few hundred processes and the whole sandbox may stop.
+// That passes only when the cap was measured (the cgroup, or a refused fork in the shell's stderr);
+// a stop whose cause was not measured fails (forkBombVerdict()).
 const bomb = await Sandbox.create({ runtime });
 networks.push(bomb.network);
 try {
+  const cgroup = await pidsCgroup(bomb.name);
+  const watch = cgroup.dir ? watchPids(cgroup.dir, { limitDir: cgroup.limitDir }) : null;
   const r = await bomb.exec(`i=0; while [ $i -lt 700 ]; do sleep 60 > /dev/null 2>&1 & i=$((i+1)); done; echo started $i`, { timeoutMs: 60_000 });
   const pids = Number((await run('docker', ['stats', '--no-stream', '--format', '{{.PIDs}}', bomb.name])).stdout.trim());
-  const refused = /fork|resource temporarily unavailable|cannot/i.test(r.stderr);
-  const capped = pids > 0 && pids <= 512 && refused;
-  // Under gVisor the cap also counts the sandbox kernel's own host threads (about two per process
-  // inside), so the bomb reaches it after a few hundred processes and the whole sandbox stops.
-  // That still holds the bomb at the cap; the check only accepts it when fewer than 700 started.
-  let stopped = false;
-  if (!capped && runtime === 'runsc' && !/started 700/.test(r.stdout)) {
+  const startedAll = /started 700/.test(r.stdout);
+  let stopped = null;
+  if (runtime === 'runsc' && !startedAll && !(pids > 0 && pids <= LIMITS.pids && FORK_REFUSED.test(r.stderr))) {
     for (let i = 0; i < 20 && !stopped; i++) {
-      stopped = (await run('docker', ['inspect', '-f', '{{.State.Running}}', bomb.name])).stdout.trim() !== 'true';
-      if (!stopped) await new Promise((ok) => setTimeout(ok, 250));
+      const [running, oom, exit] = (await run('docker', ['inspect', '-f', '{{.State.Running}} {{.State.OOMKilled}} {{.State.ExitCode}}', bomb.name])).stdout.trim().split(' ');
+      if (running === 'false') stopped = { oom: oom === 'true', exit };
+      else await new Promise((ok) => setTimeout(ok, 250));
     }
   }
-  check('process count is capped (fork bomb)', capped || stopped, stopped
-    ? `gVisor: the sandbox stopped at the 512 cap before 700 processes started (${r.stderr.trim().split('\n').pop()})`
-    : `${pids} processes after trying 700; ${refused ? 'further forks refused' : 'no refusal seen'}`);
+  const seen = watch ? watch.stop() : null;
+  const verdict = forkBombVerdict({ limit: LIMITS.pids, runtime, pids, stderr: r.stderr, startedAll, stopped, seen, cgWhy: cgroup.why });
+  check('process count is capped (fork bomb; under gVisor the sandbox may stop at the cap, measured)', verdict.pass, verdict.detail);
 } finally {
   await bomb.destroy();
 }

@@ -15,6 +15,7 @@ import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 import { LIMITS, Sandbox, run } from '../runner/sandbox.mjs';
 import { SetupError, installDeps, runTask, sayInstallFailed } from '../runner/run-task.mjs';
+import { pidsCgroup, spawnProgress, spawnVerdict, watchPids } from './measure.mjs';
 
 const FIXTURES = fileURLToPath(new URL('./fixtures/', import.meta.url));
 const HOSTILE = path.join(FIXTURES, 'hostile-repo');
@@ -138,37 +139,40 @@ const hostOk = (await readFile(canary, 'utf8')) === 'untouched\n'
 check('hostile repo: the host is untouched', hostOk, 'canary, secret file and the fixture itself still in place');
 
 // The spawn loop in its own sandbox: once the process table is full, nothing new can start inside,
-// so the process count is read from the host. Under gVisor the cap also counts the sandbox kernel's
-// own host threads, so the loop sometimes stops the whole sandbox at the cap before the 20 s limit,
-// as the fork bomb in containment.mjs does. That still holds the loop at the cap. The check accepts
-// it only under runsc, when the loop did start, the exec ended before its limit, and Docker then
-// reports the container stopped and not OOM-killed; the detail says that this is what happened.
+// so the process count is read from the host: docker stats after the loop, and the container's own
+// cgroup (pids.current and the refused-fork counter in pids.events) every 10 ms while it runs, and at
+// once when the kernel reports a refused fork, since Docker removes that cgroup with the container.
+// Under gVisor the cap also counts the sandbox kernel's own host threads, so the loop sometimes stops
+// the whole sandbox before the 20 s limit, as the fork bomb in containment.mjs may. That passes only
+// when the cap was measured (the cgroup, or the loop's own progress line); a stop whose cause was not
+// measured fails (spawnVerdict()).
 const spin = await Sandbox.create({ runtime });
 try {
   await spin.copyIn(HOSTILE, '/work/app');
+  const cgroup = await pidsCgroup(spin.name);
+  const watch = cgroup.dir ? watchPids(cgroup.dir, { limitDir: cgroup.limitDir }) : null;
   const t = Date.now();
   const r = await spin.exec('cd /work/app && sh hostile.sh spawn', { timeoutMs: 20_000 });
   const secs = Math.round((Date.now() - t) / 1000);
   const t2 = Date.now();
   const pids = Number((await run('docker', ['stats', '--no-stream', '--format', '{{.PIDs}}', spin.name])).stdout.trim());
-  const answered = ((Date.now() - t2) / 1000).toFixed(1);
-  const last = r.stdout.trim().split('\n').filter((l) => l.startsWith('started ')).pop() ?? 'no progress line';
-  const refused = Number(last.match(/refused (\d+)/)?.[1] ?? 0);
-  const held = r.stdout.includes('ran spawn') && r.timedOut && refused > 0 && pids > 0 && pids <= LIMITS.pids;
+  const statsSecs = ((Date.now() - t2) / 1000).toFixed(1);
+  const ran = r.stdout.includes('ran spawn');
   let stopped = null;
-  if (!held && runtime === 'runsc' && r.stdout.includes('ran spawn') && !r.timedOut) {
+  if (runtime === 'runsc' && ran && !r.timedOut) {
     for (let i = 0; i < 20 && !stopped; i++) {
       const [running, oom, exit] = (await run('docker', ['inspect', '-f', '{{.State.Running}} {{.State.OOMKilled}} {{.State.ExitCode}}', spin.name])).stdout.trim().split(' ');
       if (running === 'false') stopped = { oom: oom === 'true', exit };
       else await sleep(250);
     }
   }
-  const capped = stopped !== null && !stopped.oom;
-  check('hostile repo: an endless spawn loop is held at the process cap (until its time limit, or until gVisor stops the sandbox there)',
-    held || capped,
-    capped
-      ? `gVisor: the sandbox stopped at the ${LIMITS.pids} cap after ${secs}s, before the 20 s limit (container exit ${stopped.exit}, not OOM-killed; last progress "${last}"; ${r.stderr.trim().split('\n').pop() || `exec exit ${r.code}`})`
-      : `${pids} processes (cap ${LIMITS.pids}); last progress "${last}"; cut off after ${secs}s; docker stats answered in ${answered}s${stopped?.oom ? '; the container stopped, OOM-killed' : ''}`);
+  const seen = watch ? watch.stop() : null;
+  const verdict = spawnVerdict({
+    limit: LIMITS.pids, runtime, ran, timedOut: r.timedOut, secs, progress: spawnProgress(r.stdout), pids, statsSecs, stopped, seen,
+    cgWhy: cgroup.why, execNote: r.stderr.trim().split('\n').pop() || `exec exit ${r.code}`,
+  });
+  check('hostile repo: an endless spawn loop is held at the process cap (until its time limit, or until gVisor stops the sandbox there, measured)',
+    verdict.pass, verdict.detail);
 } finally {
   await spin.destroy();
 }
