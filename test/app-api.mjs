@@ -637,7 +637,7 @@ try {
   // The publish bar and the published page (app/publish.mjs), on receipts the fake loop never writes.
   const pub = await import('../app/publish.mjs');
   const passing = { ...fakeReceipt({ id: `t_${'a'.repeat(32)}`, source: { kind: 'sample', name: 'lumen' }, matrix: {}, model: 'm' }), label: 'REAL RUN · Vultr VX1 sea · 2026-11-04 05:12 UTC', publishable: true };
-  const sampleTask = { id: passing.taskId, source: { kind: 'sample', label: 'Lumen (sample site)' } };
+  const sampleTask = { id: passing.taskId, source: { kind: 'sample', label: 'Lumen (sample site)' }, gate: true, promptVariant: 'neutral' };
   const lostOne = { ...passing, counts: { ...passing.counts, lost: 1 } };
   const screens = { ...passing, counts: { ...passing.counts, cellsCompared: 8, cellsExpected: 16 } };
   const noApply = { ...passing, diff: { ...passing.diff, applies: false } };
@@ -645,6 +645,19 @@ try {
     pub.notPublishable(sampleTask, passing) === null && /lost control/.test(pub.notPublishable(sampleTask, lostOne) ?? '')
       && /compared 8 of the 16 screens/.test(pub.notPublishable(sampleTask, screens) ?? '') && /does not apply/.test(pub.notPublishable(sampleTask, noApply) ?? ''),
     [passing, lostOne, screens, noApply].map((r) => pub.notPublishable(sampleTask, r) ?? 'publishable').join(' | '));
+  // /latest/ shows what a public run does, so a bench arm (the pressure message, or the gate off) is never published.
+  const { promptVariant: _variant, ...beforeArms } = passing;
+  const arms = {
+    'pressure task': pub.notPublishable({ ...sampleTask, promptVariant: 'pressure' }, passing),
+    'pressure receipt': pub.notPublishable(sampleTask, { ...passing, promptVariant: 'pressure' }),
+    'gate off (task)': pub.notPublishable({ ...sampleTask, gate: false }, passing),
+    'gate off (receipt)': pub.notPublishable(sampleTask, { ...passing, gate: { ...passing.gate, enabled: false } }),
+    'older run, no variant recorded': pub.notPublishable({ ...sampleTask, promptVariant: null }, beforeArms),
+  };
+  check('the publish bar refuses a bench arm: the pressure task message or the gate off, in the task or its receipt; a run from before the pressure arm (no variant recorded) still passes',
+    [arms['pressure task'], arms['pressure receipt']].every((w) => /pressure task message/.test(w ?? '')) && [arms['gate off (task)'], arms['gate off (receipt)']].every((w) => /gate off/.test(w ?? ''))
+      && arms['older run, no variant recorded'] === null,
+    Object.entries(arms).map(([k, w]) => `${k}: ${w ?? 'publishable'}`).join(' | '));
   const at = '2026-11-04T06:00:00.000Z';
   const page = (task) => pub.runPageHtml({ task, receipt: passing, images: [], selftests: {} });
   const byLink = page({ ...sampleTask, approvedAt: at, approvedWith: 'owner-link' });

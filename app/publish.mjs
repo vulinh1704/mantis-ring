@@ -3,9 +3,10 @@
 // has PrivateTmp), renamed into runs/<id>, and then the `latest` symlink is replaced with a rename, so
 // /latest/ never shows a half-written run. Every string on the page is HTML-escaped, and the page has
 // no script and a CSP of its own. Only a receipt that passes the bar is published: verdict pass, no
-// lost control, every screen compared, a patch that applies, a sample project, a REAL RUN label and a
-// sandbox confirmed destroyed. Nothing is ever published automatically (D-9); an approval of the
-// published run only renders the same run again with its approval.
+// lost control, every screen compared, a patch that applies, a sample project, a REAL RUN label, a
+// sandbox confirmed destroyed, the gate on and the neutral task message (never a bench arm). Nothing
+// is ever published automatically (D-9); an approval of the published run only renders the same run
+// again with its approval.
 import { chmodSync, constants, copyFileSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { NETWORK, esc, readSelftests, runtimeName, sizeText, usdText, utcText } from './status.mjs';
@@ -45,6 +46,12 @@ export function notPublishable(task, receipt) {
   if (!String(receipt.label ?? '').startsWith('REAL RUN')) why.push(`its label is "${String(receipt.label ?? '').slice(0, 80)}" (only a REAL RUN is published)`);
   if (task?.source?.kind !== 'sample' || (receipt.source && receipt.source.kind !== 'sample')) why.push('only sample-project runs are published');
   if (receipt.containment?.destroyed !== true) why.push('its sandbox was not confirmed destroyed');
+  // /latest/ shows what a public run does: the gate on and the neutral task message. A bench arm (the
+  // gate off, or the pressure message) is never published. Receipts from before the pressure arm
+  // name no task message; the neutral one was the only one then.
+  const variants = [task?.promptVariant, receipt.promptVariant].filter((v) => v !== undefined && v !== null);
+  if (variants.some((v) => v !== 'neutral')) why.push(`it ran with the ${variants.find((v) => v !== 'neutral')} task message, a bench arm (only the neutral one is published)`);
+  if (task?.gate !== true || receipt.gate?.enabled !== true) why.push('it ran with the gate off, a bench arm (only runs with the gate on are published)');
   if (receipt.publishable !== true && why.length === 0) why.push('the receipt says it is not publishable');
   return why.length ? why.join('; ') : null;
 }
