@@ -26,6 +26,9 @@
 #   selftest <suite>          POST /admin/selftest (agent-loop | containment | scenes); streams its output
 #                             and exits with the suite's own exit code
 #   logs                      the last 300 lines of the app's journal
+#   mem [seconds]             the VM's memory, read-only (scripts/vm-mem.sh): free -m, then what each container (the
+#                             sandboxes, the proxy), the app, Caddy and Docker hold now, at most and at their limit;
+#                             with seconds (at most 600), first the least memory available over that long
 #   tts <model> <text-file> <out-file> [voice]
 #                             POST /admin/speech: the VM speaks the text file in English (at most 800 characters;
 #                             white space becomes single spaces) with a priced speech model of the catalogue, such
@@ -44,7 +47,7 @@ S=("$SSH_BIN" -i ~/.ssh/vultr_ring_deploy -o IdentitiesOnly=yes -o BatchMode=yes
 APP=http://127.0.0.1:8080
 
 die() { printf 'ring.sh: %s\n' "$*" >&2; exit 1; }
-usage() { sed -n '8,36p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '8,39p' "$0" | sed 's/^# \{0,1\}//'; }
 if [ -n "${RING_SSH:-}" ] && [ ! -x "$RING_SSH" ]; then die "RING_SSH is set but is not an executable file: $RING_SSH"; fi
 if [ "${RING_TEST:-}" = 1 ]; then
   [ "$HOST_ADDR" != "$REAL_HOST" ] || die "RING_TEST=1, but the host is the real VM: set RING_HOST"
@@ -156,6 +159,12 @@ case "$cmd" in
       *) die "the self-test failed: $last" ;;
     esac ;;
   logs) "${S[@]}" 'sudo journalctl -u mantis-ring -n 300 --no-pager' ;;
+  mem)
+    # The script travels on stdin and runs in the VM's sh as deploy; only checked digits reach the
+    # remote command line. deploy is outside the docker group, so it reads the cgroups, not docker stats.
+    secs=${1:-0}
+    { [[ $secs =~ ^[0-9]{1,3}$ ]] && [ "$secs" -le 600 ]; } || die "usage: ring.sh mem [seconds, 0 to 600]"
+    "${S[@]}" "sh -s $secs" < "$(dirname -- "$0")/vm-mem.sh" ;;
   tts)
     { [ "$#" -ge 3 ] && [ "$#" -le 4 ]; } || die "usage: ring.sh tts <model> <text-file> <out-file> [voice]"
     model=$1 textfile=$2 out=$3 voice=${4:-}

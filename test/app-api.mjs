@@ -4,7 +4,8 @@
 // and a fake runFix that finishes (or waits) on command. It checks the routes, the local-admin rule
 // D-4 (loopback peer, no X-Forwarded-For, loopback Host), D-5 (public runs closed), the per-IP and
 // queue limits, approve/patch with the owner token, and SSE replay, and POST /admin/speech (the video's
-// voice: admin only, its text and cost caps, the ledger line) with scripts/ring.sh tts. /status and the
+// voice: admin only, its text and cost caps, the ledger line) with scripts/ring.sh tts, and what
+// scripts/ring.sh mem sends (scripts/vm-mem.sh, the VM's memory, read-only). /status and the
 // speech calls talk to test/fake-gateway.mjs, never to the real inference service. Each check prints
 // PASS or FAIL.
 // Usage: node test/app-api.mjs
@@ -735,6 +736,27 @@ try {
   check('scripts/ring.sh config: RING_ALLOW_PUBLIC=sample opens only publicSampleRuns, github only publicGithubRuns, yes both; the old publicRuns needs yes; closing needs nothing',
     wrong.length === 0 && /RING_ALLOW_PUBLIC=github/.test(refusedGithub.err),
     wrong.join(' | ') || `${cases.length} patches as expected; refused with: ${refusedGithub.err}`);
+
+  // scripts/ring.sh mem sends scripts/vm-mem.sh to the VM's sh on stdin, with only checked digits on the
+  // remote command line. The script itself runs here once for a second: it only reads.
+  const vmMem = fileURLToPath(new URL('../scripts/vm-mem.sh', import.meta.url));
+  const ringMem = async (...args) => {
+    const before = (await readFile(sshLog, 'utf8')).length;
+    const env = { PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin', HOME: stateDir, LANG: 'C.UTF-8', RING_TEST: '1', RING_HOST: '192.0.2.1', RING_SSH: fakeSsh };
+    const r = spawnSync('bash', [ringSh, 'mem', ...args], { encoding: 'utf8', env, timeout: 20_000 });
+    return { code: r.status, sent: (await readFile(sshLog, 'utf8')).slice(before), err: oneLine(r.stderr) };
+  };
+  const memScript = await readFile(vmMem, 'utf8');
+  const memNow = await ringMem();
+  const memWatch = await ringMem('30');
+  const memBad = [await ringMem('abc'), await ringMem('601'), await ringMem('5;id')];
+  const memHere = spawnSync('sh', [vmMem, '1'], { encoding: 'utf8', timeout: 20_000 });
+  check('scripts/ring.sh mem sends scripts/vm-mem.sh on stdin to the VM\'s sh with only the checked seconds (0 by default, at most 600), and anything else stops before ssh; the script reads free -m and the cgroups, and with seconds the least memory available',
+    memNow.code === 0 && memNow.sent.startsWith('sh -s 0\n') && memNow.sent.includes(memScript)
+      && memWatch.code === 0 && memWatch.sent.startsWith('sh -s 30\n') && memBad.every((r) => r.code !== 0 && r.sent === '' && /usage: ring\.sh mem/.test(r.err))
+      && memHere.status === 0 && /^over 1 s: MemAvailable at least \d+ MB \(at \d\d:\d\d:\d\d UTC\)/m.test(memHere.stdout) && /^Mem: /m.test(memHere.stdout)
+      && /^cgroup +now +peak +limit$/m.test(memHere.stdout),
+    `${memNow.code} ${oneLine(memNow.sent.slice(0, 40))} | ${memWatch.code} | bad: ${memBad.map((r) => `${r.code} ${r.err}`).join(' / ')} | here: ${memHere.status} ${oneLine(memHere.stdout.slice(0, 160))} ${oneLine(memHere.stderr)}`);
 
   const pubTry = await admin('POST', `/admin/publish/${id ?? 'x'}`, { body: {} });
   check('POST /admin/publish/:id refuses a TEST RUN receipt (409) and publishes nothing', pubTry.status === 409 && published.length === 0, `${pubTry.status} ${oneLine(pubTry.json?.error ?? pubTry.text)}`);
