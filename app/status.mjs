@@ -222,7 +222,7 @@ function runtimeText(rt) {
 
 /** "gVisor" for runsc, so the literal "runsc" on the page only ever comes from the live runtime check. */
 export const runtimeName = (r) => (r === 'runsc' ? 'gVisor' : String(r ?? ''));
-/** "3 GB" from Docker's "3g". */
+/** "4 GB" from Docker's "4g". */
 export const sizeText = (s) => String(s).replace(/^(\d+)g$/i, '$1 GB').replace(/^(\d+)m$/i, '$1 MB');
 
 /** One self-test result, with the commit it ran on; a result from another commit than the one deployed says so. */

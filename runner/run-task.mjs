@@ -729,7 +729,7 @@ export function installFailure(output, { code = 1, timedOut = false, truncated =
 /**
  * The download caches an install leaves in the sandbox, where every tmpfs folder is RAM: npm's (it
  * also installs pnpm and yarn) and yarn's. Nothing reads them after the install, and a Next.js app's
- * npm cache alone took 0.17 GB of the sandbox's 3 GB. pnpm's store stays: node_modules is hard-linked
+ * npm cache alone took 0.17 GB of the sandbox's memory. pnpm's store stays: node_modules is hard-linked
  * into it, so removing it would free next to nothing.
  */
 export const INSTALL_CACHES = Object.freeze(['/home/ring/.npm/_cacache', '/work/.yarn-cache']);
@@ -1037,7 +1037,9 @@ export async function sandboxSnapshot(box) {
 /**
  * Below this much free memory before the first look, the live log says that measuring may run out
  * of memory. On 4 Nov a look of a Next.js 16 app, one group at a time, took 0.57 GB and 0.61 GB more
- * than the sandbox held before it.
+ * than the sandbox held before it. That is what a look needs, whatever the sandbox's limit, so it
+ * stayed at 1 GiB when the limit went from 3 GB to 4 GB: the free memory is the limit the host
+ * cgroup reports (memory.max) less what is in use.
  */
 export const LOW_MEMORY_BYTES = 2 ** 30;
 
@@ -1049,7 +1051,7 @@ export function memoryWarning(u) {
     + "(the project's files and dependencies count too), so measuring may run out of memory";
 }
 
-/** One reading of the host cgroup: "memory 2.10 GB of 3.00 GB, 85 processes of 512". */
+/** One reading of the host cgroup: "memory 2.10 GB of 4.00 GB, 85 processes of 512". */
 function usageNow(u) {
   const of = (n, f) => (Number.isFinite(n) ? ` of ${f(n)}` : '');
   return `memory ${gbText(u.memPeak)}${of(u.memMax, gbText)}, ${u.pidsPeak} processes${of(u.pidsMax, String)}`;

@@ -155,7 +155,7 @@ export function usageVerdict(u) {
 }
 
 /**
- * One line for the journal: "memory: 1.21 GB at the start, at most 2.91 GB of 3.00 GB, at the limit 4
+ * One line for the journal: "memory: 1.21 GB at the start, at most 2.91 GB of 4.00 GB, at the limit 4
  * times, 0 OOM, 0 OOM kills · processes: 60 at the start, at most 230 of 512, 0 refused · 41 reads in 4.9 s".
  */
 export function usageText(u) {

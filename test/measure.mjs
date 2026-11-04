@@ -5,7 +5,7 @@
 // is reported as such, never as "held at the cap".
 import { readFileSync, watch } from 'node:fs';
 import path from 'node:path';
-import { CGROUP_ROOT, cgroupDirs } from '../runner/cgroup.mjs';
+import { CGROUP_ROOT, cgroupDirs, usageText } from '../runner/cgroup.mjs';
 import { run } from '../runner/sandbox.mjs';
 
 // The runner reads the same cgroups while a look runs (runner/cgroup.mjs); the folder rule is shared.
@@ -180,6 +180,46 @@ export function spawnVerdict({ limit, runtime, ran, timedOut, secs, progress, pi
     return { pass: false, detail: `stopped, cause not measured: ${what}; ${last}; ${cg}` };
   }
   return { pass: false, detail: `${Number.isFinite(pids) ? pids : 'unknown'} processes (cap ${limit}); ${last}; cut off after ${secs}s; docker stats answered in ${statsSecs}s${stopped?.oom ? '; the container stopped, OOM-killed' : ''}; ${cg}` };
+}
+
+// --- The memory cap ------------------------------------------------------------------------------------
+/** Bytes in a Docker size such as LIMITS.memory ("4g", "512m"); NaN for anything else. */
+export function sizeBytes(size) {
+  const m = /^(\d+)([kmg])$/i.exec(String(size ?? ''));
+  return m ? Number(m[1]) * 1024 ** ({ k: 1, m: 2, g: 3 }[m[2].toLowerCase()]) : NaN;
+}
+
+const mbOf = (bytes) => (Number.isFinite(bytes) ? `${Math.round(bytes / 2 ** 20)} MB` : String(bytes));
+
+/**
+ * The containment memory check: an allocation loop in a fresh sandbox takes 256 MB at a time and
+ * prints how many MB it holds. It passes only when the cap it met is the one LIMITS sets
+ * (`capBytes`):
+ * - Docker gives the container exactly that much memory, and no swap on top (HostConfig.Memory and
+ *   HostConfig.MemorySwap);
+ * - the host cgroup, when it was read, has that memory.max;
+ * - the loop was stopped before the check's time limit: exit 137 (runc's OOM killer), or under gVisor
+ *   any other non-zero exit, since gVisor stops it inside its own kernel;
+ * - it held more than the cap less 512 MB, and no more than the cap, when it stopped. So the cap
+ *   stopped it, and not a lower limit: a sandbox still at 3 GB stops at 2,816 MB (4 Nov, under gVisor).
+ * @param {{capBytes: number, runtime?: string, code: number|null, timedOut: boolean, heldMb: number,
+ *   docker: {memory: number, swap: number}|null, usage: import('../runner/cgroup.mjs').Usage|null, container?: string}} o
+ * @returns {{pass: boolean, detail: string}}
+ */
+export function memoryCapVerdict({ capBytes, runtime, code, timedOut, heldMb, docker, usage, container = '' }) {
+  const capMb = Math.round(capBytes / 2 ** 20);
+  const read = Boolean(usage) && usage.reads > 0;
+  const why = [];
+  if (!docker || docker.memory !== capBytes) why.push(`Docker gives the sandbox ${docker ? mbOf(docker.memory) : 'an unknown amount'}, not the ${capMb} MB of LIMITS.memory`);
+  if (docker && docker.swap !== docker.memory) why.push(`swap is allowed (memory and swap together ${mbOf(docker.swap)})`);
+  if (read && usage.memMax !== capBytes) why.push(`the host cgroup's memory.max is ${mbOf(usage.memMax)}, not ${capMb} MB`);
+  const stopped = !timedOut && (code === 137 || (runtime === 'runsc' && Number.isInteger(code) && code !== 0));
+  if (!stopped) why.push(timedOut ? 'the loop was still running at the time limit' : `exit ${code} does not show a stop at the cap`);
+  if (!(heldMb > capMb - 512 && heldMb <= capMb)) why.push(`it held ${heldMb} MB when it stopped, not between ${capMb - 512} and ${capMb} MB`);
+  const detail = `exit ${code}${timedOut ? ' (timed out)' : ''}, held ${heldMb} MB of the ${capMb} MB cap when it stopped; `
+    + `Docker: memory ${docker ? mbOf(docker.memory) : 'unknown'}, with swap ${docker ? mbOf(docker.swap) : 'unknown'}; `
+    + `${read ? `host cgroup ${usageText(usage)}` : `host cgroup not read${usage?.error ? ` (${usage.error})` : ''}`}${container ? `; container ${container}` : ''}`;
+  return why.length ? { pass: false, detail: `${why.join('; ')}: ${detail}` } : { pass: true, detail };
 }
 
 /** Lines of a shell's stderr that say a fork was refused (dash, bash, busybox). */

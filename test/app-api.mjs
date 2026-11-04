@@ -99,7 +99,7 @@ function fakeReceipt(task) {
     diff: { files: 1, insertions: 1, deletions: 1, bytes: Buffer.byteLength(PATCH), sha256: null, applies: true },
     vision: { model: null, verdict: 'skipped', agree: 0, pairs: [] },
     summary: { text: 'Fake run.', note: "the model's own words, not measured" },
-    containment: { runtime: 'runc', sandbox: 'ring-00000000', limits: { memory: '3g', cpus: '2', pids: 512 }, network: 'ring-internal → ring-proxy (allowlist)', destroyed: true, goneCheck: 'docker ps -a: gone' },
+    containment: { runtime: 'runc', sandbox: 'ring-00000000', limits: { memory: '4g', cpus: '2', pids: 512 }, network: 'ring-internal → ring-proxy (allowlist)', destroyed: true, goneCheck: 'docker ps -a: gone' },
     mantis: { version: '0.7.1', baselineRunId: '2026-11-04T05-00-00', finalRunId: '2026-11-04T05-01-00', comparedWith: 'baseline run (R0)' },
     verdict: 'pass', publishable: false, promptVersion: 'ring-2', promptVariant: task.promptVariant ?? 'neutral',
   };
@@ -501,11 +501,14 @@ try {
   const unknownKey = await admin('POST', '/admin/config', { body: { nope: 1 } });
   const badValue = await admin('POST', '/admin/config', { body: { publicSampleRuns: 'yes' } });
   const oldOpen = await admin('POST', '/admin/config', { body: { publicRuns: true } });
+  // Each sandbox may hold 4 GB, so the VM's 16 GB takes 2 at once, no longer 3.
+  const threeAtOnce = await admin('POST', '/admin/config', { body: { maxRunning: 3 } });
   const stillShut = await admin('GET', '/admin/config');
-  check('/admin/config refuses unknown keys, bad values and the old {publicRuns:true}, which no longer says what to open (400)',
+  check('/admin/config refuses unknown keys, bad values, maxRunning 3 (4 GB sandboxes on a 16 GB VM) and the old {publicRuns:true}, which no longer says what to open (400)',
     unknownKey.status === 400 && badValue.status === 400 && oldOpen.status === 400 && /publicSampleRuns/.test(oldOpen.json?.error ?? '')
+      && threeAtOnce.status === 400 && /maxRunning must be 1 or 2 .*4 GB.*16 GB/.test(threeAtOnce.json?.error ?? '') && stillShut.json?.maxRunning === 2
       && stillShut.json?.publicSampleRuns === false && stillShut.json?.publicGithubRuns === false,
-    `${unknownKey.status}, ${badValue.status}, ${oldOpen.status} ${oneLine(oldOpen.json?.error)}`);
+    `${unknownKey.status}, ${badValue.status}, ${oldOpen.status} ${oneLine(oldOpen.json?.error)}; maxRunning 3: ${threeAtOnce.status} ${oneLine(threeAtOnce.json?.error)}`);
   const longer = await admin('POST', '/admin/config', { body: { caps: { wallClockSec: 1500 } } });
   const cfgLonger = await visitor('203.0.113.1', 'GET', '/api/config');
   const back = await admin('POST', '/admin/config', { body: { caps: { wallClockSec: 900 } } });

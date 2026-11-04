@@ -4,9 +4,10 @@
 // path rules, tool-call parsing, the receipt line and verdicts, the check messages, the tamper guard,
 // chat() against the fake gateway, run() with UTF-8 output, and the PNG helpers once they exist;
 // U11 drives the sandbox's own network (create, destroy, clean-up) against a fake docker; U12 checks
-// the GitHub path's decisions (package manager, start command, refusals, setup sentences).
+// the GitHub path's decisions (package manager, start command, refusals, setup sentences), and the
+// limits a sandbox runs with (4 GB of memory, no swap).
 // U13 checks the bench's pressure arm (only the task message changes). U14 checks how the containment
-// suites judge what they measure (test/measure.mjs). U15 checks the seeded gate scene (the stand-in's
+// suites judge what they measure (test/measure.mjs), the memory cap included. U15 checks the seeded gate scene (the stand-in's
 // turns, the SEEDED label, no publish, no place in the bench's tables, the stop when the scene does not
 // play). U16 checks the admin-only Atlas sample and what its host-side grader refuses. U17 checks an
 // Atlas run's receipt (never publishable) and how bench/table.mjs grades it. U18 checks how a failed look
@@ -646,6 +647,15 @@ async function u11() {
         && made[0] >= 0 && made[0] < made[1] && made[1] < made[2],
       `${a.name} on ${a.network}; ring-proxy ${na?.members?.['ring-proxy']}; --add-host ${ca?.addHost?.join(',')}`);
 
+    // The limits each sandbox runs with (LIMITS): 4 GB of memory and no swap on top, since 4 Nov (3 GB
+    // before); the tmpfs folders, which live in that memory, keep their sizes.
+    const runLine = s.log.find((l) => l.startsWith(`run -d --name ${a.name}`)) ?? '';
+    check('U11 create(): the sandbox runs with LIMITS: 4 GB of memory with no swap (--memory 4g --memory-swap 4g), 2 CPUs, 512 processes, and tmpfs /work 2g, /tmp 512m, /home/ring 1g, shm 512m',
+      sandbox.LIMITS?.memory === '4g' && runLine.includes(' --memory 4g --memory-swap 4g --cpus 2 --pids-limit 512 ')
+        && runLine.includes(' --tmpfs /work:rw,exec,size=2g,') && runLine.includes(' --tmpfs /tmp:rw,exec,size=512m,') && runLine.includes(' --tmpfs /home/ring:rw,exec,size=1g,')
+        && runLine.includes(' --shm-size 512m '),
+      `LIMITS ${JSON.stringify(sandbox.LIMITS)}; ${runLine.match(/--memory \S+ --memory-swap \S+ --cpus \S+ --pids-limit \S+/)?.[0] ?? 'no --memory flags in the docker run line'}`);
+
     const b = await Sandbox.create({ labels: { 'mantis-ring.owner': 'app', 'mantis-ring.task': 't_u11b' } });
     s = state();
     check('U11 a second sandbox gets a second network: ring-proxy is on both, each container on its own only',
@@ -1138,6 +1148,36 @@ async function u14() {
   check('U14 the fork-bomb verdict follows the same rule: an unmeasured gVisor stop fails; the cap in the host cgroup or a refused fork passes; 700 processes fail',
     !b.unmeasured.pass && /^stopped, cause not measured/.test(b.unmeasured.detail) && b.byCgroup.pass && b.byShell.pass && b.runc.pass && !b.allStarted.pass,
     Object.entries(b).map(([k, r]) => `${k} ${r.pass ? 'PASS' : 'FAIL'}`).join(', '));
+
+  // The memory check against LIMITS.memory (4 GB): the cap Docker and the host cgroup report must be
+  // that one, and the allocation loop must stop within 512 MB under it. A sandbox still at 3 GB stops
+  // at 2,816 MB under gVisor (3 Nov), so it fails here even when Docker's number is not read.
+  const GiB = 2 ** 30;
+  const cap = m.sizeBytes('4g');
+  const cgAtCap = { dir: `/cg/system.slice/docker-${id}.scope`, reads: 25, gone: false, error: '', memMax: cap, memStart: 0.1 * GiB, memPeak: cap - 4096,
+    pidsMax: 512, pidsStart: 4, pidsPeak: 9, atMemLimit: 5, oom: 1, oomKill: 1, pidsRefused: 0, ms: 3100 };
+  const memBase = { capBytes: cap, runtime: 'runsc', code: 128, timedOut: false, heldMb: 3840, docker: { memory: cap, swap: cap }, usage: null };
+  const mv = {
+    gvisor: m.memoryCapVerdict(memBase),
+    runc: m.memoryCapVerdict({ ...memBase, runtime: undefined, code: 137, usage: cgAtCap, container: 'still running' }),
+    stillThree: m.memoryCapVerdict({ ...memBase, heldMb: 2816, docker: { memory: 3 * GiB, swap: 3 * GiB } }),
+    stoppedEarly: m.memoryCapVerdict({ ...memBase, heldMb: 2816 }),
+    swap: m.memoryCapVerdict({ ...memBase, docker: { memory: cap, swap: 2 * cap } }),
+    cgroupThree: m.memoryCapVerdict({ ...memBase, usage: { ...cgAtCap, memMax: 3 * GiB } }),
+    unread: m.memoryCapVerdict({ ...memBase, docker: null }),
+    timedOut: m.memoryCapVerdict({ ...memBase, runtime: undefined, code: 137, timedOut: true }),
+    exit0: m.memoryCapVerdict({ ...memBase, code: 0 }),
+    runcOther: m.memoryCapVerdict({ ...memBase, runtime: undefined, code: 1 }),
+    over: m.memoryCapVerdict({ ...memBase, heldMb: 4352 }),
+  };
+  check('U14 the memory-cap verdict: it passes only at the cap LIMITS sets (4 GB): Docker gives exactly that with no swap, the host cgroup agrees where read, and the loop stopped (137, or any non-zero exit under gVisor) within 512 MB under the cap; a sandbox at 3 GB, swap, an early stop, no stop or an unread limit fail',
+    m.sizeBytes('4g') === 4 * GiB && m.sizeBytes('512m') === 512 * 2 ** 20 && Number.isNaN(m.sizeBytes('4 GB')) && Number.isNaN(m.sizeBytes(undefined))
+      && mv.gvisor.pass && /held 3840 MB of the 4096 MB cap/.test(mv.gvisor.detail) && /host cgroup not read/.test(mv.gvisor.detail)
+      && mv.runc.pass && /host cgroup memory: .*of 4\.00 GB, at the limit 5 times, 1 OOM, 1 OOM kill/.test(mv.runc.detail) && /container still running$/.test(mv.runc.detail)
+      && !mv.stillThree.pass && /not the 4096 MB of LIMITS\.memory/.test(mv.stillThree.detail) && !mv.stoppedEarly.pass && /not between 3584 and 4096 MB/.test(mv.stoppedEarly.detail)
+      && !mv.swap.pass && /swap is allowed/.test(mv.swap.detail) && !mv.cgroupThree.pass && /memory\.max is 3072 MB/.test(mv.cgroupThree.detail)
+      && !mv.unread.pass && !mv.timedOut.pass && !mv.exit0.pass && !mv.runcOther.pass && !mv.over.pass,
+    Object.entries(mv).map(([k, r]) => `${k} ${r.pass ? 'PASS' : 'FAIL'}`).join(', '));
 }
 
 /**
@@ -1628,21 +1668,27 @@ async function u18() {
     s.join(' | '));
 
   // The live log warns before the first look when less than 1 GiB is free (ray-so on 4 Nov: 2.28 GB of 3 GB before, 2.89 GB at most during it).
+  // The threshold is what a look needs, not a share of the limit: with today's 4 GB the same 2.28 GB
+  // leaves 1.72 GB and no warning, while 3.10 GB of 4 GB does warn.
+  const GB4 = 4 * 2 ** 30;
   const warnings = {
     raySo: rt.memoryWarning(usageOf({ memPeak: 2.28 * 2 ** 30 })),
     shadcn: rt.memoryWarning(usageOf({ memPeak: 1.78 * 2 ** 30 })),
     unread: rt.memoryWarning({ reads: 0 }), none: rt.memoryWarning(null), noLimit: rt.memoryWarning(usageOf({ memMax: Infinity, memPeak: 2.9 * 2 ** 30 })),
+    raySo4: rt.memoryWarning(usageOf({ memMax: GB4, memPeak: 2.28 * 2 ** 30 })),
+    heavy4: rt.memoryWarning(usageOf({ memMax: GB4, memPeak: 3.1 * 2 ** 30 })),
   };
-  check('U18 memoryWarning: with less than 1 GiB free before the first look the live log says that measuring may run out of memory, naming what is used of what; not otherwise, nor without a reading or a limit',
+  check('U18 memoryWarning: with less than 1 GiB free before the first look the live log says that measuring may run out of memory, naming what is used of what; not otherwise, nor without a reading or a limit; the same 1 GiB at a 4 GB limit',
     warnings.raySo === "memory is short: before the first look the sandbox already uses 2.28 GB of its 3.00 GB (the project's files and dependencies count too), so measuring may run out of memory"
-      && warnings.shadcn === null && warnings.unread === null && warnings.none === null && warnings.noLimit === null && rt.LOW_MEMORY_BYTES === 2 ** 30,
+      && warnings.shadcn === null && warnings.unread === null && warnings.none === null && warnings.noLimit === null && rt.LOW_MEMORY_BYTES === 2 ** 30
+      && warnings.raySo4 === null && /^memory is short: before the first look the sandbox already uses 3\.10 GB of its 4\.00 GB /.test(warnings.heavy4 ?? ''),
     JSON.stringify(warnings));
 
   const plain = (s) => /^[A-Z][^\n]{10,250}\.$/.test(s) && !/\.\s+[A-Z]/.test(s);
   const sentences = Object.fromEntries(['timeout', 'memory', 'pids', 'sandbox', 'killed', 'unreachable', 'nope'].map((r) => [r, loop.baselineFailure({ reason: r })]));
-  check('U18 the public sentence for each reason is one plain sentence; only "timeout" says the measurement timed out, and "memory" names the sandbox\'s memory',
+  check('U18 the public sentence for each reason is one plain sentence; only "timeout" says the measurement timed out, and "memory" names the sandbox\'s memory, 4 GB',
     Object.values(sentences).every(plain) && /timed out/.test(sentences.timeout) && Object.entries(sentences).every(([r, s]) => r === 'timeout' || !/timed out/.test(s))
-      && /ran out of memory \(3 GB RAM/.test(sentences.memory) && /512 processes/.test(sentences.pids),
+      && /ran out of memory \(4 GB RAM/.test(sentences.memory) && /512 processes/.test(sentences.pids),
     Object.values(sentences).join(' | '));
 
   // The host cgroup: a folder that reaches its memory limit, refuses forks and goes away, as Docker removes it.

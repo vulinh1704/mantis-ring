@@ -45,8 +45,8 @@ const ADMIN_MAX = {
 const GITHUB_WALL_CLOCK_SEC = 1200;
 /**
  * How many route × viewport groups a look of a GitHub task opens at once (Mantis's default is 3).
- * On 4 Nov a Next.js 16 app's dev server and files held 1.98 GB of the sandbox's 3 GB before the
- * first look, and four pages at once took the rest within 6 s.
+ * On 4 Nov a Next.js 16 app's dev server and files held 1.98 GB of the sandbox's 3 GB (the limit
+ * then; 4 GB since) before the first look, and four pages at once took the rest within 6 s.
  */
 export const GITHUB_LOOK_CONCURRENCY = 1;
 const PORT = 3000;
@@ -145,7 +145,7 @@ function abortable(promise, signal) {
   });
 }
 
-/** "3 GB RAM, 2 CPUs, 512 processes" from the runner's LIMITS. */
+/** "4 GB RAM, 2 CPUs, 512 processes" from the runner's LIMITS. */
 function limitsText(l = LIMITS) {
   const mem = String(l?.memory ?? '?');
   const memText = /^\d+(\.\d+)?g$/i.test(mem) ? `${parseFloat(mem)} GB` : /^\d+(\.\d+)?m$/i.test(mem) ? `${parseFloat(mem)} MB` : mem;

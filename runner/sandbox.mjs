@@ -15,7 +15,12 @@ import path from 'node:path';
 import { pipeline } from 'node:stream';
 import { usageDir, watchUsage } from './cgroup.mjs';
 
-export const LIMITS = { memory: '3g', cpus: '2', pids: 512, shm: '512m', work: '2g', tmp: '512m', home: '1g' };
+// Memory is 4 GB with no swap (--memory-swap equals --memory), and the tmpfs folders below live in it:
+// their sizes are caps on each folder, not memory set aside. Until 4 Nov 2026 it was 3 GB, and a
+// Next.js 16 app's files, dependencies and dev server left too little of that for Mantis's browser
+// (bench/2026-11-04-nextjs-memory.md). The VM has 16 GB, so the app runs at most 2 sandboxes at once
+// (maxRunning in app/config.mjs).
+export const LIMITS = { memory: '4g', cpus: '2', pids: 512, shm: '512m', work: '2g', tmp: '512m', home: '1g' };
 /** The label of the app's own sandboxes. Self-test sandboxes lack it, so removeAll() never stops a self-test. */
 export const APP_LABEL = 'mantis-ring.owner=app';
 /** On every sandbox container and every sandbox network: Mantis Ring made it (the clean-ups filter on it). */

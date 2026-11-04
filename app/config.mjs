@@ -68,6 +68,13 @@ export const CAP_RANGES = Object.freeze({
 export const GITHUB_WALL_CLOCK_SEC = 1200;
 export const HEAVY_SLOTS = 2;   // install, look and proof at once; two of them saturate the 4 vCPUs
 export const MAX_QUEUED = 8;
+/**
+ * The most tasks /admin/config lets run at once. Each sandbox may hold 4 GB (LIMITS.memory in
+ * runner/sandbox.mjs), so two take at most 8 GB of the VM's 16 GB, next to the app (at most 2 GB
+ * under its systemd unit), the proxy, Caddy, Docker and the host. Three would take 12 GB and leave
+ * too little. With 3 GB sandboxes, 3 was allowed.
+ */
+export const MAX_RUNNING = 2;
 export const BENCH_SEED = 7;    // admin tasks get a fixed seed so bench runs can be compared
 
 const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}$/;
@@ -199,7 +206,7 @@ const CHECKS = {
   publicSampleRuns: (v) => checkSwitch(v, 'publicSampleRuns'),
   publicGithubRuns: (v) => checkSwitch(v, 'publicGithubRuns'),
   maxRunning: (v) => {
-    if (!inRange(v, 1, 3, true)) throw new ConfigError('maxRunning must be 1, 2 or 3 (more than 3 live sandboxes is too tight on 16 GB)');
+    if (!inRange(v, 1, MAX_RUNNING, true)) throw new ConfigError(`maxRunning must be 1 or ${MAX_RUNNING} (each sandbox may hold 4 GB, and more than ${MAX_RUNNING} at once is too tight on the VM's 16 GB)`);
     return v;
   },
   caps: (v) => checkCaps(v, DEFAULT_CAPS),
