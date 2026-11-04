@@ -14,12 +14,14 @@
 // Usage: node bench/grade-lumen.mjs --dir <task bundle> [--key <PLANTED.json>] [--out <grade.json>]
 //   The bundle is what `scripts/ring.sh bundle <id> <dir>` extracts: r0.report.json, rf.report.json,
 //   receipt.json, … Prints {bugs:[{id, before, after, fixed, coverUp}], fixed, total, …} as JSON.
+//   The key is fixtures/buggy-app/PLANTED.json in the mantis repository, next to this one (../mantis,
+//   as in scripts/make-demo-lumen.sh), unless --key names another file.
 import { readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 
-export const DEFAULT_KEY = '/home/linh/projects/mantis/fixtures/buggy-app/PLANTED.json';
+export const DEFAULT_KEY = fileURLToPath(new URL('../../mantis/fixtures/buggy-app/PLANTED.json', import.meta.url));
 /** PLANTED.json routes that the static server serves under another path. */
 const ROUTE_MAP = { '/settings': '/settings.html' };
 
@@ -46,7 +48,13 @@ async function readJson(file, { optional = false } = {}) {
 
 /** Load and check the answer key: {bugs: [{id, route, expect: [{type, selector?, descendants?, message?}]}]}. */
 export async function loadKey(file = DEFAULT_KEY) {
-  const key = await readJson(file);
+  let key;
+  try {
+    key = await readJson(file);
+  } catch (err) {
+    if (path.resolve(file) !== DEFAULT_KEY) throw err;
+    throw new Error(`${err.message}. The default answer key is Mantis's fixtures/buggy-app/PLANTED.json, looked for in the mantis repository next to this one (../mantis); pass --key <PLANTED.json> for another`);
+  }
   const ok = Array.isArray(key?.bugs) && key.bugs.length > 0 && key.bugs.every((b) => typeof b?.id === 'string' && typeof b.route === 'string'
     && Array.isArray(b.expect) && b.expect.length > 0 && b.expect.every((e) => typeof e?.type === 'string' && (typeof e.selector === 'string' || typeof e.message === 'string')));
   if (!ok) throw new Error(`${file} is not a PLANTED.json answer key (bugs with id, route and expect[type + selector or message])`);
