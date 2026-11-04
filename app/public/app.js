@@ -91,17 +91,28 @@
     const models = [cfg.fixModel, cfg.visionModel].filter((m) => typeof m === 'string' && m);
     $('chip-models').textContent = models.length ? `${cfg.provider || PROVIDER} (${models.join(', ')})` : cfg.provider || PROVIDER;
     showLatest(cfg.latest);
+    // Two switches on the server: runs of the sample, and runs on any public GitHub repository.
     const sample = Array.isArray(cfg.samples) ? cfg.samples[0] : null;
     const button = $('run-sample');
-    if (!cfg.publicRuns || !sample) {
-      $('run-note').textContent = 'Live runs open soon.';
-      button.title = 'Live runs open soon';
-      return;
+    if (cfg.publicSampleRuns === true && sample) {
+      button.disabled = false;
+      button.classList.add('primary');
+      $('run-note').textContent = `${sample.label}. A run takes ${sample.etaText}, and you can follow every step live.`;
+      button.addEventListener('click', () => startRun({ sample: sample.id }, button));
+    } else {
+      const note = cfg.publicGithubRuns === true ? 'Runs of the sample are not open right now.' : 'Live runs open soon.';
+      $('run-note').textContent = note;
+      button.title = note;
     }
-    button.disabled = false;
-    button.classList.add('primary');
-    $('run-note').textContent = `${sample.label}. A run takes ${sample.etaText}, and you can follow every step live.`;
-    button.addEventListener('click', () => startSample(sample.id, button));
+    // The GitHub row is shown only while its switch is open. The server checks the address.
+    if (cfg.publicGithubRuns === true) {
+      const input = $('repo-url');
+      const go = $('run-repo');
+      $('repo-try').hidden = false;
+      const start = () => { if (!go.disabled) startRun({ repo: input.value.trim() }, go); };
+      go.addEventListener('click', start);
+      input.addEventListener('keydown', (e) => { if (e.key === 'Enter') start(); });
+    }
   }
 
   /** Step 1 of the judges' box: the published run's own line, or, before the first publish, where to look instead. */
@@ -121,14 +132,15 @@
     go.classList.remove('primary');
   }
 
-  async function startSample(sampleId, button) {
+  /** Start a public run: `what` is {sample: <id>} or {repo: <address as typed>}. */
+  async function startRun(what, button) {
     const label = button.textContent;
     button.disabled = true;
     button.textContent = 'Starting…';
     showRunError(null);
     try {
       const body = await getJson('/api/tasks', {
-        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sample: sampleId }),
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(what),
       });
       if (!body || !/^t_[0-9a-f]{32}$/.test(body.id)) throw new Error('The demo did not return a run.');
       if (typeof body.ownerToken === 'string') session.set(`ring-owner:${body.id}`, body.ownerToken);

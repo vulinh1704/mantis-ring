@@ -71,7 +71,9 @@ const DEFAULTS = Object.freeze({
     'glm-5.3': { temperature: 1 },
     'glm-5.3-flash': { temperature: 1 },
   },
-  publicRuns: false,                          // D-5: no public route can start a task tonight
+  // D-5: a public route starts a task only once the owner opens its kind, through /admin/config only.
+  publicSampleRuns: false,                    // the sample projects (SAMPLES): the home page's "Run sample"
+  publicGithubRuns: false,                    // any public GitHub repository: opened on its own, later
   maxRunning: 2,
   caps: DEFAULT_CAPS,
   // §4.4, owner decision D6, with app/spend.mjs's key names. USD at list price; the token budget is
@@ -136,6 +138,21 @@ function checkModel(v, name) {
   return v;
 }
 
+function checkSwitch(v, name) {
+  if (typeof v !== 'boolean') throw new ConfigError(`${name} must be true or false`);
+  return v;
+}
+
+/**
+ * Until 4 Nov one switch, publicRuns, opened public runs on the samples and on any GitHub repository
+ * at once. In a config.json that still has it, its value becomes publicSampleRuns (unless the file
+ * names that too), so sample runs stay as they were; GitHub runs have a switch of their own, which
+ * the old key never opens. In a /admin/config patch, publicRuns false still closes both; true is
+ * refused, because it no longer says which kind to open.
+ */
+const LEGACY_PUBLIC = 'publicRuns';
+const SAY_LEGACY_PUBLIC = 'publicRuns was split in two: set publicSampleRuns (the sample projects) and publicGithubRuns (any public GitHub repository); publicRuns false still closes both';
+
 function checkSpendCaps(v) {
   if (!isObject(v)) throw new ConfigError('spendCaps must be an object');
   const out = {};
@@ -162,10 +179,8 @@ const CHECKS = {
     for (const [model, s] of Object.entries(v)) out[checkModel(model, 'a modelSampling key')] = checkSampling(s, `modelSampling.${model}`);
     return out;
   },
-  publicRuns: (v) => {
-    if (typeof v !== 'boolean') throw new ConfigError('publicRuns must be true or false');
-    return v;
-  },
+  publicSampleRuns: (v) => checkSwitch(v, 'publicSampleRuns'),
+  publicGithubRuns: (v) => checkSwitch(v, 'publicGithubRuns'),
   maxRunning: (v) => {
     if (!inRange(v, 1, 3, true)) throw new ConfigError('maxRunning must be 1, 2 or 3 (more than 3 live sandboxes is too tight on 16 GB)');
     return v;
@@ -201,11 +216,24 @@ function loadOverrides() {
     return overrides;
   }
   for (const [key, value] of Object.entries(data)) {
+    if (key === LEGACY_PUBLIC) continue;
     try {
       if (!Object.hasOwn(CHECKS, key)) throw new ConfigError('unknown setting');
       overrides[key] = CHECKS[key](value);
     } catch (err) {
       console.error(`config: ignoring ${key} in ${FILE}: ${err.message}`);
+    }
+  }
+  if (Object.hasOwn(data, LEGACY_PUBLIC)) {
+    const v = data[LEGACY_PUBLIC];
+    if (typeof v !== 'boolean') {
+      console.error(`config: ignoring ${LEGACY_PUBLIC} in ${FILE}: it must be true or false`);
+    } else if (Object.hasOwn(data, 'publicSampleRuns')) {
+      console.error(`config: ${FILE} has both ${LEGACY_PUBLIC} and publicSampleRuns; ${LEGACY_PUBLIC} is ignored`);
+    } else {
+      overrides.publicSampleRuns = v;
+      console.log(`config: ${FILE} has the old switch ${LEGACY_PUBLIC} (${v}): it now sets publicSampleRuns only; `
+        + `publicGithubRuns is ${overrides.publicGithubRuns ?? DEFAULTS.publicGithubRuns}, and the file drops ${LEGACY_PUBLIC} at the next /admin/config change`);
     }
   }
   try {
@@ -224,14 +252,21 @@ export function get() {
 
 /**
  * Change settings (admin only). Unknown keys and invalid values throw ConfigError and change nothing.
- * Object settings are merged: {"caps":{"maxUsd":1.5}} changes one cap and keeps the rest.
+ * Object settings are merged: {"caps":{"maxUsd":1.5}} changes one cap and keeps the rest. The old
+ * switch {"publicRuns":false} closes both public switches; {"publicRuns":true} is refused.
  * @returns the settings in effect afterwards
  */
 export function set(patch) {
   if (!isObject(patch) || Object.keys(patch).length === 0) throw new ConfigError('send a JSON object with at least one setting');
   const current = get();
   const next = { ...loadOverrides() };
-  for (const [key, value] of Object.entries(patch)) {
+  const { [LEGACY_PUBLIC]: legacy, ...rest } = patch;
+  if (Object.hasOwn(patch, LEGACY_PUBLIC)) {
+    if (legacy !== false) throw new ConfigError(SAY_LEGACY_PUBLIC);
+    next.publicSampleRuns = false;
+    next.publicGithubRuns = false;
+  }
+  for (const [key, value] of Object.entries(rest)) {
     if (!Object.hasOwn(CHECKS, key)) throw new ConfigError(`unknown setting: ${key}`);
     next[key] = CHECKS[key](MERGED.has(key) && isObject(value) ? { ...current[key], ...value } : value);
   }

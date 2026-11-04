@@ -9,7 +9,7 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import http from 'node:http';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -233,6 +233,10 @@ try {
     if (r.status !== 200 || r.headers['content-type'] !== want) wrongTypes.push(`${p}: ${r.status} ${r.headers['content-type']}`);
   }
   check('static files have exact MIME types (app.js, app.css, favicon.svg)', wrongTypes.length === 0, wrongTypes.join('; ') || 'all exact');
+  const appJs = (await visitor('203.0.113.1', 'GET', '/app.js')).text;
+  check('the home page keeps the GitHub row hidden until its switch opens; app.js reads publicSampleRuns and publicGithubRuns, never publicRuns',
+    /<li id="repo-try" hidden>/.test(home.text) && /cfg\.publicSampleRuns === true/.test(appJs) && /cfg\.publicGithubRuns === true/.test(appJs) && !/\bpublicRuns\b/.test(appJs),
+    `row hidden: ${/<li id="repo-try" hidden>/.test(home.text)}; app.js mentions publicRuns: ${/\bpublicRuns\b/.test(appJs)}`);
   const st = await visitor('203.0.113.1', 'GET', '/status');
   const stj = await visitor('203.0.113.1', 'GET', '/status.json');
   check('GET /status (HTML) and /status.json answer; neither shows the key or the environment',
@@ -240,10 +244,15 @@ try {
       && ![st.text, stj.text].some((t) => t.includes(FAKE_KEY) || t.includes('VULTR_INFERENCE') || t.includes('RING_STATE_DIR')),
     `${st.status} / ${stj.status}; ok=${stj.json?.ok}; inference reachable=${stj.json?.inference?.reachable}`);
   const cfg = await visitor('203.0.113.1', 'GET', '/api/config');
-  check('GET /api/config: provider, models, samples, publicRuns false',
-    cfg.status === 200 && cfg.json?.provider === 'Vultr Serverless Inference' && cfg.json?.publicRuns === false && typeof cfg.json?.fixModel === 'string'
+  check('GET /api/config: provider, models, samples, and both public switches false (publicSampleRuns, publicGithubRuns; no old publicRuns)',
+    cfg.status === 200 && cfg.json?.provider === 'Vultr Serverless Inference' && typeof cfg.json?.fixModel === 'string'
+      && cfg.json?.publicSampleRuns === false && cfg.json?.publicGithubRuns === false && !('publicRuns' in (cfg.json ?? {}))
       && Array.isArray(cfg.json?.samples) && cfg.json.samples.some((s) => s.id === 'lumen' && typeof s.label === 'string' && typeof s.etaText === 'string'),
     oneLine(cfg.text));
+  check('/status.json and /status show both public switches closed',
+    stj.json?.publicSampleRuns === false && stj.json?.publicGithubRuns === false && !('publicRuns' in (stj.json ?? {}))
+      && /Public runs, sample<\/dt><dd><span class="muted">not open yet/.test(st.text) && /Public runs, GitHub repositories<\/dt><dd><span class="muted">not open yet/.test(st.text),
+    `status.json: sample ${stj.json?.publicSampleRuns}, GitHub ${stj.json?.publicGithubRuns}`);
   const unknown = await visitor('203.0.113.1', 'GET', `/api/tasks/t_${'f'.repeat(32)}`);
   const badId = await visitor('203.0.113.1', 'GET', '/api/tasks/..%2F..%2Fetc%2Fpasswd');
   check('unknown or malformed task ids give 404 with {error, more:"/latest/"}', unknown.status === 404 && plainError(unknown) && badId.status === 404,
@@ -277,22 +286,24 @@ try {
   const countBefore = listOf(before).length;
   const hidden = [];
   for (const [method, p, body] of [['GET', '/admin/config'], ['GET', '/admin/tasks'], ['GET', '/admin/spend'], ['POST', '/admin/tasks', { sample: 'lumen' }],
-    ['POST', '/admin/config', { publicRuns: true }], ['POST', '/admin/selftest', { suite: 'agent-loop' }], ['POST', '/admin/probe', { models: ['fake-coder'] }]]) {
+    ['POST', '/admin/config', { publicSampleRuns: true, publicGithubRuns: true }], ['POST', '/admin/selftest', { suite: 'agent-loop' }], ['POST', '/admin/probe', { models: ['fake-coder'] }]]) {
     const r = await visitor('203.0.113.7', method, p, body === undefined ? {} : { body });
     if (r.status !== 404) hidden.push(`${method} ${p}: ${r.status}`);
   }
   const after = await admin('GET', '/admin/tasks');
   const cfgAfter = await admin('GET', '/admin/config');
   check('A1 every /admin/* route answers 404 through Caddy and changes nothing',
-    hidden.length === 0 && listOf(after).length === countBefore && cfgAfter.json?.publicRuns === false && gw.chats().length === 0,
-    hidden.join('; ') || `7 routes hidden; tasks ${countBefore} → ${listOf(after).length}; publicRuns ${cfgAfter.json?.publicRuns}`);
+    hidden.length === 0 && listOf(after).length === countBefore && cfgAfter.json?.publicSampleRuns === false && cfgAfter.json?.publicGithubRuns === false && gw.chats().length === 0,
+    hidden.join('; ') || `7 routes hidden; tasks ${countBefore} → ${listOf(after).length}; public switches ${cfgAfter.json?.publicSampleRuns}/${cfgAfter.json?.publicGithubRuns}`);
 
   // --- A2 / D-5: public runs are closed --------------------------------------------------------------
   const closed = await visitor('203.0.113.8', 'POST', '/api/tasks', { body: { sample: 'lumen' } });
+  const closedRepo = await visitor('203.0.113.8', 'POST', '/api/tasks', { body: { repo: 'https://github.com/vitejs/vite' } });
   const afterClosed = listOf(await admin('GET', '/admin/tasks')).length;
-  check('A2 POST /api/tasks answers 503 with a sentence while publicRuns is false, and starts nothing',
-    closed.status === 503 && plainError(closed) && /open/i.test(closed.json?.error ?? '') && afterClosed === countBefore && fake.seen.length === 0,
-    `${closed.status} ${oneLine(closed.text)}`);
+  check('A2 POST /api/tasks answers 503 with a sentence while both public switches are closed, for the sample and for a repository, and starts nothing',
+    closed.status === 503 && plainError(closed) && /open/i.test(closed.json?.error ?? '') && closedRepo.status === 503 && closedRepo.json?.error === closed.json?.error
+      && afterClosed === countBefore && fake.seen.length === 0,
+    `${closed.status} ${oneLine(closed.text)}; repository ${closedRepo.status}`);
 
   // --- An admin task through the fake loop -----------------------------------------------------------
   const created = await admin('POST', '/admin/tasks', { body: { sample: 'lumen', gate: false, label: 'app-api test' } });
@@ -376,11 +387,32 @@ try {
 
   // --- A3 / A4 and the public limits, with public runs switched on ------------------------------------
   const unknownKey = await admin('POST', '/admin/config', { body: { nope: 1 } });
-  const badValue = await admin('POST', '/admin/config', { body: { publicRuns: 'yes' } });
-  check('/admin/config refuses unknown keys and bad values (400)', unknownKey.status === 400 && badValue.status === 400, `${unknownKey.status}, ${badValue.status}`);
-  const open = await admin('POST', '/admin/config', { body: { publicRuns: true } });
+  const badValue = await admin('POST', '/admin/config', { body: { publicSampleRuns: 'yes' } });
+  const oldOpen = await admin('POST', '/admin/config', { body: { publicRuns: true } });
+  const stillShut = await admin('GET', '/admin/config');
+  check('/admin/config refuses unknown keys, bad values and the old {publicRuns:true}, which no longer says what to open (400)',
+    unknownKey.status === 400 && badValue.status === 400 && oldOpen.status === 400 && /publicSampleRuns/.test(oldOpen.json?.error ?? '')
+      && stillShut.json?.publicSampleRuns === false && stillShut.json?.publicGithubRuns === false,
+    `${unknownKey.status}, ${badValue.status}, ${oldOpen.status} ${oneLine(oldOpen.json?.error)}`);
+  const open = await admin('POST', '/admin/config', { body: { publicSampleRuns: true } });
   const cfgOpen = await visitor('203.0.113.1', 'GET', '/api/config');
-  check('POST /admin/config {publicRuns:true} switches public runs on', open.status === 200 && cfgOpen.json?.publicRuns === true, `${open.status}; /api/config publicRuns ${cfgOpen.json?.publicRuns}`);
+  const stOpen = await visitor('203.0.113.1', 'GET', '/status.json');
+  check('POST /admin/config {publicSampleRuns:true} opens runs of the sample only; /api/config and /status.json say so',
+    open.status === 200 && cfgOpen.json?.publicSampleRuns === true && cfgOpen.json?.publicGithubRuns === false
+      && stOpen.json?.publicSampleRuns === true && stOpen.json?.publicGithubRuns === false,
+    `${open.status}; /api/config sample ${cfgOpen.json?.publicSampleRuns}, GitHub ${cfgOpen.json?.publicGithubRuns}`);
+  const seenBefore = fake.seen.length;
+  const repoShut = await visitor('203.0.113.26', 'POST', '/api/tasks', { body: { repo: 'https://github.com/vitejs/vite' } });
+  check('with only the sample switch open, a GitHub repository → 503 with its own sentence, and nothing starts',
+    repoShut.status === 503 && plainError(repoShut) && /GitHub repository are not open/.test(repoShut.json?.error ?? '') && fake.seen.length === seenBefore,
+    `${repoShut.status} ${oneLine(repoShut.json?.error)}`);
+  const openGithub = await admin('POST', '/admin/config', { body: { publicGithubRuns: true } });
+  const repoRun = await visitor('203.0.113.27', 'POST', '/api/tasks', { body: { repo: 'github.com/vitejs/vite' } });
+  if (repoRun.json?.id) await settle(repoRun.json.id);
+  const repoSeen = fake.seen.find((t) => t.id === repoRun.json?.id);
+  check('POST /admin/config {publicGithubRuns:true} opens runs on a public GitHub repository',
+    openGithub.status === 200 && openGithub.json?.publicGithubRuns === true && repoRun.status === 202 && repoSeen?.source?.kind === 'github' && repoSeen?.source?.label === 'vitejs/vite',
+    `${openGithub.status}; ${repoRun.status} ${oneLine(repoRun.json?.error)}; source ${repoSeen?.source?.kind}:${repoSeen?.source?.label}`);
 
   const plain = await visitor('203.0.113.20', 'POST', '/api/tasks', { body: JSON.stringify({ sample: 'lumen' }), headers: { 'content-type': 'text/plain' } });
   const crossSite = await visitor('203.0.113.21', 'POST', '/api/tasks', { body: { sample: 'lumen' }, headers: { 'sec-fetch-site': 'cross-site' } });
@@ -492,6 +524,39 @@ try {
   const states = [];
   for (const r of fill) if (r.json?.id) states.push(await settle(r.json.id, 15_000));
   check('the queue drains after the runs are released', states.length === 10 && states.every((s) => s === 'done'), states.join(','));
+
+  // The old switch still closes everything, as an operator may type it in a hurry.
+  const oldClose = await admin('POST', '/admin/config', { body: { publicRuns: false } });
+  const shutAgain = await visitor('198.51.100.20', 'POST', '/api/tasks', { body: { sample: 'lumen' } });
+  check('the old {publicRuns:false} still closes both switches; a public start then gets the closed sentence',
+    oldClose.status === 200 && oldClose.json?.publicSampleRuns === false && oldClose.json?.publicGithubRuns === false
+      && shutAgain.status === 503 && /open soon/i.test(shutAgain.json?.error ?? ''),
+    `${oldClose.status}; switches ${oldClose.json?.publicSampleRuns}/${oldClose.json?.publicGithubRuns}; start ${shutAgain.status}`);
+
+  // A config.json from before the split, read by a fresh copy of app/config.mjs: its publicRuns becomes
+  // publicSampleRuns unless the file names that too, GitHub runs stay closed, and the next change drops it.
+  const legacyRead = async (name, data) => {
+    const dir = path.join(stateDir, name);
+    await mkdir(dir, { recursive: true });
+    await writeFile(path.join(dir, 'config.json'), `${JSON.stringify(data)}\n`);
+    const saved = process.env.RING_STATE_DIR;
+    process.env.RING_STATE_DIR = dir;
+    try {
+      const mod = await import(`../app/config.mjs?${name}`);
+      return { mod, dir, cfg: mod.get() };
+    } finally {
+      process.env.RING_STATE_DIR = saved;
+    }
+  };
+  const oldOn = await legacyRead('legacy-open', { publicRuns: true, maxRunning: 2 });
+  oldOn.mod.set({ maxRunning: 1 });
+  const rewritten = JSON.parse(await readFile(path.join(oldOn.dir, 'config.json'), 'utf8'));
+  const both = await legacyRead('legacy-both', { publicRuns: true, publicSampleRuns: false });
+  check('an old config.json with publicRuns true keeps sample runs open and GitHub runs closed; the new key wins; the next change drops publicRuns',
+    oldOn.cfg.publicSampleRuns === true && oldOn.cfg.publicGithubRuns === false && !('publicRuns' in oldOn.cfg)
+      && rewritten.publicSampleRuns === true && !('publicRuns' in rewritten) && rewritten.maxRunning === 1
+      && both.cfg.publicSampleRuns === false && both.cfg.publicGithubRuns === false,
+    `read: sample ${oldOn.cfg.publicSampleRuns}, GitHub ${oldOn.cfg.publicGithubRuns}; rewritten ${JSON.stringify(rewritten)}; with both keys: sample ${both.cfg.publicSampleRuns}`);
 
   const pubTry = await admin('POST', `/admin/publish/${id ?? 'x'}`, { body: {} });
   check('POST /admin/publish/:id refuses a TEST RUN receipt (409) and publishes nothing', pubTry.status === 409 && published.length === 0, `${pubTry.status} ${oneLine(pubTry.json?.error ?? pubTry.text)}`);

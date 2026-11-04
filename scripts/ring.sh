@@ -4,11 +4,12 @@
 # JSON bodies travel on stdin (curl --data-binary @-), never inside the remote command line, and task
 # ids are checked before they are. The owner link that `run` prints is for the owner only: approving
 # a run needs the owner's browser and is refused on this admin channel (and, once the owner sets an
-# approval passphrase on the server, needs that passphrase too).
+# approval passphrase on the server, an admin run needs that passphrase too).
 #
 # Usage: scripts/ring.sh <command> [args]
 #   status                    /status.json
-#   health                    /admin/health (running and queued tasks, Docker, proxy, sandboxes, networks)
+#   health                    /admin/health: running and queued tasks, Docker, the runtime, the proxy, and how
+#                             many of the app's sandboxes and their own networks (ring-task-…) exist; 0 and 0 when idle
 #   probe '<json>'            POST /admin/probe  {"models":[...],"vision":[...]}
 #   run '<json>'              POST /admin/tasks  prints the id, the position and the owner link
 #   watch <id>                live events (SSE) until the task is done; Ctrl-C to stop
@@ -17,7 +18,8 @@
 #   cancel <id>               POST /admin/tasks/<id>/cancel
 #   bundle <id> <localdir>    every file of the task, unpacked into <localdir>
 #   publish <id>              POST /admin/publish/<id>
-#   config ['<json>']         GET, or POST with a patch, /admin/config (publicRuns needs RING_ALLOW_PUBLIC=yes)
+#   config ['<json>']         GET, or POST with a patch, /admin/config. A patch that opens publicSampleRuns or
+#                             publicGithubRuns needs RING_ALLOW_PUBLIC=yes; closing them never does
 #   spend                     /admin/spend
 #   selftest <suite>          POST /admin/selftest (agent-loop | containment | scenes); streams its output
 #                             and exits with the suite's own exit code
@@ -34,7 +36,7 @@ S=("$SSH_BIN" -i ~/.ssh/vultr_ring_deploy -o IdentitiesOnly=yes -o BatchMode=yes
 APP=http://127.0.0.1:8080
 
 die() { printf 'ring.sh: %s\n' "$*" >&2; exit 1; }
-usage() { sed -n '8,25p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '8,28p' "$0" | sed 's/^# \{0,1\}//'; }
 if [ -n "${RING_SSH:-}" ] && [ ! -x "$RING_SSH" ]; then die "RING_SSH is set but is not an executable file: $RING_SSH"; fi
 if [ "${RING_TEST:-}" = 1 ]; then
   [ "$HOST_ADDR" != "$REAL_HOST" ] || die "RING_TEST=1, but the host is the real VM: set RING_HOST"
@@ -109,9 +111,11 @@ case "$cmd" in
   config)
     if [ "$#" -ge 1 ]; then
       need_json "$1"
-      # D-5: opening public runs spends tokens for anyone; it takes a second, deliberate step.
-      if node -e 'process.exit(Object.hasOwn(JSON.parse(process.argv[1]), "publicRuns") ? 0 : 1)' "$1"; then
-        [ "${RING_ALLOW_PUBLIC:-}" = yes ] || die "this patch sets publicRuns. Public runs stay closed (D-5) unless the owner says so: set RING_ALLOW_PUBLIC=yes to send it"
+      # D-5: opening public runs spends tokens for anyone, so it takes a second, deliberate step.
+      # Closing them (false) never does. The old switch publicRuns counts too.
+      if node -e 'const p = JSON.parse(process.argv[1]); const keys = ["publicSampleRuns", "publicGithubRuns", "publicRuns"];
+        process.exit(p !== null && typeof p === "object" && keys.some((k) => Object.hasOwn(p, k) && p[k] !== false) ? 0 : 1)' "$1"; then
+        [ "${RING_ALLOW_PUBLIC:-}" = yes ] || die "this patch opens public runs (publicSampleRuns or publicGithubRuns). They stay closed (D-5) unless the owner says so: set RING_ALLOW_PUBLIC=yes to send it"
       fi
       post /admin/config "$1"
     else

@@ -167,7 +167,8 @@ export async function statusData(ctx) {
     spend: spendSummary(spend, cfg),
     queue: { running: queue.running().length, queued: queue.queued().length, maxRunning: queue.maxRunning, etaSec },
     latest: readLatest(),
-    publicRuns: !!cfg.publicRuns,
+    publicSampleRuns: cfg.publicSampleRuns === true,
+    publicGithubRuns: cfg.publicGithubRuns === true,
     uptimeSec: Math.max(0, Math.round((now() - startedAt) / 1000)),
   };
 }
@@ -291,8 +292,9 @@ export function statusHtml(d) {
     row('Running', esc(`${d.queue.running} of ${d.queue.maxRunning} at once`)),
     row('Waiting', esc(d.queue.queued)),
     // Only a visitor who can start a run needs an ETA; it comes from comparable runs (app/tasks.mjs).
-    ...(d.publicRuns ? [row('A new run would finish in', esc(etaText(d.queue.etaSec)))] : []),
-    row('Public runs', d.publicRuns ? pill(true, 'open', '') : '<span class="muted">not open yet</span>'),
+    ...(d.publicSampleRuns || d.publicGithubRuns ? [row('A new run would finish in', esc(etaText(d.queue.etaSec)))] : []),
+    row('Public runs, sample', d.publicSampleRuns ? pill(true, 'open', '') : '<span class="muted">not open yet</span>'),
+    row('Public runs, GitHub repositories', d.publicGithubRuns ? pill(true, 'open', '') : '<span class="muted">not open yet</span>'),
   ].join('');
 
   const runLink = /^t_[0-9a-f]{32}$/.test(String(d.latest?.taskId ?? '')) ? `<a href="/t/${esc(d.latest.taskId)}">the run's step-by-step log</a>` : '';

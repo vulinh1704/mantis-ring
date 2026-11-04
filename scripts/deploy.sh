@@ -7,16 +7,18 @@
 # the probe, the vision check or the spend ledger, is rolled back to the saved tree. It refuses to
 # restart while a task runs or waits, or a self-test runs (a restart kills them), and ends with the
 # checks a judge would see from outside: the pages answer, gVisor is on, /admin/* is a 404 through
-# Caddy, and public runs are still closed.
+# Caddy, and both public switches (runs of the sample, runs on GitHub repositories) are still closed.
 #
 # Usage: scripts/deploy.sh [--dirty] [--force] [--selftest]
 #   --dirty     deploy uncommitted changes too (app/VERSION.json then says dirty: true)
 #   --force     restart even while a task or a self-test runs, or when the VM's queue cannot be read
 #   --selftest  afterwards, with no task running, run ring-selftest (containment and scenes; every check must pass)
+# Once the owner opens public runs (D-5): RING_ALLOW_PUBLIC=sample accepts open sample runs while
+# GitHub runs must still be closed, and RING_ALLOW_PUBLIC=yes accepts both open.
 # Environment, for tests only: RING_SSH, RING_RSYNC (programs to use instead of ssh and rsync; they
 # must be executable), RING_HOST, RING_URL. With RING_TEST=1 the script refuses to run unless both
 # programs are test stand-ins and the host is not the real VM, so a broken fake can never fall
-# through to the real ssh. RING_ALLOW_PUBLIC=yes skips the "public runs are closed" check (D-5).
+# through to the real ssh.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 REAL_HOST=104.156.252.200
@@ -108,7 +110,7 @@ for arg in "$@"; do
     --dirty) dirty=yes ;;
     --force) force=yes ;;
     --selftest) selftest=yes ;;
-    -h | --help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h | --help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "usage: scripts/deploy.sh [--dirty] [--force] [--selftest]" >&2; exit 64 ;;
   esac
 done
@@ -202,7 +204,7 @@ echo "the app answers /status.json"
 "${S[@]}" 'sudo systemctl status mantis-ring' || true
 
 # 9. From outside, as a judge: the pages answer, gVisor is on, the admin API is not reachable, and
-# public runs are still closed (D-5).
+# both public switches are still closed (D-5), or only what RING_ALLOW_PUBLIC allows is open.
 say "9/11 outside checks ($URL)"
 if hc=$(bash "$HEALTHCHECK" "$URL" --status-grep runsc); then
   echo "$hc"
@@ -213,11 +215,19 @@ fi
 admin_code=$(curl -s -o /dev/null -m 20 -w '%{http_code}' "$URL/admin/health" || true)
 [ "$admin_code" = 404 ] || die "$URL/admin/health answered $admin_code (it must be 404): the admin API may be public. Fix this before anything else."
 echo "/admin/health through Caddy: 404"
-public_runs=$(curl -fsS -m 20 "$URL/api/config" | json_field publicRuns || true)
-if [ "${RING_ALLOW_PUBLIC:-}" != yes ]; then
-  [ "$public_runs" = false ] || die "$URL/api/config says publicRuns is '$public_runs': public runs must stay closed (D-5). Close them with scripts/ring.sh config, or set RING_ALLOW_PUBLIC=yes once the owner opens them."
-fi
-echo "public runs: ${public_runs:-unknown}"
+# Each switch reads true, false, or '' when /api/config did not answer or lacks it (anything but false is open).
+api_config=$(curl -fsS -m 20 "$URL/api/config" || true)
+sample_runs=$(printf '%s' "$api_config" | json_field publicSampleRuns)
+github_runs=$(printf '%s' "$api_config" | json_field publicGithubRuns)
+case "${RING_ALLOW_PUBLIC:-}" in
+  yes) ;;
+  sample)
+    [ "$github_runs" = false ] || die "$URL/api/config says publicGithubRuns is '$github_runs': runs on GitHub repositories must stay closed with RING_ALLOW_PUBLIC=sample (D-5). Close them with scripts/ring.sh config, or set RING_ALLOW_PUBLIC=yes once the owner opens them." ;;
+  *)
+    [ "$sample_runs" = false ] && [ "$github_runs" = false ] \
+      || die "$URL/api/config says publicSampleRuns is '$sample_runs' and publicGithubRuns is '$github_runs': public runs must stay closed (D-5). Close them with scripts/ring.sh config, or set RING_ALLOW_PUBLIC=sample or yes once the owner opens them." ;;
+esac
+echo "public runs: sample ${sample_runs:-unknown}, GitHub ${github_runs:-unknown}"
 
 # 10. Self-tests under gVisor, only with no task running.
 if [ "$selftest" = yes ]; then

@@ -55,6 +55,9 @@ const NORMAL_ENDS = ['finish', 'checks', 'turns', 'time', 'no-tools'];
 // Public answers are one plain sentence each (§4.5).
 const SAY = {
   closed: 'Live runs open soon. Meanwhile, the latest verified run shows a complete result.',
+  // Only one kind of public run is open: these name the other, which the home page offers.
+  closedGithub: 'Runs on your own GitHub repository are not open yet. You can run the sample project from the home page.',
+  closedSample: 'Runs of the sample project are not open right now. You can run a public GitHub repository from the home page.',
   hour: `You have started ${PER_IP.hour} runs in the last hour from this network. Please try again later, or open the latest verified run.`,
   day: `You have started ${PER_IP.day} runs today from this network. Please try again tomorrow, or open the latest verified run.`,
   active: 'You already have a run in progress. Follow it, or wait until it finishes.',
@@ -635,16 +638,21 @@ export function createApp(deps = {}) {
 
   // --- public routes (§4.2) --------------------------------------------------------------------
   async function createPublicTask(c) {
-    if (!config.get().publicRuns) return sendError(c.res, 503, sentence('closed'));   // D-5
+    const cfg = config.get();
+    // D-5: each kind of public run has its own switch, the sample projects and any GitHub repository.
+    if (!cfg.publicSampleRuns && !cfg.publicGithubRuns) return sendError(c.res, 503, sentence('closed'));
     const body = await readJson(c.req);
     if (closing) throw new HttpError(503, SAY.restarting);
     const ip = clientIp(c.req);
     const key = ipKey(ip);
-    // A sandbox that reaches Caddy through the bridge gateway arrives from a private address.
+    // Anything that reaches Caddy from a loopback or private address (a sandbox, the VM itself) is refused.
     if (!key || isLocalIp(ip)) throw new HttpError(403, SAY.local);
+    const wantsRepo = body.repo !== undefined && body.repo !== null;
+    if (wantsRepo && !cfg.publicGithubRuns) throw new HttpError(503, SAY.closedGithub);
+    if (!wantsRepo && !cfg.publicSampleRuns) throw new HttpError(503, SAY.closedSample);
     let spec;
     try {
-      spec = taskFromBody(body, { admin: false, cfg: config.get() });
+      spec = taskFromBody(body, { admin: false, cfg });
     } catch (err) {
       if (err instanceof TaskInputError) throw new HttpError(400, err.message);
       throw err;
@@ -1005,7 +1013,8 @@ export function createApp(deps = {}) {
       const cfg = config.get();
       const etaText = stats.count('sample') >= MIN_ETA_RUNS ? `about ${Math.max(1, Math.round(stats.median('sample') / 60))} min` : 'a few minutes';
       sendJson(c.res, 200, {
-        publicRuns: cfg.publicRuns, provider: PROVIDER, fixModel: cfg.fixModel, visionModel: cfg.visionModel,
+        publicSampleRuns: cfg.publicSampleRuns === true, publicGithubRuns: cfg.publicGithubRuns === true,
+        provider: PROVIDER, fixModel: cfg.fixModel, visionModel: cfg.visionModel,
         samples: Object.entries(SAMPLES).map(([id, s]) => ({ id, label: s.label, etaText })),
         latest: readLatest(),   // null until a run is published
       });
@@ -1208,7 +1217,7 @@ async function main() {
   const host = process.env.HOST || '127.0.0.1';
   app.server.on('error', fatal('listen'));
   app.server.listen(port, host, () => {
-    log(`listening on http://${host}:${app.server.address().port} · runtime ${RUNTIME ?? 'runc (docker default)'} · publicRuns ${cfg.publicRuns} · agent loop ${loop?.runFix ? 'loaded' : 'not installed'}`);
+    log(`listening on http://${host}:${app.server.address().port} · runtime ${RUNTIME ?? 'runc (docker default)'} · public runs: sample ${cfg.publicSampleRuns}, GitHub ${cfg.publicGithubRuns} · agent loop ${loop?.runFix ? 'loaded' : 'not installed'}`);
   });
   setInterval(() => {
     const n = store.prune();
