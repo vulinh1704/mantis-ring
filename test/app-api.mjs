@@ -351,6 +351,63 @@ try {
       `default ${flag(id)}, pressure ${flag(pressuredId)}`);
   }
 
+  // --- The admin-only Atlas sample ----------------------------------------------------------------------
+  const atlas = await admin('POST', '/admin/tasks', { body: { sample: 'atlas', label: 'atlas sample' } });
+  const atlasId = atlas.json?.id;
+  if (atlasId) await settle(atlasId);
+  const atlasSeen = fake.seen.find((t) => t.id === atlasId);
+  const atlasCells = atlasSeen ? ['routes', 'viewports', 'schemes', 'locales'].reduce((n, k) => n * atlasSeen.matrix[k].length, 1) : 0;
+  check('an admin task runs the Atlas sample: its own folder (demo/atlas), its 3 pages, 24 screens, the gate on and the configured model',
+    atlas.status === 202 && atlasSeen?.source?.kind === 'sample' && atlasSeen.source.name === 'atlas' && /\/demo\/atlas\/$/.test(atlasSeen.source.dir ?? '')
+      && JSON.stringify(atlasSeen.matrix.routes) === '["/","/pricing.html","/account.html"]' && atlasCells === 24 && atlasSeen.gate === true && atlasSeen.model === config.get().fixModel,
+    `${atlas.status} ${oneLine(atlas.json?.error)}; ${atlasSeen?.source?.dir}; ${atlasCells} screens`);
+  check('/api/config lists only the public sample: Lumen, never Atlas', cfg.json?.samples?.length === 1 && cfg.json.samples[0].id === 'lumen' && !cfg.text.includes('atlas'),
+    JSON.stringify(cfg.json?.samples ?? null));
+  const sayNoSample = (body) => { try { tasksMod.taskFromBody(body, { admin: false, cfg: config.get() }); return 'accepted'; } catch (err) { return err.message; } };
+  check('a public request body for Atlas gets the same sentence as a sample that does not exist; an admin body may name it',
+    sayNoSample({ sample: 'atlas' }) === tasksMod.SAY_NO_SAMPLE && sayNoSample({ sample: 'nope' }) === tasksMod.SAY_NO_SAMPLE
+      && tasksMod.taskFromBody({ sample: 'atlas' }, { admin: true, cfg: config.get() }).source.name === 'atlas',
+    `public atlas: ${sayNoSample({ sample: 'atlas' })}`);
+
+  // --- The seeded gate scene: a scripted stand-in instead of a model (admin only) ------------------------
+  const { SEEDED_LABEL, SEEDED_MODEL } = await import('../agent/seeded.mjs');
+  const scene = await admin('POST', '/admin/tasks', { body: { sample: 'lumen', seeded: 'cover-up', label: 'seeded scene' } });
+  const sceneId = scene.json?.id;
+  if (sceneId) await settle(sceneId);
+  const sceneSeen = fake.seen.find((t) => t.id === sceneId);
+  const sceneView = sceneId ? recordOf((await visitor('203.0.113.13', 'GET', `/api/tasks/${sceneId}`)).json) : null;
+  check('an admin task may ask for the seeded scene: the loop gets the script, the stand-in, no vision model, the gate on and the neutral message; the run page gets the exact SEEDED label',
+    scene.status === 202 && sceneSeen?.seeded === 'cover-up' && sceneSeen.model === SEEDED_MODEL && sceneSeen.visionModel === null && sceneSeen.gate === true
+      && sceneSeen.promptVariant === 'neutral' && sceneView?.seeded?.label === SEEDED_LABEL && sceneView?.seeded?.model === SEEDED_MODEL && sceneView?.model === SEEDED_MODEL,
+    `${scene.status} ${oneLine(scene.json?.error)}; loop got seeded ${sceneSeen?.seeded}, model ${sceneSeen?.model}; page label ${sceneView?.seeded?.label}`);
+  const sceneRefusals = {
+    atlas: { sample: 'atlas', seeded: 'cover-up' }, repo: { repo: 'https://github.com/vitejs/vite', seeded: 'cover-up' }, 'gate off': { sample: 'lumen', seeded: 'cover-up', gate: false },
+    model: { sample: 'lumen', seeded: 'cover-up', model: 'glm-5.3' }, vision: { sample: 'lumen', seeded: 'cover-up', visionModel: 'qwen3.8-27b' },
+    pressure: { sample: 'lumen', seeded: 'cover-up', promptVariant: 'pressure' }, sampling: { sample: 'lumen', seeded: 'cover-up', sampling: { seed: 8 } },
+    'unknown script': { sample: 'lumen', seeded: 'magic' }, 'not a string': { sample: 'lumen', seeded: true },
+  };
+  const sceneCodes = {};
+  for (const [k, body] of Object.entries(sceneRefusals)) sceneCodes[k] = (await admin('POST', '/admin/tasks', { body })).status;
+  check('a seeded task is refused (400) on Atlas or a repository, and with the gate off, a model, a vision model, the pressure message, sampling or an unknown script',
+    Object.values(sceneCodes).every((c) => c === 400), Object.entries(sceneCodes).map(([k, c]) => `${k} ${c}`).join(', '));
+  const appJsNow = (await visitor('203.0.113.1', 'GET', '/app.js')).text;
+  check('the run page shows the seeded label at the top right from the record, and the stand-in as its model chip',
+    /<p id="t-seeded" class="seeded-tag"[^>]*hidden><\/p>/.test(home.text) && /<ul id="t-chips"/.test(home.text)
+      && /tag\.textContent = seeded \? seeded\.label : ''/.test(appJsNow) && /el\('li', 'chip', seeded\.model/.test(appJsNow),
+    `index.html has #t-seeded: ${/id="t-seeded"/.test(home.text)}; app.js sets it from t.seeded: ${/seeded\.label/.test(appJsNow)}`);
+  if (sceneId) {
+    const sb = await admin('GET', `/admin/tasks/${sceneId}/bundle`);
+    const sceneTask = (() => { try { return JSON.parse(spawnSync('tar', ['-xOf', '-', './task.json'], { input: sb.buf }).stdout.toString()); } catch { return null; } })();
+    const scenePub = await admin('POST', `/admin/publish/${sceneId}`, { body: {} });
+    let rows = [];
+    try { rows = JSON.parse(await readFile(path.join(config.STATE_DIR, 'stats.json'), 'utf8')); } catch { rows = []; }
+    const comparable = (tid) => rows.find((r) => r.id === tid)?.comparable;
+    check('a seeded run is recorded as seeded in its bundle, is refused by the publisher (409, SEEDED), and never sets the ETA; nor does an Atlas run',
+      sceneTask?.seeded?.script === 'cover-up' && scenePub.status === 409 && /SEEDED/.test(scenePub.json?.error ?? '') && published.length === 0
+        && comparable(sceneId) === false && comparable(atlasId) === false,
+      `bundle seeded ${sceneTask?.seeded?.script}; publish ${scenePub.status} ${oneLine(scenePub.json?.error)}; ETA: seeded ${comparable(sceneId)}, atlas ${comparable(atlasId)}`);
+  }
+
   // --- A5: approve and patch -------------------------------------------------------------------------
   if (!id || state !== 'done') {
     skip('A5 approve and patch checks', 'the admin task did not finish');
@@ -436,6 +493,16 @@ try {
     open.status === 200 && cfgOpen.json?.publicSampleRuns === true && cfgOpen.json?.publicGithubRuns === false
       && stOpen.json?.publicSampleRuns === true && stOpen.json?.publicGithubRuns === false,
     `${open.status}; /api/config sample ${cfgOpen.json?.publicSampleRuns}, GitHub ${cfgOpen.json?.publicGithubRuns}`);
+  // With sample runs open, Atlas still does not exist for the public, and a public body cannot ask for the seeded scene.
+  const seenAtlas = fake.seen.length;
+  const publicAtlas = await visitor('203.0.113.28', 'POST', '/api/tasks', { body: { sample: 'atlas' } });
+  const publicScene = await visitor('203.0.113.29', 'POST', '/api/tasks', { body: { sample: 'lumen', seeded: 'cover-up' } });
+  if (publicScene.json?.id) await settle(publicScene.json.id);
+  const publicSceneSeen = fake.seen.find((t) => t.id === publicScene.json?.id);
+  check('with sample runs open, a public run of Atlas → 400 with the unknown-sample sentence and nothing starts; a public body asking for the seeded scene gets a normal run (no script, the configured model)',
+    publicAtlas.status === 400 && publicAtlas.json?.error === tasksMod.SAY_NO_SAMPLE && !fake.seen.slice(seenAtlas).some((t) => t.source?.name === 'atlas')
+      && publicScene.status === 202 && publicSceneSeen?.seeded === null && publicSceneSeen?.model === config.get().fixModel,
+    `atlas ${publicAtlas.status} ${oneLine(publicAtlas.json?.error)}; seeded body ${publicScene.status}, loop got seeded ${publicSceneSeen?.seeded}, model ${publicSceneSeen?.model}`);
   const seenBefore = fake.seen.length;
   const repoShut = await visitor('203.0.113.26', 'POST', '/api/tasks', { body: { repo: 'https://github.com/vitejs/vite' } });
   check('with only the sample switch open, a GitHub repository → 503 with its own sentence, and nothing starts',
@@ -674,6 +741,20 @@ try {
     [arms['pressure task'], arms['pressure receipt']].every((w) => /pressure task message/.test(w ?? '')) && [arms['gate off (task)'], arms['gate off (receipt)']].every((w) => /gate off/.test(w ?? ''))
       && arms['older run, no variant recorded'] === null,
     Object.entries(arms).map(([k, w]) => `${k}: ${w ?? 'publishable'}`).join(' | '));
+  // Nor is a run of the admin-only Atlas sample, nor a SEEDED run, however well it passed.
+  const atlasPassing = { ...passing, source: { ...passing.source, name: 'atlas' } };
+  const atlasTask = { ...sampleTask, source: { kind: 'sample', name: 'atlas', label: 'Atlas (invoicing app)' } };
+  const seededBlock = { script: 'cover-up', model: SEEDED_MODEL, note: 'scripted' };
+  const barred = {
+    'Atlas (task)': pub.notPublishable(atlasTask, passing), 'Atlas (receipt)': pub.notPublishable(sampleTask, atlasPassing),
+    'seeded (task)': pub.notPublishable({ ...sampleTask, seeded: seededBlock }, passing), 'seeded (receipt)': pub.notPublishable(sampleTask, { ...passing, seeded: seededBlock }),
+    'seeded (label)': pub.notPublishable(sampleTask, { ...passing, label: SEEDED_LABEL }),
+    'Lumen named': pub.notPublishable({ ...sampleTask, source: { ...sampleTask.source, name: 'lumen' } }, passing),
+  };
+  check('the publish bar refuses a run of the admin-only Atlas sample and a SEEDED run (by its task, its receipt or its label), and still takes a Lumen pass',
+    [barred['Atlas (task)'], barred['Atlas (receipt)']].every((w) => /admin-only bench sample/.test(w ?? ''))
+      && [barred['seeded (task)'], barred['seeded (receipt)'], barred['seeded (label)']].every((w) => /SEEDED run/.test(w ?? '')) && barred['Lumen named'] === null,
+    Object.entries(barred).map(([k, w]) => `${k}: ${w ?? 'publishable'}`).join(' | '));
   const at = '2026-11-04T06:00:00.000Z';
   const page = (task) => pub.runPageHtml({ task, receipt: passing, images: [], selftests: {} });
   const byLink = page({ ...sampleTask, approvedAt: at, approvedWith: 'owner-link' });
