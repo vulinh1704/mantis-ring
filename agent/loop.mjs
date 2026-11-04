@@ -29,7 +29,7 @@ import { changedSince, initWorkspace, isClean, patchApplies, patchSince, revertT
 import { usageText } from '../runner/cgroup.mjs';
 import { LIMITS, Sandbox, networkText } from '../runner/sandbox.mjs';
 import {
-  baseUrl, bringIn, describePlan, devServerUp, inspectProject, installDeps, look, lookFailureText, startCommand, startDevServer,
+  baseUrl, bringIn, describePlan, devServerUp, inspectProject, installDeps, look, lookFailureLines, sandboxSnapshot, startCommand, startDevServer,
 } from '../runner/run-task.mjs';
 
 /** Caps of a public task (§2.4). Admin tasks may raise them up to ADMIN_MAX. */
@@ -658,6 +658,16 @@ class FixRun {
     this.step('install', 'done', ti);
 
     this.phase = 'baseline';
+    // A GitHub project shares the sandbox's memory with the browser: the journal keeps what is in use
+    // before the first look (the host cgroup, the processes, the tmpfs folders and the largest ones).
+    if (s.kind === 'github') {
+      try {
+        for (const line of await sandboxSnapshot(this.box)) this.journal(`before the baseline look: ${line}`);
+      } catch (err) {
+        if (this.ac.signal.aborted) throw new Stopped();
+        this.journal(`before the baseline look: not read (${firstLine(err?.message)})`);
+      }
+    }
     const tl = Date.now();
     this.step('look', 'start');
     let R0;
@@ -665,7 +675,7 @@ class FixRun {
       R0 = await this.timed('baseline', () => this.heavy(() => look(this.box, { ...this.matrixArgs, baseline: 'none', timeoutSec: this.caps.lookTimeoutSec })));
     } catch (err) {
       if (err instanceof Stopped || this.ac.signal.aborted) throw new Stopped();
-      this.journal(`baseline look failed: ${lookFailureText(err)}`);
+      for (const line of lookFailureLines(err)) this.journal(`baseline look failed: ${line}`);
       throw failure(baselineFailure(err), err);
     }
     if (R0?.usage) this.journal(`baseline look usage: ${usageText(R0.usage)}`);
@@ -1077,7 +1087,7 @@ class FixRun {
           failReason = err.message;
         } else {
           failReason = lookReason(err);
-          this.journal(`check ${k}: look failed: ${lookFailureText(err)}`);
+          for (const line of lookFailureLines(err)) this.journal(`check ${k}: look failed: ${line}`);
         }
       }
     }
@@ -1243,7 +1253,7 @@ class FixRun {
     } catch (err) {
       if (err instanceof Stopped || this.ac.signal.aborted) throw new Stopped();
       if (err instanceof NoTime) return tooLate();
-      this.journal(`verify look failed: ${lookFailureText(err)}`);
+      for (const line of lookFailureLines(err)) this.journal(`verify look failed: ${line}`);
       this.say(`verify look failed (${lookReason(err)}): the final files are what check ${k} measured`);
       return prev;
     } finally {

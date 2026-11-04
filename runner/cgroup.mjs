@@ -66,12 +66,12 @@ export function usageDir(procText, { root = CGROUP_ROOT, id = '' } = {}) {
 }
 
 /**
- * What the cgroup showed while it was watched: its limits, the most memory and processes at once,
- * and what the kernel counted since the watch began: memory.events `max` (usage reached the limit),
- * `oom` and `oom_kill`, and pids.events `max` (a fork or a new thread refused at the limit).
- * `gone`: the folder disappeared, which happens when the container stops.
- * @typedef {{dir: string, reads: number, gone: boolean, error: string, memMax: number|null, memPeak: number,
- *   pidsMax: number|null, pidsPeak: number, atMemLimit: number, oom: number, oomKill: number, pidsRefused: number, ms: number}} Usage
+ * What the cgroup showed while it was watched: its limits, the memory and processes at the first
+ * reading and the most at once, and what the kernel counted since the watch began: memory.events
+ * `max` (usage reached the limit), `oom` and `oom_kill`, and pids.events `max` (a fork or a new
+ * thread refused at the limit). `gone`: the folder disappeared, which happens when the container stops.
+ * @typedef {{dir: string, reads: number, gone: boolean, error: string, memMax: number|null, memStart: number|null, memPeak: number,
+ *   pidsMax: number|null, pidsStart: number|null, pidsPeak: number, atMemLimit: number, oom: number, oomKill: number, pidsRefused: number, ms: number}} Usage
  */
 
 /**
@@ -85,8 +85,8 @@ export function usageDir(procText, { root = CGROUP_ROOT, id = '' } = {}) {
 export function watchUsage(dir, { everyMs = 200 } = {}) {
   const t0 = Date.now();
   const seen = {
-    dir, reads: 0, gone: false, error: '', memMax: readNumber(dir, 'memory.max'), memPeak: 0, pidsMax: readNumber(dir, 'pids.max'), pidsPeak: 0,
-    atMemLimit: 0, oom: 0, oomKill: 0, pidsRefused: 0, ms: 0,
+    dir, reads: 0, gone: false, error: '', memMax: readNumber(dir, 'memory.max'), memStart: null, memPeak: 0, pidsMax: readNumber(dir, 'pids.max'),
+    pidsStart: null, pidsPeak: 0, atMemLimit: 0, oom: 0, oomKill: 0, pidsRefused: 0, ms: 0,
   };
   let start = null;
   const read = () => {
@@ -97,8 +97,8 @@ export function watchUsage(dir, { everyMs = 200 } = {}) {
       const me = parseEvents(readFileSync(path.join(dir, 'memory.events'), 'utf8'));
       const pe = parseEvents(readFileSync(path.join(dir, 'pids.events'), 'utf8'));
       seen.reads += 1;
-      if (Number.isFinite(mem)) seen.memPeak = Math.max(seen.memPeak, mem);
-      if (Number.isFinite(pids)) seen.pidsPeak = Math.max(seen.pidsPeak, pids);
+      if (Number.isFinite(mem)) { seen.memStart ??= mem; seen.memPeak = Math.max(seen.memPeak, mem); }
+      if (Number.isFinite(pids)) { seen.pidsStart ??= pids; seen.pidsPeak = Math.max(seen.pidsPeak, pids); }
       start ??= { max: me.max ?? 0, oom: me.oom ?? 0, oomKill: me.oom_kill ?? 0, pids: pe.max ?? 0 };
       seen.atMemLimit = Math.max(seen.atMemLimit, (me.max ?? 0) - start.max);
       seen.oom = Math.max(seen.oom, (me.oom ?? 0) - start.oom);
@@ -154,11 +154,15 @@ export function usageVerdict(u) {
   return null;
 }
 
-/** One line for the journal: "memory: at most 2.91 GB of 3.00 GB, at the limit 4 times, 0 OOM kills · processes: at most 230 of 512, 0 refused · 41 reads in 4.9 s". */
+/**
+ * One line for the journal: "memory: 1.21 GB at the start, at most 2.91 GB of 3.00 GB, at the limit 4
+ * times, 0 OOM, 0 OOM kills · processes: 60 at the start, at most 230 of 512, 0 refused · 41 reads in 4.9 s".
+ */
 export function usageText(u) {
   if (!u) return 'host cgroup not read';
   if (u.reads === 0) return `host cgroup not read (${u.error || 'no reading'})`;
-  return `memory: at most ${gb(u.memPeak)} of ${limitText(u.memMax, gb)}, at the limit ${u.atMemLimit} time${u.atMemLimit === 1 ? '' : 's'}, `
-    + `${u.oom} OOM, ${u.oomKill} OOM kill${u.oomKill === 1 ? '' : 's'} · processes: at most ${u.pidsPeak} of ${limitText(u.pidsMax, String)}, `
+  const start = (n, f) => (Number.isFinite(n) ? `${f(n)} at the start, ` : '');
+  return `memory: ${start(u.memStart, gb)}at most ${gb(u.memPeak)} of ${limitText(u.memMax, gb)}, at the limit ${u.atMemLimit} time${u.atMemLimit === 1 ? '' : 's'}, `
+    + `${u.oom} OOM, ${u.oomKill} OOM kill${u.oomKill === 1 ? '' : 's'} · processes: ${start(u.pidsStart, String)}at most ${u.pidsPeak} of ${limitText(u.pidsMax, String)}, `
     + `${u.pidsRefused} refused · ${u.reads} reads in ${(u.ms / 1000).toFixed(1)} s${u.gone ? ' · the cgroup went away (the sandbox stopped)' : ''}`;
 }

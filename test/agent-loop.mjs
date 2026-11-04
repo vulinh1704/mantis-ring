@@ -1488,7 +1488,7 @@ async function u18() {
   const cg = await load('../runner/cgroup.mjs');
   const loop = await load('../agent/loop.mjs');
   if (!rt || !cg || !loop) return;
-  const { LookError, look, lookFailureText, postmortemText, signalOf } = rt;
+  const { JOURNAL_LINE, LookError, look, lookFailureLines, lookFailureText, sandboxLines, sandboxSnapshot: snapshot, signalOf } = rt;
 
   check('U18 signalOf: 137 is SIGKILL, 134 SIGABRT, 135 SIGBUS, 139 SIGSEGV, 143 SIGTERM; 1, 124, 128 and 160 are no signal',
     signalOf(137) === 'SIGKILL' && signalOf(134) === 'SIGABRT' && signalOf(135) === 'SIGBUS' && signalOf(139) === 'SIGSEGV' && signalOf(143) === 'SIGTERM'
@@ -1537,7 +1537,7 @@ async function u18() {
   const causes = Object.fromEntries(Object.entries(c).map(([k, e]) => [k, e?.reason]));
   check('U18 the cause comes from what was measured: an OOM in the host cgroup is "memory", a refused fork "pids", an exited container "sandbox" ("memory" when Docker says OOM-killed), nothing seen "killed"; a stopped container gets no post-mortem exec',
     causes.memory === 'memory' && causes.pids === 'pids' && causes.gone === 'sandbox' && causes.dockerOom === 'memory' && causes.nothing === 'killed'
-      && /^container exited \(exit 128\)$/.test(c.gone?.postmortem ?? '') && c.memory?.usage?.oomKill === 1,
+      && JSON.stringify(c.gone?.postmortem) === '["container exited (exit 128)"]' && c.memory?.usage?.oomKill === 1,
     `${JSON.stringify(causes)}; gone: ${c.gone?.postmortem}`);
 
   const key = process.env.VULTR_INFERENCE_API_KEY;
@@ -1546,14 +1546,28 @@ async function u18() {
     usage: usageOf({ memPeak: 2.5 * 2 ** 30 }),
     stderr: `\x1b[31mlook: / mobile/light ok\x1b[0m\nBus error (core dumped)\napi_key=${key} token abcdefgh12345678\nthe monitored command dumped core\n`,
   }));
+  const lines = lookFailureLines(leaky);
   const line = lookFailureText(leaky);
-  check('U18 the journal line keeps the exit code and signal, the time, the host cgroup, the end of stderr and the post-mortem (processes, tmpfs, dev server, its log), with credentials redacted',
-    /^killed: mantis look was stopped by SIGBUS after 0\.\d s · exit 135 \(SIGBUS\) · after 0\.\d s · memory: at most 2\.50 GB of 3\.00 GB/.test(line)
+  // The app clips each journal line of a task to 400 characters, its "task=t_… " prefix and the loop's own included.
+  const longest = Math.max(...lines.map((l) => `task=t_${'0'.repeat(32)} baseline look failed: ${l}`.length));
+  check('U18 the journal lines keep the exit code and signal, the time, the host cgroup, the end of stderr and the post-mortem (processes, tmpfs, dev server, its log), with credentials redacted, each short enough for the app\'s 400-character journal line',
+    /^killed: mantis look was stopped by SIGBUS after 0\.\d s \(exit 135 \(SIGBUS\), after 0\.\d s\)$/.test(lines[0])
+      && /^host cgroup during the look: memory: at most 2\.50 GB of 3\.00 GB/.test(lines[1])
       && /stderr: look: \/ mobile\/light ok \| Bus error \(core dumped\) \| api_key=\[redacted\] token \[redacted\] \| the monitored command dumped core/.test(line)
-      && /container running · 2 processes, 70 threads, 1\.60 GB resident \(largest: next-server \(v16 1\.20 GB 40 threads/.test(line)
-      && /tmpfs: \/work 1\.50 GB of 2\.00 GB/.test(line) && /dev server running/.test(line) && /dev log: ready \| curl -H "Authorization: \[redacted\]/.test(line)
-      && /https:\/\/\[redacted\]@example\.com/.test(line) && !line.includes(key) && !line.includes('abcdefgh12345678') && !line.includes('\x1b') && leaky.reason === 'killed',
-    line.slice(0, 600));
+      && lines.includes('container running') && lines.some((l) => /^2 processes, 70 threads, 1\.60 GB resident; largest \(memory\/threads\): next-server \(v16 1\.20 GB\/40t/.test(l))
+      && /tmpfs: \/work 1\.50 GB of 2\.00 GB/.test(line) && /dev server running · dev log: ready \| curl -H "Authorization: \[redacted\]/.test(line)
+      && /https:\/\/\[redacted\]@example\.com/.test(line) && !line.includes(key) && !line.includes('abcdefgh12345678') && !line.includes('\x1b') && leaky.reason === 'killed'
+      && lines.every((l) => l.length <= JOURNAL_LINE) && longest <= 400,
+    `${lines.length} lines, longest journal line ${longest}: ${line.slice(0, 500)}`);
+
+  // Right before the baseline look of a GitHub task: the host cgroup now, then the inside view with the folder sizes.
+  const snapBox = lookBox({ code: 0, post: { ...facts, sizes: { '/work/app/node_modules': 0.75 * 2 ** 30, '/home/ring/.npm': 0.25 * 2 ** 30 } }, usage: usageOf({ memStart: 2 * 2 ** 30, pidsStart: 60, pidsPeak: 60 }) });
+  const snap = await snapshot(snapBox);
+  check('U18 snapshot: the host cgroup now (memory and processes of their limits), then the processes, the tmpfs folders with the sizes of node_modules and the npm cache, and the dev server',
+    snap[0] === 'host cgroup now: memory 2.00 GB of 3.00 GB, 60 processes of 512' && /^2 processes, 70 threads/.test(snap[1] ?? '')
+      && /tmpfs: \/work 1\.50 GB of 2\.00 GB · sizes: \/work\/app\/node_modules 0\.75 GB, \/home\/ring\/\.npm 0\.25 GB · sandbox kernel: 0\.10 GB available of 3\.00 GB/.test(snap[2] ?? '')
+      && /^dev server running/.test(snap[3] ?? '') && snapBox.posts === 1 && JSON.stringify(await snapshot({})) === '["host cgroup: not read"]',
+    snap.join(' | '));
 
   const plain = (s) => /^[A-Z][^\n]{10,250}\.$/.test(s) && !/\.\s+[A-Z]/.test(s);
   const sentences = Object.fromEntries(['timeout', 'memory', 'pids', 'sandbox', 'killed', 'unreachable', 'nope'].map((r) => [r, loop.baselineFailure({ reason: r })]));
@@ -1584,7 +1598,8 @@ async function u18() {
   }
   const v = (o) => cg.usageVerdict({ ...usageOf({}), ...o });
   check('U18 watchUsage keeps the limits, the most memory and processes at once and what the kernel counted since the watch began, after the cgroup went away; usageVerdict reads it',
-    seen?.memMax === GB3 && seen.pidsMax === 512 && seen.memPeak === GB3 - 4096 && seen.pidsPeak === 300 && seen.atMemLimit === 7 && seen.oom === 1 && seen.oomKill === 1
+    seen?.memMax === GB3 && seen.pidsMax === 512 && seen.memStart === 1000 && seen.pidsStart === 10 && seen.memPeak === GB3 - 4096 && seen.pidsPeak === 300
+      && seen.atMemLimit === 7 && seen.oom === 1 && seen.oomKill === 1
       && seen.pidsRefused === 2 && seen.gone === true && seen.reads > 2 && cg.usageVerdict(seen) === 'memory'
       && v({ pidsRefused: 1 }) === 'pids' && v({ gone: true }) === 'sandbox' && v({ gone: true, memPeak: GB3 }) === 'memory' && v({}) === null && cg.usageVerdict({ reads: 0 }) === null
       && cg.usageVerdict(null) === null && /at the limit 7 times, 1 OOM, 1 OOM kill .* at most 300 of 512, 2 refused/.test(cg.usageText(seen)),
@@ -1606,9 +1621,10 @@ async function u18() {
     rmSync(root, { recursive: true, force: true });
   }
 
-  check('U18 postmortemText on nothing usable still says so; a LookError made the old way (three arguments) has no exit code or usage',
-    /^0 processes, 0 threads, 0\.00 GB resident · dev server unknown$/.test(postmortemText({})) && new LookError('usage', 'x', '').exitCode === null && new LookError('usage', 'x').usage === null,
-    postmortemText({}));
+  check('U18 sandboxLines on nothing usable still says so; a LookError made the old way (three arguments) has no exit code, usage or post-mortem',
+    JSON.stringify(sandboxLines({})) === '["0 processes, 0 threads, 0.00 GB resident","dev server unknown"]'
+      && new LookError('usage', 'x', '').exitCode === null && new LookError('usage', 'x').usage === null && new LookError('usage', 'x').postmortem.length === 0,
+    sandboxLines({}).join(' | '));
 }
 
 // ---------------------------------------------------------------------------------------------

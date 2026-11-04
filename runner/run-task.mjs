@@ -147,7 +147,8 @@ export class LookError extends Error {
    * @param {'unreachable'|'timeout'|'memory'|'pids'|'sandbox'|'killed'|'no-report'|'stale'|'usage'} reason
    * @param {string} message  one sentence
    * @param {string} [stderrTail]
-   * @param {{exitCode?: number|null, signal?: string|null, ms?: number|null, usage?: import('./cgroup.mjs').Usage|null, postmortem?: string}} [facts]
+   * @param {{exitCode?: number|null, signal?: string|null, ms?: number|null, usage?: import('./cgroup.mjs').Usage|null, postmortem?: string[]}} [facts]
+   *   postmortem: journal lines (postmortem())
    */
   constructor(reason, message, stderrTail = '', facts = {}) {
     super(message);
@@ -158,7 +159,7 @@ export class LookError extends Error {
     this.signal = facts.signal ?? null;
     this.ms = Number.isFinite(facts.ms) ? facts.ms : null;
     this.usage = facts.usage ?? null;
-    this.postmortem = facts.postmortem ?? '';
+    this.postmortem = Array.isArray(facts.postmortem) ? facts.postmortem.map(String) : [];
   }
 }
 
@@ -190,20 +191,39 @@ export function journalSafe(text, { max = 600, lines = 8 } = {}) {
   return out.length > max ? `…${out.slice(-max)}` : out;
 }
 
+/** The app clips each journal line of a task to 400 characters (app/server.mjs): the runner's lines stay under this. */
+export const JOURNAL_LINE = 320;
+
+/** `text` cut into at most `n` pieces of at most JOURNAL_LINE characters, the end kept when it is longer. */
+function pieces(text, n = 3) {
+  const s = String(text ?? '');
+  const room = JOURNAL_LINE * n;
+  const kept = s.length > room ? `…${s.slice(-(room - 1))}` : s;
+  const out = [];
+  for (let i = 0; i < kept.length; i += JOURNAL_LINE) out.push(kept.slice(i, i + JOURNAL_LINE));
+  return out;
+}
+
 /**
- * Everything a failed look left, on one line for the journal (never the public page): the reason and
- * sentence, the exit code and signal, how long it ran, the host cgroup's usage, the end of stderr and
- * the post-mortem. Any other error gives its message.
+ * Everything a failed look left, as journal lines of at most JOURNAL_LINE characters (never for the
+ * public page): the reason and sentence with the exit code, the signal and how long it ran; the host
+ * cgroup during the look; the end of stderr; the post-mortem. Any other error gives its message.
+ * @returns {string[]}
  */
+export function lookFailureLines(err) {
+  if (!(err instanceof LookError)) return [journalSafe(err?.message ?? err, { max: JOURNAL_LINE })];
+  const how = [err.exitCode !== null ? `exit ${err.exitCode}${err.signal ? ` (${err.signal})` : ''}` : '', err.ms !== null ? `after ${(err.ms / 1000).toFixed(1)} s` : '']
+    .filter(Boolean).join(', ');
+  const lines = [journalSafe(`${err.reason}: ${err.message}${how ? ` (${how})` : ''}`, { max: JOURNAL_LINE })];
+  if (err.usage) lines.push(...pieces(`host cgroup during the look: ${usageText(err.usage)}`, 2));
+  lines.push(...pieces(`stderr: ${journalSafe(err.stderrTail, { max: 1200, lines: 12 }) || '(empty)'}`, 3));
+  for (const l of Array.isArray(err.postmortem) ? err.postmortem : []) lines.push(...pieces(l, 2));
+  return lines;
+}
+
+/** lookFailureLines() on one line, for the command line's result. */
 export function lookFailureText(err) {
-  if (!(err instanceof LookError)) return journalSafe(err?.message ?? err, { max: 300 });
-  const parts = [`${err.reason}: ${err.message}`];
-  if (err.exitCode !== null) parts.push(`exit ${err.exitCode}${err.signal ? ` (${err.signal})` : ''}`);
-  if (err.ms !== null) parts.push(`after ${(err.ms / 1000).toFixed(1)} s`);
-  if (err.usage) parts.push(usageText(err.usage));
-  parts.push(`stderr: ${journalSafe(err.stderrTail, { max: 1200, lines: 12 }) || '(empty)'}`);
-  if (err.postmortem) parts.push(err.postmortem);
-  return parts.join(' · ');
+  return lookFailureLines(err).join(' · ');
 }
 
 /** Every accepted form of a source, as {kind:'local', dir} or {kind:'github', owner, name}; throws on anything else. */
@@ -855,14 +875,21 @@ export async function devServerUp(box, origin) {
   return r.code === 0;
 }
 
-// Inside the sandbox, right after a look was stopped: every process still there (name, state,
-// threads, resident memory), how full the tmpfs folders are (they live in RAM), what the sandbox
-// kernel says about memory, whether the dev server still runs, and the end of its log. One line of JSON.
-const POSTMORTEM = `
+// Inside the sandbox, right before the baseline look of a GitHub task and right after a look was
+// stopped: every process (name, state, threads, resident memory), how full the tmpfs folders are
+// (they live in RAM), what the sandbox kernel says about memory, whether the dev server runs, and the
+// end of its log. With "du", also the size of node_modules, .next and the npm cache. One line of JSON.
+const SANDBOX_VIEW = `
 const fs = require('fs');
-const [pidFile, logFile] = process.argv.slice(1);
+const [pidFile, logFile, du] = process.argv.slice(1);
 const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch { return null; } };
-const out = { procs: [], mem: {}, dirs: {}, dev: null, log: '' };
+const out = { procs: [], mem: {}, dirs: {}, sizes: {}, dev: null, log: '' };
+if (du === 'du') {
+  let text = '';
+  try { text = require('child_process').execFileSync('du', ['-sk', '/work/app/node_modules', '/work/app/.next', '/home/ring/.npm', '/home/ring/.cache'], { timeout: 15000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }); }
+  catch (e) { text = String((e && e.stdout) || ''); }
+  for (const line of text.split('\\n')) { const m = /^(\\d+)\\s+(\\/\\S+)$/.exec(line.trim()); if (m) out.sizes[m[2]] = Number(m[1]) * 1024; }
+}
 for (const d of fs.readdirSync('/proc')) {
   if (!/^\\d+$/.test(d) || Number(d) === process.pid) continue;
   const st = read('/proc/' + d + '/stat');
@@ -887,41 +914,71 @@ process.stdout.write(JSON.stringify(out));
 
 const gbText = (bytes) => `${(bytes / 2 ** 30).toFixed(2)} GB`;
 
+/** The sandbox from inside (SANDBOX_VIEW) as journal lines; `sizes` adds node_modules, .next and the npm cache. */
+async function insideLines(box, { sizes = false } = {}) {
+  if (typeof box.execArgs !== 'function') return [];
+  const r = await box.execArgs(['timeout', '-k', '2', '25', 'node', '-e', SANDBOX_VIEW, DEV_PID, DEV_LOG, sizes ? 'du' : '-'], { timeoutMs: 40_000, maxBytes: 256 * 1024 });
+  let facts = null;
+  try { facts = JSON.parse(r.stdout); } catch { facts = null; }
+  if (r.code !== 0 || !facts) return [`inside the sandbox: not read (exit ${r.code}): ${journalSafe(r.stderr, { max: 200, lines: 2 }) || 'no output'}`];
+  return sandboxLines(facts);
+}
+
 /**
- * What the sandbox looked like right after a look was stopped, for the journal: the container's state
- * (Docker), then, while it still runs, what postmortemText() makes of POSTMORTEM. `verdict` is
- * 'memory' or 'sandbox' when Docker shows the container stopped (OOM-killed or not), else null.
+ * What the sandbox looked like right after a look was stopped, as journal lines: the container's state
+ * (Docker), then, while it still runs, the inside view (sandboxLines()). `verdict` is 'memory' or
+ * 'sandbox' when Docker shows the container stopped (OOM-killed or not), else null.
  * @param {Sandbox} box
- * @returns {Promise<{text: string, verdict: 'memory'|'sandbox'|null}>}
+ * @returns {Promise<{lines: string[], verdict: 'memory'|'sandbox'|null}>}
  */
 export async function postmortem(box) {
   const st = typeof box.state === 'function' ? await box.state().catch(() => null) : null;
   const head = st ? `container ${st.status}${st.running ? '' : ` (exit ${st.exitCode})`}${st.oomKilled ? ', OOM-killed' : ''}` : 'container state unknown';
-  if (st && !st.running) return { text: head, verdict: st.oomKilled ? 'memory' : 'sandbox' };
-  if (typeof box.execArgs !== 'function') return { text: head, verdict: null };
-  const r = await box.execArgs(['timeout', '-k', '2', '15', 'node', '-e', POSTMORTEM, DEV_PID, DEV_LOG], { timeoutMs: 30_000, maxBytes: 256 * 1024 });
-  let facts = null;
-  try { facts = JSON.parse(r.stdout); } catch { facts = null; }
-  if (r.code !== 0 || !facts) return { text: `${head} · post-mortem failed (exit ${r.code}): ${journalSafe(r.stderr, { max: 200, lines: 2 }) || 'no output'}`, verdict: null };
-  return { text: `${head} · ${postmortemText(facts)}`, verdict: null };
+  if (st && !st.running) return { lines: [head], verdict: st.oomKilled ? 'memory' : 'sandbox' };
+  return { lines: [head, ...(await insideLines(box))], verdict: null };
 }
 
-/** POSTMORTEM's JSON as one line: processes and the largest ones, the tmpfs folders, the kernel's memory view, the dev server and its log. */
-export function postmortemText(f) {
+/**
+ * The sandbox right before a look, as journal lines: the host cgroup now (memory and processes, of
+ * their limits), then the inside view with the size of node_modules, .next and the npm cache.
+ * @param {Sandbox} box
+ * @returns {Promise<string[]>}
+ */
+export async function sandboxSnapshot(box) {
+  const w = typeof box.watchUsage === 'function' ? await box.watchUsage().catch(() => null) : null;
+  const u = w ? w.stop() : null;
+  const host = u && u.reads > 0 ? `host cgroup now: ${usageNow(u)}` : 'host cgroup: not read';
+  return [host, ...(await insideLines(box, { sizes: true }))];
+}
+
+/** One reading of the host cgroup: "memory 2.10 GB of 3.00 GB, 85 processes of 512". */
+function usageNow(u) {
+  const of = (n, f) => (Number.isFinite(n) ? ` of ${f(n)}` : '');
+  return `memory ${gbText(u.memPeak)}${of(u.memMax, gbText)}, ${u.pidsPeak} processes${of(u.pidsMax, String)}`;
+}
+
+/**
+ * SANDBOX_VIEW's JSON as journal lines of at most JOURNAL_LINE characters: the processes and the
+ * largest ones; the tmpfs folders and the sizes asked for, with the kernel's view of memory; the dev
+ * server and the end of its log.
+ * @returns {string[]}
+ */
+export function sandboxLines(f) {
   const procs = Array.isArray(f?.procs) ? f.procs : [];
   const rss = (p) => (Number(p?.rssKb) || 0) * 1024;
   const threads = procs.reduce((n, p) => n + (Number(p?.threads) || 0), 0);
-  const top = [...procs].sort((a, b) => rss(b) - rss(a)).slice(0, 5)
-    .map((p) => `${journalSafe(p.comm, { max: 40, lines: 1 }) || '?'} ${gbText(rss(p))} ${Number(p.threads) || 0} threads${p.state === 'Z' ? ' (zombie)' : ''}`);
-  const parts = [`${procs.length} processes, ${threads} threads, ${gbText(procs.reduce((n, p) => n + rss(p), 0))} resident${top.length ? ` (largest: ${top.join(', ')})` : ''}`];
+  const top = [...procs].sort((a, b) => rss(b) - rss(a)).slice(0, 6)
+    .map((p) => `${journalSafe(p.comm, { max: 30, lines: 1 }) || '?'} ${gbText(rss(p))}/${Number(p.threads) || 0}t${p.state === 'Z' ? ' (zombie)' : ''}`);
+  const lines = [`${procs.length} processes, ${threads} threads, ${gbText(procs.reduce((n, p) => n + rss(p), 0))} resident${top.length ? `; largest (memory/threads): ${top.join(', ')}` : ''}`];
   const dirs = Object.entries(f?.dirs ?? {}).map(([d, s]) => `${d} ${gbText(Number(s?.used) || 0)} of ${gbText(Number(s?.size) || 0)}`);
-  if (dirs.length) parts.push(`tmpfs: ${dirs.join(', ')}`);
+  const sizes = Object.entries(f?.sizes ?? {}).map(([d, n]) => `${d} ${gbText(Number(n) || 0)}`);
   const kb = (k) => (Number.isFinite(f?.mem?.[k]) ? gbText(f.mem[k] * 1024) : '?');
-  if (f?.mem && Object.keys(f.mem).length) parts.push(`sandbox kernel: ${kb('MemAvailable')} available of ${kb('MemTotal')}, ${kb('Shmem')} shared`);
-  parts.push(`dev server ${f?.dev === true ? 'running' : f?.dev === false ? 'not running' : 'unknown'}`);
-  const log = journalSafe(f?.log, { max: 600, lines: 6 });
-  if (log) parts.push(`dev log: ${log}`);
-  return parts.join(' · ');
+  const mem = f?.mem && Object.keys(f.mem).length ? [`sandbox kernel: ${kb('MemAvailable')} available of ${kb('MemTotal')}, ${kb('Shmem')} shared`] : [];
+  const fsLine = [dirs.length ? `tmpfs: ${dirs.join(', ')}` : '', sizes.length ? `sizes: ${sizes.join(', ')}` : '', ...mem].filter(Boolean).join(' · ');
+  if (fsLine) lines.push(fsLine);
+  const log = journalSafe(f?.log, { max: 240, lines: 4 });
+  lines.push(`dev server ${f?.dev === true ? 'running' : f?.dev === false ? 'not running' : 'unknown'}${log ? ` · dev log: ${log}` : ''}`);
+  return lines.map((l) => (l.length > JOURNAL_LINE ? `${l.slice(0, JOURNAL_LINE - 1)}…` : l));
 }
 
 /** A matrix value for the command line: a comma-separated string, or an array of strings joined with commas. */
@@ -982,10 +1039,10 @@ export async function look(box, { port, host = '127.0.0.1', routes = '/', locale
   // Anything else at 128 or more stopped it from outside or crashed it: say what, and look at the
   // sandbox at once, before anything else changes there.
   if (r.code >= 128) {
-    const post = await postmortem(box).catch((err) => ({ text: `post-mortem failed: ${journalSafe(err?.message, { max: 200, lines: 1 })}`, verdict: null }));
+    const post = await postmortem(box).catch((err) => ({ lines: [`post-mortem failed: ${journalSafe(err?.message, { max: 200, lines: 1 })}`], verdict: null }));
     const reason = usageVerdict(usage) ?? post.verdict ?? 'killed';
     const how = facts.signal ? `was stopped by ${facts.signal}` : `ended with exit code ${r.code}`;
-    throw new LookError(reason, `mantis look ${how} after ${(ms / 1000).toFixed(1)} s`, stderrTail, { ...facts, postmortem: post.text });
+    throw new LookError(reason, `mantis look ${how} after ${(ms / 1000).toFixed(1)} s`, stderrTail, { ...facts, postmortem: post.lines });
   }
   let report = null;
   try { report = JSON.parse(r.stdout); } catch { /* no report: judged below by the exit code */ }
