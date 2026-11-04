@@ -27,6 +27,7 @@ import { mkdir, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
+import { usageText, usageVerdict } from './cgroup.mjs';
 import { Sandbox } from './sandbox.mjs';
 
 export const sh = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
@@ -131,19 +132,78 @@ export class SetupError extends Error {
   }
 }
 
-/** `mantis look` gave no usable measurement. `reason` says why; `stderrTail` is the end of its stderr. */
+/**
+ * `mantis look` gave no usable measurement. `reason` says why:
+ * - 'timeout': its time limit ran out (the only path that is a timeout);
+ * - 'memory', 'pids', 'sandbox': it was stopped, and the host cgroup or Docker shows the cause: the
+ *   sandbox's memory limit, its process limit, or the sandbox itself stopped;
+ * - 'killed': it was stopped by a signal (or exit code 128 or more) for a cause nothing showed;
+ * - 'unreachable', 'no-report', 'stale', 'usage': it ran, and said why it could not measure.
+ * The rest is for the journal (lookFailureText()), never for the public page: the exit code and its
+ * signal, how long it ran, the end of its stderr, the host cgroup's usage and the post-mortem.
+ */
 export class LookError extends Error {
   /**
-   * @param {'unreachable'|'timeout'|'no-report'|'stale'|'usage'} reason
+   * @param {'unreachable'|'timeout'|'memory'|'pids'|'sandbox'|'killed'|'no-report'|'stale'|'usage'} reason
    * @param {string} message  one sentence
    * @param {string} [stderrTail]
+   * @param {{exitCode?: number|null, signal?: string|null, ms?: number|null, usage?: import('./cgroup.mjs').Usage|null, postmortem?: string}} [facts]
    */
-  constructor(reason, message, stderrTail = '') {
+  constructor(reason, message, stderrTail = '', facts = {}) {
     super(message);
     this.name = 'LookError';
     this.reason = reason;
     this.stderrTail = stderrTail;
+    this.exitCode = Number.isInteger(facts.exitCode) ? facts.exitCode : null;
+    this.signal = facts.signal ?? null;
+    this.ms = Number.isFinite(facts.ms) ? facts.ms : null;
+    this.usage = facts.usage ?? null;
+    this.postmortem = facts.postmortem ?? '';
   }
+}
+
+// Linux signal numbers: a shell reports a process that signal n stopped as exit code 128 + n, and
+// `timeout` and `docker exec` pass that code on.
+const SIGNALS = ['SIGHUP', 'SIGINT', 'SIGQUIT', 'SIGILL', 'SIGTRAP', 'SIGABRT', 'SIGBUS', 'SIGFPE', 'SIGKILL', 'SIGUSR1', 'SIGSEGV', 'SIGUSR2', 'SIGPIPE',
+  'SIGALRM', 'SIGTERM', 'SIGSTKFLT', 'SIGCHLD', 'SIGCONT', 'SIGSTOP', 'SIGTSTP', 'SIGTTIN', 'SIGTTOU', 'SIGURG', 'SIGXCPU', 'SIGXFSZ', 'SIGVTALRM', 'SIGPROF',
+  'SIGWINCH', 'SIGIO', 'SIGPWR', 'SIGSYS'];
+
+/** The signal behind an exit code of 129 to 159 ('SIGKILL' for 137), or null for any other code. */
+export function signalOf(code) {
+  return Number.isInteger(code) && code > 128 && code <= 128 + SIGNALS.length ? SIGNALS[code - 129] : null;
+}
+
+/**
+ * Text from the sandbox (stderr, a log, process names) made fit for the journal: no colour codes or
+ * control characters, the last `lines` non-empty lines joined with " | ", at most `max` characters
+ * (the end is kept), and anything shaped like a credential redacted. The sandbox never gets a
+ * secret; this keeps one that a project prints, or the inference key, out of the journal all the same.
+ */
+export function journalSafe(text, { max = 600, lines = 8 } = {}) {
+  let s = String(text ?? '').replace(ANSI, '').replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, ' ');
+  const key = process.env.VULTR_INFERENCE_API_KEY;
+  if (key && key.length >= 8) s = s.split(key).join('[redacted]');
+  s = s.replace(/\b(Bearer|Basic|token)\s+[A-Za-z0-9._~+/=-]{8,}/gi, '$1 [redacted]')
+    .replace(/\b(authorization|api[_-]?key|access[_-]?token|auth[_-]?token|password|passwd|secret)(["']?\s*[:=]\s*["']?)[^\s"',;]+/gi, '$1$2[redacted]')
+    .replace(/(\b[a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]*@/gi, '$1[redacted]@');
+  const out = s.split('\n').map((l) => l.replace(/\s+/g, ' ').trim()).filter(Boolean).slice(-lines).join(' | ');
+  return out.length > max ? `…${out.slice(-max)}` : out;
+}
+
+/**
+ * Everything a failed look left, on one line for the journal (never the public page): the reason and
+ * sentence, the exit code and signal, how long it ran, the host cgroup's usage, the end of stderr and
+ * the post-mortem. Any other error gives its message.
+ */
+export function lookFailureText(err) {
+  if (!(err instanceof LookError)) return journalSafe(err?.message ?? err, { max: 300 });
+  const parts = [`${err.reason}: ${err.message}`];
+  if (err.exitCode !== null) parts.push(`exit ${err.exitCode}${err.signal ? ` (${err.signal})` : ''}`);
+  if (err.ms !== null) parts.push(`after ${(err.ms / 1000).toFixed(1)} s`);
+  if (err.usage) parts.push(usageText(err.usage));
+  parts.push(`stderr: ${journalSafe(err.stderrTail, { max: 1200, lines: 12 }) || '(empty)'}`);
+  if (err.postmortem) parts.push(err.postmortem);
+  return parts.join(' · ');
 }
 
 /** Every accepted form of a source, as {kind:'local', dir} or {kind:'github', owner, name}; throws on anything else. */
@@ -795,6 +855,75 @@ export async function devServerUp(box, origin) {
   return r.code === 0;
 }
 
+// Inside the sandbox, right after a look was stopped: every process still there (name, state,
+// threads, resident memory), how full the tmpfs folders are (they live in RAM), what the sandbox
+// kernel says about memory, whether the dev server still runs, and the end of its log. One line of JSON.
+const POSTMORTEM = `
+const fs = require('fs');
+const [pidFile, logFile] = process.argv.slice(1);
+const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch { return null; } };
+const out = { procs: [], mem: {}, dirs: {}, dev: null, log: '' };
+for (const d of fs.readdirSync('/proc')) {
+  if (!/^\\d+$/.test(d) || Number(d) === process.pid) continue;
+  const st = read('/proc/' + d + '/stat');
+  if (!st) continue;
+  const close = st.lastIndexOf(')');
+  const f = st.slice(close + 2).split(' ');
+  out.procs.push({ pid: Number(d), comm: st.slice(st.indexOf('(') + 1, close).slice(0, 40), state: f[0], threads: Number(f[17]) || 0, rssKb: (Number(f[21]) || 0) * 4 });
+}
+for (const line of String(read('/proc/meminfo') || '').split('\\n')) {
+  const m = /^(MemTotal|MemFree|MemAvailable|Shmem):\\s+(\\d+) kB/.exec(line);
+  if (m) out.mem[m[1]] = Number(m[2]);
+}
+for (const d of ['/work', '/home/ring', '/tmp', '/dev/shm']) {
+  try { const s = fs.statfsSync(d); out.dirs[d] = { used: (s.blocks - s.bfree) * s.bsize, size: s.blocks * s.bsize }; } catch {}
+}
+const pid = Number(String(read(pidFile) || '').trim());
+if (pid > 1) { const st = read('/proc/' + pid + '/stat'); out.dev = Boolean(st) && st.charAt(st.lastIndexOf(')') + 2) !== 'Z'; }
+const log = read(logFile);
+if (log) out.log = log.slice(-4000);
+process.stdout.write(JSON.stringify(out));
+`;
+
+const gbText = (bytes) => `${(bytes / 2 ** 30).toFixed(2)} GB`;
+
+/**
+ * What the sandbox looked like right after a look was stopped, for the journal: the container's state
+ * (Docker), then, while it still runs, what postmortemText() makes of POSTMORTEM. `verdict` is
+ * 'memory' or 'sandbox' when Docker shows the container stopped (OOM-killed or not), else null.
+ * @param {Sandbox} box
+ * @returns {Promise<{text: string, verdict: 'memory'|'sandbox'|null}>}
+ */
+export async function postmortem(box) {
+  const st = typeof box.state === 'function' ? await box.state().catch(() => null) : null;
+  const head = st ? `container ${st.status}${st.running ? '' : ` (exit ${st.exitCode})`}${st.oomKilled ? ', OOM-killed' : ''}` : 'container state unknown';
+  if (st && !st.running) return { text: head, verdict: st.oomKilled ? 'memory' : 'sandbox' };
+  if (typeof box.execArgs !== 'function') return { text: head, verdict: null };
+  const r = await box.execArgs(['timeout', '-k', '2', '15', 'node', '-e', POSTMORTEM, DEV_PID, DEV_LOG], { timeoutMs: 30_000, maxBytes: 256 * 1024 });
+  let facts = null;
+  try { facts = JSON.parse(r.stdout); } catch { facts = null; }
+  if (r.code !== 0 || !facts) return { text: `${head} · post-mortem failed (exit ${r.code}): ${journalSafe(r.stderr, { max: 200, lines: 2 }) || 'no output'}`, verdict: null };
+  return { text: `${head} · ${postmortemText(facts)}`, verdict: null };
+}
+
+/** POSTMORTEM's JSON as one line: processes and the largest ones, the tmpfs folders, the kernel's memory view, the dev server and its log. */
+export function postmortemText(f) {
+  const procs = Array.isArray(f?.procs) ? f.procs : [];
+  const rss = (p) => (Number(p?.rssKb) || 0) * 1024;
+  const threads = procs.reduce((n, p) => n + (Number(p?.threads) || 0), 0);
+  const top = [...procs].sort((a, b) => rss(b) - rss(a)).slice(0, 5)
+    .map((p) => `${journalSafe(p.comm, { max: 40, lines: 1 }) || '?'} ${gbText(rss(p))} ${Number(p.threads) || 0} threads${p.state === 'Z' ? ' (zombie)' : ''}`);
+  const parts = [`${procs.length} processes, ${threads} threads, ${gbText(procs.reduce((n, p) => n + rss(p), 0))} resident${top.length ? ` (largest: ${top.join(', ')})` : ''}`];
+  const dirs = Object.entries(f?.dirs ?? {}).map(([d, s]) => `${d} ${gbText(Number(s?.used) || 0)} of ${gbText(Number(s?.size) || 0)}`);
+  if (dirs.length) parts.push(`tmpfs: ${dirs.join(', ')}`);
+  const kb = (k) => (Number.isFinite(f?.mem?.[k]) ? gbText(f.mem[k] * 1024) : '?');
+  if (f?.mem && Object.keys(f.mem).length) parts.push(`sandbox kernel: ${kb('MemAvailable')} available of ${kb('MemTotal')}, ${kb('Shmem')} shared`);
+  parts.push(`dev server ${f?.dev === true ? 'running' : f?.dev === false ? 'not running' : 'unknown'}`);
+  const log = journalSafe(f?.log, { max: 600, lines: 6 });
+  if (log) parts.push(`dev log: ${log}`);
+  return parts.join(' · ');
+}
+
 /** A matrix value for the command line: a comma-separated string, or an array of strings joined with commas. */
 function csv(name, value) {
   const s = Array.isArray(value) ? value.join(',') : value;
@@ -812,7 +941,9 @@ function csv(name, value) {
  *   host: 127.0.0.1 (the default) or ::1, where startDevServer() found the app;
  *   baseline: 'none' (the default) or the absolute run folder inside the sandbox to compare with;
  *   prevRunId: the previous look's run id, which this look must not return again; timeoutSec: 300.
- * @returns {Promise<{report: object, runId: string, runDir: string, exitCode: 0|1|2, crashed: boolean, ms: number}>}
+ * While it runs, the sandbox's host cgroup is watched (box.watchUsage(), where the box has it).
+ * @returns {Promise<{report: object, runId: string, runDir: string, exitCode: 0|1|2, crashed: boolean, ms: number,
+ *   usage: import('./cgroup.mjs').Usage|null}>}
  *   crashed: exit 2 with a report, some cells could not be analysed (the rest were measured)
  * @throws {LookError} when there is no usable report
  */
@@ -829,33 +960,53 @@ export async function look(box, { port, host = '127.0.0.1', routes = '/', locale
   // --style none: the result must not depend on a stray style.json. cwd stays /work: a relative
   // --out, the proof aliases and Mantis's project detection all depend on it.
   args.push('--out', MANTIS_OUT, '--baseline', baseline, '--style', 'none', '--json');
+  const watch = typeof box.watchUsage === 'function' ? await box.watchUsage().catch(() => null) : null;
   const started = Date.now();
-  const r = await box.exec(`cd /work && timeout -k 5 ${sh(timeoutSec)} mantis ${args.map(sh).join(' ')}`, { timeoutMs: (timeoutSec + 30) * 1000 });
+  let r;
+  let usage = null;
+  try {
+    r = await box.exec(`cd /work && timeout -k 5 ${sh(timeoutSec)} mantis ${args.map(sh).join(' ')}`, { timeoutMs: (timeoutSec + 30) * 1000 });
+  } finally {
+    usage = watch?.stop() ?? null;
+  }
   const ms = Date.now() - started;
   const stderrTail = tailOf(r.stderr);
+  const facts = { exitCode: r.code, signal: signalOf(r.code), ms, usage };
 
-  if (r.truncated) throw new LookError('no-report', 'mantis look printed more than 16 MiB, so its report was not read', stderrTail);
-  if (r.timedOut || r.code === 124 || r.code >= 128) throw new LookError('timeout', `mantis look did not finish within ${timeoutSec} s`, stderrTail);
+  if (r.truncated) throw new LookError('no-report', 'mantis look printed more than 16 MiB, so its report was not read', stderrTail, facts);
+  // Only the time limit is a timeout: the host's own timer, `timeout` itself (124), or the KILL that
+  // `timeout -k 5` sends 5 s after the limit (137, once the limit has passed).
+  if (r.timedOut || r.code === 124 || (r.code === 137 && ms >= timeoutSec * 1000)) {
+    throw new LookError('timeout', `mantis look did not finish within ${timeoutSec} s`, stderrTail, facts);
+  }
+  // Anything else at 128 or more stopped it from outside or crashed it: say what, and look at the
+  // sandbox at once, before anything else changes there.
+  if (r.code >= 128) {
+    const post = await postmortem(box).catch((err) => ({ text: `post-mortem failed: ${journalSafe(err?.message, { max: 200, lines: 1 })}`, verdict: null }));
+    const reason = usageVerdict(usage) ?? post.verdict ?? 'killed';
+    const how = facts.signal ? `was stopped by ${facts.signal}` : `ended with exit code ${r.code}`;
+    throw new LookError(reason, `mantis look ${how} after ${(ms / 1000).toFixed(1)} s`, stderrTail, { ...facts, postmortem: post.text });
+  }
   let report = null;
   try { report = JSON.parse(r.stdout); } catch { /* no report: judged below by the exit code */ }
   const hasReport = report !== null && typeof report === 'object' && typeof report.runId === 'string'
     && report.summary !== null && typeof report.summary === 'object';
   if (r.code === 0 || r.code === 1) {
-    if (!hasReport) throw new LookError('no-report', 'mantis look finished but printed no report', stderrTail);
+    if (!hasReport) throw new LookError('no-report', 'mantis look finished but printed no report', stderrTail, facts);
   } else if (r.code === 2) {
     // Exit 2 with a report means some cells crashed and the rest were measured. Without one, Mantis could not run.
     if (!hasReport || !(report.summary.crashedCells > 0)) {
       const unreachable = r.stderr.split('\n').find((l) => /cannot reach/.test(l));
-      if (unreachable) throw new LookError('unreachable', `mantis could not reach the app: ${unreachable.trim().slice(0, 300)}`, stderrTail);
-      throw new LookError('usage', `mantis look failed: ${lastLine(r.stderr).slice(0, 300) || 'exit 2'}`, stderrTail);
+      if (unreachable) throw new LookError('unreachable', `mantis could not reach the app: ${unreachable.trim().slice(0, 300)}`, stderrTail, facts);
+      throw new LookError('usage', `mantis look failed: ${lastLine(r.stderr).slice(0, 300) || 'exit 2'}`, stderrTail, facts);
     }
   } else {
-    throw new LookError('usage', `mantis look could not run (exit ${r.code}): ${lastLine(r.stderr).slice(0, 300)}`, stderrTail);
+    throw new LookError('usage', `mantis look could not run (exit ${r.code}): ${lastLine(r.stderr).slice(0, 300)}`, stderrTail, facts);
   }
-  if (!RUN_ID.test(report.runId)) throw new LookError('no-report', `the report has an unexpected run id ${JSON.stringify(report.runId.slice(0, 40))}`, stderrTail);
-  if (prevRunId && report.runId === prevRunId) throw new LookError('stale', `mantis returned the previous run ${prevRunId} again`, stderrTail);
-  if (baseline !== 'none' && !report.baseline) throw new LookError('no-report', 'the report has no comparison with the baseline run', stderrTail);
-  return { report, runId: report.runId, runDir: `${MANTIS_OUT}/runs/${report.runId}`, exitCode: r.code, crashed: r.code === 2, ms };
+  if (!RUN_ID.test(report.runId)) throw new LookError('no-report', `the report has an unexpected run id ${JSON.stringify(report.runId.slice(0, 40))}`, stderrTail, facts);
+  if (prevRunId && report.runId === prevRunId) throw new LookError('stale', `mantis returned the previous run ${prevRunId} again`, stderrTail, facts);
+  if (baseline !== 'none' && !report.baseline) throw new LookError('no-report', 'the report has no comparison with the baseline run', stderrTail, facts);
+  return { report, runId: report.runId, runDir: `${MANTIS_OUT}/runs/${report.runId}`, exitCode: r.code, crashed: r.code === 2, ms, usage };
 }
 
 /**
@@ -922,7 +1073,8 @@ export async function runTask(opts, log = () => {}) {
     });
     Object.assign(result, { ok: true, reportDir: dest, summary: report.summary });
   } catch (err) {
-    result.error = expired ? `task timed out after ${timeoutSec}s` : err.publicMessage ? `${err.publicMessage} (${err.message})` : err.message;
+    result.error = expired ? `task timed out after ${timeoutSec}s`
+      : err.publicMessage ? `${err.publicMessage} (${err.message})` : err instanceof LookError ? lookFailureText(err) : err.message;
   } finally {
     clearTimeout(deadline);
     try {

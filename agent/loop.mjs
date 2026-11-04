@@ -26,8 +26,11 @@ import { buildReceipt, diffStats, receiptLine, receiptMarkdown } from './receipt
 import { seededChat, seededInfo, seededSceneBroken, seededSceneMissing } from './seeded.mjs';
 import { FILE_TOOL_NAMES, TOOL_SCHEMAS, ToolError, WRITE_TOOL_NAMES, fileTools, parseToolCall } from './tools.mjs';
 import { changedSince, initWorkspace, isClean, patchApplies, patchSince, revertTo, snapshot, stageAll, tamperHits } from './workspace.mjs';
+import { usageText } from '../runner/cgroup.mjs';
 import { LIMITS, Sandbox, networkText } from '../runner/sandbox.mjs';
-import { baseUrl, bringIn, describePlan, devServerUp, inspectProject, installDeps, look, startCommand, startDevServer } from '../runner/run-task.mjs';
+import {
+  baseUrl, bringIn, describePlan, devServerUp, inspectProject, installDeps, look, lookFailureText, startCommand, startDevServer,
+} from '../runner/run-task.mjs';
 
 /** Caps of a public task (§2.4). Admin tasks may raise them up to ADMIN_MAX. */
 export const DEFAULT_CAPS = Object.freeze({
@@ -52,9 +55,15 @@ const VISION_TIMEOUT_MS = 180_000;
 const COMPACTABLE = new Set(['read_file', 'search_code', 'list_files']);
 const SHOT = /^shots\/[A-Za-z0-9_.-]+\.png$/;
 const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+// The look's failure, for the person who started the task. Only 'timeout' says the time ran out; a
+// look stopped by a signal says what the host saw, or that the checker stopped unexpectedly.
 const LOOK_REASONS = {
   unreachable: 'the app did not answer',
   timeout: 'the measurement timed out',
+  memory: `the sandbox ran out of memory (${limitsText().split(',')[0]}, which also holds the project's files and dependencies)`,
+  pids: `the sandbox reached its limit of ${LIMITS.pids} processes and threads`,
+  sandbox: 'the sandbox stopped while the page was measured',
+  killed: 'the checker stopped unexpectedly',
   'no-report': 'the checker wrote no report',
   stale: 'the checker returned an old report',
   usage: 'the checker refused the request',
@@ -107,6 +116,8 @@ const clip = (s, n) => { const t = String(s ?? ''); return t.length > n ? t.slic
 const isOk = (result) => !/^(error|skipped|ignored)\b/.test(String(result));
 const asError = (text) => (/^error\b/.test(String(text)) ? String(text) : `error: ${text}`);
 const lookReason = (err) => LOOK_REASONS[err?.reason] ?? 'the checker failed';
+/** The one sentence a person sees when the baseline look fails (runner LookError, by its reason). */
+export const baselineFailure = (err) => `The app could not be measured: ${lookReason(err)}.`;
 const durationText = (sec) => (sec >= 120 ? `${Math.round(sec / 60)}-minute` : `${sec}-second`);
 
 function clipBytes(s, max) {
@@ -654,8 +665,10 @@ class FixRun {
       R0 = await this.timed('baseline', () => this.heavy(() => look(this.box, { ...this.matrixArgs, baseline: 'none', timeoutSec: this.caps.lookTimeoutSec })));
     } catch (err) {
       if (err instanceof Stopped || this.ac.signal.aborted) throw new Stopped();
-      throw failure(`The app could not be measured: ${lookReason(err)}.`, err);
+      this.journal(`baseline look failed: ${lookFailureText(err)}`);
+      throw failure(baselineFailure(err), err);
     }
+    if (R0?.usage) this.journal(`baseline look usage: ${usageText(R0.usage)}`);
     const s0 = R0?.report?.summary;
     if (!s0 || typeof R0.runDir !== 'string' || typeof R0.runId !== 'string') throw failure('The app could not be measured: the checker returned no usable report.');
     if (num(s0.cells) > 0 && num(s0.crashedCells) >= num(s0.cells)) throw failure('The app could not be measured: every screen crashed while loading.');
@@ -1064,10 +1077,11 @@ class FixRun {
           failReason = err.message;
         } else {
           failReason = lookReason(err);
-          this.journal(`check ${k}: look failed (${err?.reason ?? 'error'}): ${firstLine(err?.message)}`);
+          this.journal(`check ${k}: look failed: ${lookFailureText(err)}`);
         }
       }
     }
+    if (L?.usage) this.journal(`check ${k} look usage: ${usageText(L.usage)}`);
     const b = L?.report?.baseline ?? null;
     if (L && !b && !failReason) failReason = 'the comparison with the starting point failed';
 
@@ -1229,6 +1243,7 @@ class FixRun {
     } catch (err) {
       if (err instanceof Stopped || this.ac.signal.aborted) throw new Stopped();
       if (err instanceof NoTime) return tooLate();
+      this.journal(`verify look failed: ${lookFailureText(err)}`);
       this.say(`verify look failed (${lookReason(err)}): the final files are what check ${k} measured`);
       return prev;
     } finally {

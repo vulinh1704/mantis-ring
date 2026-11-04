@@ -10,9 +10,10 @@
 // of the sandbox one at a time with readFile(): regular files only, into names the host chooses.
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { rm, stat } from 'node:fs/promises';
+import { readFile, rm, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { pipeline } from 'node:stream';
+import { usageDir, watchUsage } from './cgroup.mjs';
 
 export const LIMITS = { memory: '3g', cpus: '2', pids: 512, shm: '512m', work: '2g', tmp: '512m', home: '1g' };
 /** The label of the app's own sandboxes. Self-test sandboxes lack it, so removeAll() never stops a self-test. */
@@ -310,6 +311,35 @@ export class Sandbox {
     const name = r.stdout.trim();
     if (r.code !== 0 || !name) throw new Error(`could not read the runtime of ${this.name}: ${tail(r.stderr) || 'empty answer'}`);
     return name;
+  }
+
+  /**
+   * The container's state as Docker reports it, or null when Docker cannot say. Under gVisor a
+   * sandbox kernel that stopped (at the process cap, for one) leaves the container exited.
+   * @returns {Promise<{status: string, running: boolean, oomKilled: boolean, exitCode: number}|null>}
+   */
+  async state() {
+    const r = await run('docker', ['inspect', '--type', 'container', '-f', '{{.State.Status}} {{.State.Running}} {{.State.OOMKilled}} {{.State.ExitCode}}', this.name], { timeoutMs: 15_000 });
+    const [status, running, oom, exit] = String(r.stdout).trim().split(' ');
+    if (r.code !== 0 || !/^[a-z]+$/.test(status ?? '')) return null;
+    return { status, running: running === 'true', oomKilled: oom === 'true', exitCode: Number(exit) };
+  }
+
+  /**
+   * Start watching the container's host cgroup (runner/cgroup.mjs): memory, processes, and what the
+   * kernel counted at their limits. Null where it cannot be read: Docker Desktop, cgroup v1, a
+   * container that is gone. The folder is looked up once per sandbox.
+   * @returns {Promise<{stop(): import('./cgroup.mjs').Usage}|null>}
+   */
+  async watchUsage() {
+    this.usageDir ??= (async () => {
+      const r = await run('docker', ['inspect', '--type', 'container', '-f', '{{.Id}} {{.State.Pid}}', this.name], { timeoutMs: 15_000 });
+      const [id, pid] = String(r.stdout).trim().split(/\s+/);
+      if (r.code !== 0 || !/^[1-9]\d*$/.test(pid ?? '')) return null;
+      return usageDir(await readFile(`/proc/${pid}/cgroup`, 'utf8').catch(() => ''), { id });
+    })().catch(() => null);
+    const dir = await this.usageDir;
+    return dir ? watchUsage(dir) : null;
   }
 
   /** True once `docker ps -a` no longer lists the container. False also when docker cannot be asked. */

@@ -1475,6 +1475,142 @@ async function u17() {
   }
 }
 
+/**
+ * U18: a look that fails says why, with no Docker. Only the time limit is a timeout (124, the host's
+ * own timer, or 137 once the limit has passed); any other exit code of 128 or more names its signal,
+ * and the host cgroup or Docker names the cause where they show one (the memory limit, the process
+ * limit, a sandbox that stopped). The journal line keeps the exit code, the signal, the end of stderr
+ * and the post-mortem, with credentials redacted; the public sentence stays one plain sentence. The
+ * host cgroup reader keeps what it saw before the cgroup went away.
+ */
+async function u18() {
+  const rt = await load('../runner/run-task.mjs');
+  const cg = await load('../runner/cgroup.mjs');
+  const loop = await load('../agent/loop.mjs');
+  if (!rt || !cg || !loop) return;
+  const { LookError, look, lookFailureText, postmortemText, signalOf } = rt;
+
+  check('U18 signalOf: 137 is SIGKILL, 134 SIGABRT, 135 SIGBUS, 139 SIGSEGV, 143 SIGTERM; 1, 124, 128 and 160 are no signal',
+    signalOf(137) === 'SIGKILL' && signalOf(134) === 'SIGABRT' && signalOf(135) === 'SIGBUS' && signalOf(139) === 'SIGSEGV' && signalOf(143) === 'SIGTERM'
+      && [1, 124, 128, 160].every((c) => signalOf(c) === null),
+    [137, 134, 135, 139, 143, 124, 128, 160].map((c) => `${c} ${signalOf(c)}`).join(', '));
+
+  // look() against fake boxes: exec answers the one `mantis look` after delayMs; state, execArgs (the
+  // post-mortem) and watchUsage exist only when given.
+  const GB3 = 3 * 2 ** 30;
+  const lookBox = ({ code, stderr = '', timedOut = false, delayMs = 0, state, post, usage } = {}) => {
+    const box = { posts: 0, exec: async () => { await wait(delayMs); return { code, stdout: '', stderr, timedOut, truncated: false }; } };
+    if (state !== undefined) box.state = async () => state;
+    if (post !== undefined) box.execArgs = async () => { box.posts++; return { code: 0, stdout: JSON.stringify(post), stderr: '', timedOut: false, truncated: false }; };
+    if (usage !== undefined) box.watchUsage = async () => ({ stop: () => usage });
+    return box;
+  };
+  const failOf = (box, o = {}) => look(box, { port: 3000, timeoutSec: 300, ...o }).then(() => null, (e) => e);
+  const t = {
+    t124: await failOf(lookBox({ code: 124 })),
+    host: await failOf(lookBox({ code: 137, timedOut: true })),
+    killAfterLimit: await failOf(lookBox({ code: 137, delayMs: 1050 }), { timeoutSec: 1 }),
+    kill: await failOf(lookBox({ code: 137 })),
+    bus: await failOf(lookBox({ code: 135 })),
+    e128: await failOf(lookBox({ code: 128 })),
+  };
+  const reasons = Object.fromEntries(Object.entries(t).map(([k, e]) => [k, e instanceof LookError ? e.reason : `no LookError: ${e?.message ?? e}`]));
+  check('U18 only the time limit is a timeout (exit 124, the host timer, 137 once the limit passed); 137 or 135 early, or 128, is "killed" with its signal and how long it ran, never "timed out"',
+    reasons.t124 === 'timeout' && reasons.host === 'timeout' && reasons.killAfterLimit === 'timeout' && reasons.kill === 'killed' && reasons.bus === 'killed' && reasons.e128 === 'killed'
+      && t.kill.signal === 'SIGKILL' && t.kill.exitCode === 137 && /^mantis look was stopped by SIGKILL after 0\.\d s$/.test(t.kill.message)
+      && t.bus.signal === 'SIGBUS' && t.e128.signal === null && /ended with exit code 128/.test(t.e128.message) && !/within/.test(t.kill.message),
+    `${JSON.stringify(reasons)}; ${t.kill?.message}; ${t.e128?.message}`);
+
+  const running = { status: 'running', running: true, oomKilled: false, exitCode: 0 };
+  const usageOf = (o) => ({ dir: '/cg/x', reads: 20, gone: false, error: '', memMax: GB3, memPeak: 2 * 2 ** 30, pidsMax: 512, pidsPeak: 200, atMemLimit: 0, oom: 0, oomKill: 0, pidsRefused: 0, ms: 4900, ...o });
+  const facts = {
+    procs: [{ pid: 12, comm: 'next-server (v16', state: 'S', threads: 40, rssKb: 1_258_291 }, { pid: 30, comm: 'chrome-headless', state: 'S', threads: 30, rssKb: 419_430 }],
+    mem: { MemTotal: 3_145_728, MemAvailable: 104_858, Shmem: 1_048_576 }, dirs: { '/work': { used: 1.5 * 2 ** 30, size: 2 * 2 ** 30 } }, dev: true, log: 'ready in 2.1s\nGET / 200 in 92ms\n',
+  };
+  const c = {
+    memory: await failOf(lookBox({ code: 137, state: running, post: facts, usage: usageOf({ memPeak: GB3 - 4096, atMemLimit: 6, oom: 1, oomKill: 1 }) })),
+    pids: await failOf(lookBox({ code: 134, state: running, post: facts, usage: usageOf({ pidsPeak: 512, pidsRefused: 3 }) })),
+    gone: await failOf(lookBox({ code: 137, state: { status: 'exited', running: false, oomKilled: false, exitCode: 128 }, post: facts })),
+    dockerOom: await failOf(lookBox({ code: 137, state: { status: 'exited', running: false, oomKilled: true, exitCode: 137 } })),
+    nothing: await failOf(lookBox({ code: 139, state: running, post: facts, usage: usageOf({}) })),
+  };
+  const causes = Object.fromEntries(Object.entries(c).map(([k, e]) => [k, e?.reason]));
+  check('U18 the cause comes from what was measured: an OOM in the host cgroup is "memory", a refused fork "pids", an exited container "sandbox" ("memory" when Docker says OOM-killed), nothing seen "killed"; a stopped container gets no post-mortem exec',
+    causes.memory === 'memory' && causes.pids === 'pids' && causes.gone === 'sandbox' && causes.dockerOom === 'memory' && causes.nothing === 'killed'
+      && /^container exited \(exit 128\)$/.test(c.gone?.postmortem ?? '') && c.memory?.usage?.oomKill === 1,
+    `${JSON.stringify(causes)}; gone: ${c.gone?.postmortem}`);
+
+  const key = process.env.VULTR_INFERENCE_API_KEY;
+  const leaky = await failOf(lookBox({
+    code: 135, state: running, post: { ...facts, log: `ready\ncurl -H "Authorization: Bearer abcdefgh12345678" https://user:pw@example.com/x ${key}\n` },
+    usage: usageOf({ memPeak: 2.5 * 2 ** 30 }),
+    stderr: `\x1b[31mlook: / mobile/light ok\x1b[0m\nBus error (core dumped)\napi_key=${key} token abcdefgh12345678\nthe monitored command dumped core\n`,
+  }));
+  const line = lookFailureText(leaky);
+  check('U18 the journal line keeps the exit code and signal, the time, the host cgroup, the end of stderr and the post-mortem (processes, tmpfs, dev server, its log), with credentials redacted',
+    /^killed: mantis look was stopped by SIGBUS after 0\.\d s · exit 135 \(SIGBUS\) · after 0\.\d s · memory: at most 2\.50 GB of 3\.00 GB/.test(line)
+      && /stderr: look: \/ mobile\/light ok \| Bus error \(core dumped\) \| api_key=\[redacted\] token \[redacted\] \| the monitored command dumped core/.test(line)
+      && /container running · 2 processes, 70 threads, 1\.60 GB resident \(largest: next-server \(v16 1\.20 GB 40 threads/.test(line)
+      && /tmpfs: \/work 1\.50 GB of 2\.00 GB/.test(line) && /dev server running/.test(line) && /dev log: ready \| curl -H "Authorization: \[redacted\]/.test(line)
+      && /https:\/\/\[redacted\]@example\.com/.test(line) && !line.includes(key) && !line.includes('abcdefgh12345678') && !line.includes('\x1b') && leaky.reason === 'killed',
+    line.slice(0, 600));
+
+  const plain = (s) => /^[A-Z][^\n]{10,250}\.$/.test(s) && !/\.\s+[A-Z]/.test(s);
+  const sentences = Object.fromEntries(['timeout', 'memory', 'pids', 'sandbox', 'killed', 'unreachable', 'nope'].map((r) => [r, loop.baselineFailure({ reason: r })]));
+  check('U18 the public sentence for each reason is one plain sentence; only "timeout" says the measurement timed out, and "memory" names the sandbox\'s memory',
+    Object.values(sentences).every(plain) && /timed out/.test(sentences.timeout) && Object.entries(sentences).every(([r, s]) => r === 'timeout' || !/timed out/.test(s))
+      && /ran out of memory \(3 GB RAM/.test(sentences.memory) && /512 processes/.test(sentences.pids),
+    Object.values(sentences).join(' | '));
+
+  // The host cgroup: a folder that reaches its memory limit, refuses forks and goes away, as Docker removes it.
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'ring-u18-'));
+  let seen = null;
+  try {
+    const put = (f, v) => writeFileSync(path.join(dir, f), `${v}\n`);
+    put('memory.max', GB3); put('pids.max', 512); put('memory.current', 1000); put('pids.current', 10);
+    put('memory.events', 'low 0\nhigh 0\nmax 2\noom 0\noom_kill 0\noom_group_kill 0'); put('pids.events', 'max 5');
+    const w = cg.watchUsage(dir, { everyMs: 5 });
+    await wait(30);
+    put('memory.current', GB3 - 4096); put('pids.current', 300);
+    put('memory.events', 'low 0\nhigh 0\nmax 9\noom 1\noom_kill 1\noom_group_kill 0'); put('pids.events', 'max 7');
+    await wait(40);
+    put('memory.current', 5000);
+    await wait(20);
+    rmSync(dir, { recursive: true, force: true });
+    await wait(30);
+    seen = w.stop();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  const v = (o) => cg.usageVerdict({ ...usageOf({}), ...o });
+  check('U18 watchUsage keeps the limits, the most memory and processes at once and what the kernel counted since the watch began, after the cgroup went away; usageVerdict reads it',
+    seen?.memMax === GB3 && seen.pidsMax === 512 && seen.memPeak === GB3 - 4096 && seen.pidsPeak === 300 && seen.atMemLimit === 7 && seen.oom === 1 && seen.oomKill === 1
+      && seen.pidsRefused === 2 && seen.gone === true && seen.reads > 2 && cg.usageVerdict(seen) === 'memory'
+      && v({ pidsRefused: 1 }) === 'pids' && v({ gone: true }) === 'sandbox' && v({ gone: true, memPeak: GB3 }) === 'memory' && v({}) === null && cg.usageVerdict({ reads: 0 }) === null
+      && cg.usageVerdict(null) === null && /at the limit 7 times, 1 OOM, 1 OOM kill .* at most 300 of 512, 2 refused/.test(cg.usageText(seen)),
+    cg.usageText(seen));
+
+  const root = mkdtempSync(path.join(os.tmpdir(), 'ring-u18-cg-'));
+  try {
+    const id = 'b'.repeat(64);
+    const scope = path.join(root, 'system.slice', `docker-${id}.scope`);
+    mkdirSync(scope, { recursive: true });
+    const proc = `0::/system.slice/docker-${id}.scope\n`;
+    const noMemory = cg.usageDir(proc, { root, id });
+    writeFileSync(path.join(scope, 'memory.current'), '1\n');
+    writeFileSync(path.join(scope, 'pids.current'), '1\n');
+    check('U18 usageDir finds the container\'s cgroup v2 folder from /proc/<pid>/cgroup or from its id, and only one with memory.current and pids.current',
+      noMemory === null && cg.usageDir(proc, { root, id }) === scope && cg.usageDir('', { root, id }) === scope && cg.usageDir('0::/elsewhere\n', { root }) === null,
+      `${noMemory} → ${cg.usageDir(proc, { root, id })}`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+
+  check('U18 postmortemText on nothing usable still says so; a LookError made the old way (three arguments) has no exit code or usage',
+    /^0 processes, 0 threads, 0\.00 GB resident · dev server unknown$/.test(postmortemText({})) && new LookError('usage', 'x', '').exitCode === null && new LookError('usage', 'x').usage === null,
+    postmortemText({}));
+}
+
 // ---------------------------------------------------------------------------------------------
 // Sandbox scenarios (Docker; runc locally, runsc on the VM)
 // ---------------------------------------------------------------------------------------------
@@ -2121,6 +2257,7 @@ try {
   await group('U15', u15);
   await group('U16', u16);
   await group('U17', u17);
+  await group('U18', u18);
   if (!args.unit) await scenarios();
 
   const failed = results.filter((r) => !r.pass);

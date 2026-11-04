@@ -5,10 +5,11 @@
 // is reported as such, never as "held at the cap".
 import { readFileSync, watch } from 'node:fs';
 import path from 'node:path';
+import { CGROUP_ROOT, cgroupDirs } from '../runner/cgroup.mjs';
 import { run } from '../runner/sandbox.mjs';
 
-/** Where the host mounts its cgroups. */
-export const CGROUP_ROOT = '/sys/fs/cgroup';
+// The runner reads the same cgroups while a look runs (runner/cgroup.mjs); the folder rule is shared.
+export { CGROUP_ROOT, cgroupDirs };
 
 // --- Reaching an address ------------------------------------------------------------------------------
 /**
@@ -26,25 +27,6 @@ export const ipv6Of = (addresses) => (Array.isArray(addresses) ? addresses : [])
 // --- The process cap, read from the host -------------------------------------------------------------
 /** A path with every 64-digit container id cut to 12 digits, for the detail of a check. */
 const short = (p) => String(p).replace(/[0-9a-f]{64}/g, (id) => `${id.slice(0, 12)}…`);
-
-/**
- * The cgroup folders named in the text of /proc/<pid>/cgroup, most likely first: the cgroup v2 line
- * ("0::/system.slice/docker-<id>.scope"), then the v1 line of the pids controller.
- * @param {string} procText
- * @param {string} [root]
- * @returns {string[]}
- */
-export function cgroupDirs(procText, root = CGROUP_ROOT) {
-  const v2 = [];
-  const v1 = [];
-  for (const line of String(procText ?? '').split('\n')) {
-    const m = /^(\d+):([^:]*):(\/.*)$/.exec(line.trim());
-    if (!m) continue;
-    if (m[1] === '0' && m[2] === '') v2.push(path.join(root, m[3]));
-    else if (m[2].split(',').includes('pids')) v1.push(path.join(root, 'pids', m[3]));
-  }
-  return [...v2, ...v1];
-}
 
 /** The "max" counter of a pids.events file: how many forks the cgroup refused at its limit (0 when absent). */
 export function parsePidsEvents(text) {
