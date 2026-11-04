@@ -8,6 +8,21 @@ A boxing ring for coding agents that fix UI bugs. They can punch, but not outsid
 
 Built for the Vultr Agent Rush hackathon (Challenge 1, Blast Radius Zero). See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
+## Vultr services architecture and use case
+
+**Use case:** coding agents change UI they never look at. In Mantis Ring, a coding agent fixes UI bugs in a web project: text that overflows on a phone, a layout that breaks in another language, colours that disappear in dark mode. Its fixes are re-measured, not trusted: Mantis measures every route, screen size, colour scheme and language in the task at the start and again after each batch of edits, and a change that only hides a bug is rolled back. A person approves the run before its patch is handed out, and nothing is applied anywhere.
+
+**Architecture:** two Vultr services. Every run happens on one Vultr Cloud Compute VM, each task in a throwaway gVisor sandbox, and every model call goes from the app, outside the sandboxes, to Vultr Serverless Inference. The diagram is at the top of [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+| Vultr service | What it does in Mantis Ring | Where |
+|---|---|---|
+| Cloud Compute: one VX1 VM, `vx1-g-4c-16g-240s` (4 vCPUs, 16 GB), in Seattle (`sea`) | Runs the whole demo except the models: Caddy (HTTPS, `/latest/` as static files), the app (queue, live progress, receipts, approval, `/status`, spend ledger, publisher), the agent loop, Docker with gVisor (`runsc`) for one sandbox and one internal network per task, and the egress allowlist proxy (npm and GitHub only). Runs are controlled here, not only hosted: the orchestrator caps checks, turns, tool calls, tokens, money and wall clock, rolls back cover-ups and destroys each sandbox when its task ends. The gVisor self-tests (`ring.sh selftest`, `deploy.sh --selftest`) go through the same queue, so they never run beside a task. | `app/`, `agent/loop.mjs`, `runner/`, `proxy/`, `sandbox/Dockerfile`, `scripts/vm-bootstrap.sh`, `scripts/deploy.sh`, `scripts/ring.sh` |
+| Serverless Inference: `deepseek-v4.1-flash-1017` | The fix model: every call of the fixing agent, with tool calling. The key stays in the app's process and never enters a sandbox. | `agent/inference.mjs`, `agent/loop.mjs`, `agent/prompt.mjs`, `agent/tools.mjs` |
+| Serverless Inference: `qwen3.8-27b` | The vision second opinion on up to four before/after crops, in a strict JSON schema. It never changes the counts, the gate or the publish bar. | `agent/vision.mjs`, `agent/png.mjs` |
+| Serverless Inference: model choice and spend | A tool-calling probe per candidate model, list prices from the model catalogue (pinned on 4 Nov as a fallback), and a spend ledger whose guard fails closed. The bake-off compared `deepseek-v4.1-flash-1017`, `glm-5.3` and `minimax-m3.1-flash` (the stored fallback); see [First real runs](#first-real-runs). | `agent/probe.mjs`, `agent/prices.mjs`, `app/spend.mjs`, `bench/bakeoff.sh`, `bench/table.mjs` |
+
+The Caddyfile and the `mantis-ring` systemd unit are not in this repository: the cloud-init template drafted before the event wrote them on the VM (see [Built before the event](#built-before-the-event)).
+
 ## Status
 
 The demo runs on a Vultr VM at https://104-156-252-200.sslip.io, with every task sandbox under gVisor (`runsc`) on an internal network of its own, on which the VM has no address. `/status` names the commit the VM runs, and each result below names the commit it was measured on.
