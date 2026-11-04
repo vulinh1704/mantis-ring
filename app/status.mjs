@@ -213,7 +213,7 @@ const row = (label, value) => `<div class="kv-row"><dt>${esc(label)}</dt><dd>${v
 const pill = (ok, yes, no) => `<span class="pill ${ok ? 'is-ok' : 'is-bad'}">${esc(ok ? yes : no)}</span>`;
 
 function runtimeText(rt) {
-  // healthcheck.sh greps this page for "runsc": it may appear only when gVisor really is available.
+  // deploy.sh's outside check (or healthcheck.sh) greps this page for "runsc": it may appear only when gVisor really is available.
   if (rt.available) return `<code>runtime: ${esc(rt.configured)}</code> ${pill(true, 'available', '')}`;
   if (!rt.docker) return `<code>runtime: unknown</code> ${pill(false, '', 'Docker does not answer')}`;
   if (rt.configured === 'runsc') return `<code>runtime: unavailable</code> ${pill(false, '', 'gVisor is configured, but Docker does not list it')}`;
