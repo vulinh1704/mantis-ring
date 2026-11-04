@@ -276,7 +276,10 @@
     if (!t) return;
     let text;
     if (t.state === 'queued') {
-      text = t.position ? `Waiting in line: position ${t.position}. Expected to finish in ${etaText(t.etaSec)}.` : 'Starting…';
+      // While a self-test holds the line (app/server.mjs), no run starts until it ends, so there is no ETA either.
+      if (!t.position) text = 'Starting…';
+      else if (t.held) text = `Waiting in line: position ${t.position}. A self-test of the sandboxes is running on the VM, and no run starts until it ends.`;
+      else text = `Waiting in line: position ${t.position}. Expected to finish in ${etaText(t.etaSec)}.`;
     } else if (t.state === 'running') {
       text = `Now: ${STEPS[t.step] || 'working'}${S.lastLog ? ` — ${S.lastLog}` : ''}`;
     } else if (t.state === 'done') {
@@ -287,7 +290,8 @@
     if (!FINISHED.has(t.state)) {
       const quiet = Math.round((Date.now() - S.lastEventAt) / 1000);
       if (!S.connected) text += ' (Reconnecting to the live log; meanwhile this page checks the run every 5 s.)';
-      else if (quiet > 30) text += ` (Still working: the last update came ${quiet} s ago. Installing, measuring and model calls can each take a while.)`;
+      // A run in line gets an update only when its place changes, so only a running one says it is still working.
+      else if (t.state === 'running' && quiet > 30) text += ` (Still working: the last update came ${quiet} s ago. Installing, measuring and model calls can each take a while.)`;
     }
     $('t-now').textContent = text;
   }
@@ -494,6 +498,7 @@
         t.state = d.state;
         if ('position' in d) t.position = d.position;
         if ('etaSec' in d) t.etaSec = d.etaSec;
+        if ('held' in d) t.held = d.held === true;
         renderHead(S);
         renderNow(S);
         renderActions(S);

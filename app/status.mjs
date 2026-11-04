@@ -150,12 +150,14 @@ function spendSummary(spend, cfg) {
 /**
  * Everything /status shows (§4.7). queue.longestRunningSec is how long the task that has run longest
  * has been running (0 when none runs): a monitor outside the VM can tell a stuck task from a busy
- * queue that runs many short tasks back to back.
+ * queue that runs many short tasks back to back. queue.held is true while a self-test holds the line:
+ * no waiting run starts until it ends.
  * @param {{cfg:object, queue:{running():string[], queued():string[], maxRunning:number}, spend:object|null,
- *          startedAt:number, now?:() => number, runtime?:string, etaSec?:number|null, longestRunningSec?:number}} ctx
+ *          startedAt:number, now?:() => number, runtime?:string, etaSec?:number|null, longestRunningSec?:number,
+ *          held?:boolean}} ctx
  */
 export async function statusData(ctx) {
-  const { cfg, queue, spend, startedAt, now = Date.now, runtime, etaSec = null, longestRunningSec = 0 } = ctx;
+  const { cfg, queue, spend, startedAt, now = Date.now, runtime, etaSec = null, longestRunningSec = 0, held = false } = ctx;
   const [rt, proxy, inference] = await Promise.all([runtimeInfo(), proxyInfo(), inferenceInfo()]);
   const configured = runtime || 'runc';
   const available = rt.docker && (configured === 'runc' || rt.runtimes.includes(configured));
@@ -167,7 +169,7 @@ export async function statusData(ctx) {
     inference: { provider: PROVIDER, ...inference, fixModel: cfg.fixModel, visionModel: cfg.visionModel },
     selftest,
     spend: spendSummary(spend, cfg),
-    queue: { running: queue.running().length, queued: queue.queued().length, maxRunning: queue.maxRunning, etaSec, longestRunningSec },
+    queue: { running: queue.running().length, queued: queue.queued().length, maxRunning: queue.maxRunning, etaSec, longestRunningSec, held: held === true },
     latest: readLatest(),
     publicSampleRuns: cfg.publicSampleRuns === true,
     publicGithubRuns: cfg.publicGithubRuns === true,
@@ -293,8 +295,10 @@ export function statusHtml(d) {
   const queue = [
     row('Running', esc(`${d.queue.running} of ${d.queue.maxRunning} at once`)),
     row('Waiting', esc(d.queue.queued)),
+    ...(d.queue.held ? [row('Held', '<span class="muted">a self-test of the sandboxes is running, and no waiting run starts until it ends</span>')] : []),
     // Only a visitor who can start a run needs an ETA; it comes from comparable runs (app/tasks.mjs).
-    ...(d.publicSampleRuns || d.publicGithubRuns ? [row('A new run would finish in', esc(etaText(d.queue.etaSec)))] : []),
+    ...(d.publicSampleRuns || d.publicGithubRuns
+      ? [d.queue.held ? row('A new run would start', 'when the self-test ends') : row('A new run would finish in', esc(etaText(d.queue.etaSec)))] : []),
     row('Public runs, sample', d.publicSampleRuns ? pill(true, 'open', '') : '<span class="muted">not open yet</span>'),
     row('Public runs, GitHub repositories', d.publicGithubRuns ? pill(true, 'open', '') : '<span class="muted">not open yet</span>'),
   ].join('');

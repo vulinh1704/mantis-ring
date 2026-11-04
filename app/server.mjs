@@ -377,10 +377,12 @@ function sseFrame(type, data, seq) {
  * its own owner link, and so is every run while no passphrase is set; the record and the published
  * page then say exactly that. A published public run needs both, so the judge who started it, who
  * has only the link, can no longer approve it or download its patch (its diff stays public).
+ * `selftestDir` is the folder of the suites that POST /admin/selftest runs (test/ of this repository; a
+ * test passes stand-ins).
  * @param {{config?:{get():object, set(patch:object):object}, store?:TaskStore, queue?:Queue, spend?:object|null,
  *   runFix?:Function|null, publish?:typeof publishLatest, status?:{statusData:Function, statusHtml:Function},
  *   now?:() => number, probe?:{probeAll:Function}|null, vision?:Function|null, stats?:RunStats, log?:(line:string) => void,
- *   approval?:{passphraseSha256?:string|null}}} deps
+ *   approval?:{passphraseSha256?:string|null}, selftestDir?:string}} deps
  * @returns {{server: import('node:http').Server, close(): Promise<void>, store: TaskStore, queue: Queue}}
  */
 export function createApp(deps = {}) {
@@ -397,14 +399,24 @@ export function createApp(deps = {}) {
   const vision = deps.vision ?? null;
   const stats = deps.stats ?? new RunStats(path.join(STATE_DIR, 'stats.json'));
   const approval = deps.approval ?? { passphraseSha256: null };
+  const selftestDir = deps.selftestDir ?? path.join(REPO_ROOT, 'test');
   const startedAt = now();
   const streams = new Set();       // open SSE responses
   const streamsByKey = new Map();  // client key -> number of open SSE responses
   const announced = new Map();     // queued task -> position last sent
   const passphraseTries = new Map(); // task id -> wrong approval passphrases in this process
-  let selftestNow = null;          // the suite of a self-test that waits or runs (/admin/busy)
+  const selftests = [];            // the self-tests that wait or run, in order of arrival: {suite, running}
   let speechBusy = false;          // one speech call at a time, so its caps are checked against what is spent
   let closing = null;
+
+  /** /admin/busy: the suite of the self-test that runs, else of the first that waits; null when there is none. */
+  const selftestNow = () => (selftests.find((s) => s.running) ?? selftests[0])?.suite ?? null;
+  /**
+   * Whether a self-test holds the line: from the moment one is asked for, while it waits for the running
+   * tasks to end, until it ends, no waiting task starts (Queue.pauseForExclusive). A run held this way
+   * says so on its page and on /status, and gets no ETA, since no run's history predicts the self-test.
+   */
+  const held = () => selftests.length > 0;
 
   /** The approval passphrase's SHA-256 (lowercase hex), or null when the owner link alone approves. */
   const approvalHash = () => {
@@ -436,16 +448,18 @@ export function createApp(deps = {}) {
   // --- queue, ETA, task life cycle -------------------------------------------------------------
   queue.on('change', announcePositions);
 
-  /** Tell each waiting task its new place in line. */
+  /** Tell each waiting task its new place in line, and whether a self-test holds the line. */
   function announcePositions() {
     const waiting = queue.queued();
+    const hold = held();
     for (const id of waiting) {
       const position = queue.position(id);
-      if (announced.get(id) === position) continue;
-      announced.set(id, position);
+      const said = `${position}${hold ? ' held' : ''}`;
+      if (announced.get(id) === said) continue;
+      announced.set(id, said);
       try {
         store.update(id, { position });
-        emit(id, 'state', { state: 'queued', position, etaSec: etaFor(id) });
+        emit(id, 'state', { state: 'queued', position, etaSec: etaFor(id), held: hold });
       } catch (err) {
         log(`task=${id} position not announced: ${oneLine(err)}`);
       }
@@ -465,18 +479,22 @@ export function createApp(deps = {}) {
   };
   /** The median length of a comparable run, once MIN_ETA_RUNS of them exist; null before ("a few minutes"). */
   const medianRun = () => (stats.count() >= MIN_ETA_RUNS ? stats.median() : null);
-  /** §4.4: ceil(position / maxRunning) × median + time until a slot frees. null without enough history. */
+  /**
+   * §4.4: ceil(position / maxRunning) × median + time until a slot frees. null without enough history,
+   * and for a waiting task while a self-test holds the line.
+   */
   function etaFor(id) {
     const median = medianRun();
     const pos = queue.position(id);
     if (median === null || pos === null) return null;
     if (pos === 0) return Math.max(0, Math.round(median - elapsedSec(id)));
+    if (held()) return null;
     return Math.round(Math.ceil(pos / Math.max(1, queue.maxRunning)) * median + slotFreeIn(median));
   }
-  /** ETA for a run submitted now (shown on /status). */
+  /** ETA for a run submitted now (shown on /status); null while a self-test holds the line. */
   function etaForNew() {
     const median = medianRun();
-    if (median === null) return null;
+    if (median === null || held()) return null;
     const pos = queue.queued().length + 1;
     if (queue.queued().length === 0 && queue.running().length < queue.maxRunning) return Math.round(median);
     return Math.round(Math.ceil(pos / Math.max(1, queue.maxRunning)) * median + slotFreeIn(median));
@@ -674,6 +692,7 @@ export function createApp(deps = {}) {
       out.position = queue.position(rec.id) ?? rec.position ?? null;
       out.etaSec = etaFor(rec.id);
     }
+    if (rec.state === 'queued') out.held = held();
     out.hasPatch = rec.state === 'done' && store.size(rec.id, 'patch.diff') > 0;
     out.approvalNeedsPassphrase = passphraseFor(rec) !== null;
     out.files = store.names(rec.id, TASK_IMAGE);
@@ -693,7 +712,7 @@ export function createApp(deps = {}) {
   function statusNow() {
     // How long the oldest running task has run: the outside monitor's "stuck task" signal.
     const longestRunningSec = Math.round(Math.max(0, ...queue.running().map(elapsedSec)));
-    return status.statusData({ cfg: config.get(), queue, spend, startedAt, now, runtime: RUNTIME, etaSec: etaForNew(), longestRunningSec });
+    return status.statusData({ cfg: config.get(), queue, spend, startedAt, now, runtime: RUNTIME, etaSec: etaForNew(), longestRunningSec, held: held() });
   }
 
   // --- public routes (§4.2) --------------------------------------------------------------------
@@ -1065,26 +1084,37 @@ export function createApp(deps = {}) {
   /**
    * Run one test suite with no task running (§4.3): an exclusive queue lock, then the suite as a child
    * process with childEnv only (no API key at all), its output streamed back as text. 20 minutes at most.
+   * Each call is on the self-test list from the moment it arrives until it ends, so /admin/busy and the
+   * held runs see every self-test that waits or runs, also when two calls overlap.
    */
   async function adminSelftest(c) {
     const body = await readJson(c.req);
     const suite = body.suite;
     if (!SELFTEST_SUITES.includes(suite)) throw new HttpError(400, `suite must be one of: ${SELFTEST_SUITES.join(', ')}.`);
-    const file = path.join(REPO_ROOT, 'test', `${suite}.mjs`);
+    const file = path.join(selftestDir, `${suite}.mjs`);
     if (!existsSync(file)) throw new HttpError(404, `test/${suite}.mjs is not deployed.`);
     const res = c.res;
     res.writeHead(200, headers({ 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store', 'x-accel-buffering': 'no' }));
     res.on('error', () => {});
     const say = (text) => { if (!res.writableEnded && !res.destroyed) res.write(text); };
     say(`selftest ${suite}: waiting until no task is running (new tasks wait too)\n`);
-    selftestNow = suite;
-    const release = await queue.pauseForExclusive();
+    const me = { suite, running: false };
+    selftests.push(me);
+    // Off the list before release(), whose 'change' then tells the runs in line that the hold is over.
+    const leave = () => {
+      const i = selftests.indexOf(me);
+      if (i >= 0) selftests.splice(i, 1);
+    };
+    const turn = queue.pauseForExclusive();   // from here on, no waiting task starts
+    announcePositions();                      // the runs in line learn that a self-test holds it
+    const release = await turn;
     if (res.destroyed) {
+      leave();
       release();
-      selftestNow = null;
       log(`selftest ${suite}: the caller left before it started; not run`);
       return;
     }
+    me.running = true;
     log(`selftest ${suite}: started`);
     say(`selftest ${suite}: started, runtime ${RUNTIME ?? 'runc'}\n`);
     let finished = false, killTimer = null;
@@ -1099,8 +1129,8 @@ export function createApp(deps = {}) {
       finished = true;
       clearTimeout(timer);
       clearTimeout(killTimer);
+      leave();
       release();
-      selftestNow = null;
       log(`selftest ${suite}: ${how}`);
       say(`\nselftest ${suite}: ${how}\n`);
       if (!res.writableEnded && !res.destroyed) res.end();
@@ -1144,8 +1174,11 @@ export function createApp(deps = {}) {
   ];
   const ADMIN = [
     ['GET', /^\/admin\/health$/, adminHealth],
-    // For deploy.sh: no Docker calls, so it answers at once even while looks keep the CPUs busy.
-    ['GET', /^\/admin\/busy$/, (c) => sendJson(c.res, 200, { running: queue.running().length, queued: queue.queued().length, selftest: selftestNow })],
+    // For deploy.sh: no Docker calls, so it answers at once even while looks keep the CPUs busy. `selftest`
+    // is the suite that runs, else the first that waits (null when none), and selftestsWaiting counts those waiting.
+    ['GET', /^\/admin\/busy$/, (c) => sendJson(c.res, 200, {
+      running: queue.running().length, queued: queue.queued().length, selftest: selftestNow(), selftestsWaiting: selftests.filter((s) => !s.running).length,
+    })],
     ['GET', /^\/admin\/tasks$/, adminList],
     ['POST', /^\/admin\/tasks$/, adminCreate],
     ['GET', new RegExp(`^/admin/tasks/(${ID})$`), adminGet],

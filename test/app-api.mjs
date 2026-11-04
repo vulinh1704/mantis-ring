@@ -5,10 +5,11 @@
 // D-4 (loopback peer, no X-Forwarded-For, loopback Host), D-5 (public runs closed), the per-IP and
 // queue limits, approve/patch with the owner token, and SSE replay, and POST /admin/speech (the video's
 // voice: admin only, its text and cost caps, the ledger line) with scripts/ring.sh tts, what
-// scripts/ring.sh mem sends (scripts/vm-mem.sh, the VM's memory, read-only), and scripts/ring.sh
-// selftest with the --selftest step of scripts/deploy.sh, against a stand-in for ssh. /status and the
-// speech calls talk to test/fake-gateway.mjs, never to the real inference service. Each check prints
-// PASS or FAIL.
+// scripts/ring.sh mem sends (scripts/vm-mem.sh, the VM's memory, read-only), POST /admin/selftest on
+// stand-in suites (/admin/busy, and the runs a self-test holds), and scripts/ring.sh selftest with the
+// --selftest step, the second busy check and the outside checks of scripts/deploy.sh, against
+// stand-ins for ssh and the site. /status and the speech calls talk to test/fake-gateway.mjs, never to
+// the real inference service. Each check prints PASS or FAIL.
 // Usage: node test/app-api.mjs
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -215,7 +216,20 @@ try {
   const store = new tasksMod.TaskStore({ dir: path.join(config.STATE_DIR, 'tasks'), log });
   const queue = new tasksMod.Queue({ maxRunning: 2, heavySlots: 2, maxQueued: 8, log });
   const spend = new Spend({ dir: config.STATE_DIR, caps: config.get().spendCaps, log });
-  app = createApp({ config, store, queue, spend, runFix: fake.runFix, publish: fakePublish, status, now: Date.now, log, approval: approvalCfg });
+  // Stand-ins for the suites that POST /admin/selftest runs (no Docker here): each writes <suite>.started,
+  // waits until <suite>.go exists (10 s at most) and passes, so a test decides when a self-test ends.
+  const selftestDir = path.join(stateDir, 'selftest-suites');
+  await mkdir(selftestDir, { recursive: true });
+  for (const s of ['agent-loop', 'containment', 'scenes']) {
+    const mark = (what) => JSON.stringify(path.join(selftestDir, `${s}.${what}`));
+    await writeFile(path.join(selftestDir, `${s}.mjs`), `import { existsSync, writeFileSync } from 'node:fs';
+writeFileSync(${mark('started')}, '');
+const end = Date.now() + 10_000;
+while (!existsSync(${mark('go')}) && Date.now() < end) await new Promise((ok) => setTimeout(ok, 20));
+console.log('1/1 ${s} checks passed');
+`);
+  }
+  app = createApp({ config, store, queue, spend, runFix: fake.runFix, publish: fakePublish, status, now: Date.now, log, approval: approvalCfg, selftestDir });
   await new Promise((resolve, reject) => {
     app.server.once('error', reject);
     app.server.listen(0, '127.0.0.1', () => { app.server.off('error', reject); resolve(); });
@@ -862,8 +876,58 @@ try {
   const zero = await admin('POST', '/admin/tasks', { body: { sample: 'lumen', caps: { maxUsd: 0 } } });
   check('caps.maxUsd 0 is refused at creation (400), as the loop would refuse it', zero.status === 400 && /maxUsd/.test(zero.json?.error ?? ''), `${zero.status} ${oneLine(zero.json?.error)}`);
   const busy = await admin('GET', '/admin/busy');
-  check('/admin/busy answers running, queued and the self-test in progress', busy.status === 200 && busy.json?.running === 0 && busy.json?.queued === 0 && busy.json?.selftest === null,
+  check('/admin/busy answers running, queued and the self-test in progress', busy.status === 200 && busy.json?.running === 0 && busy.json?.queued === 0 && busy.json?.selftest === null
+    && busy.json?.selftestsWaiting === 0,
     oneLine(busy.text));
+
+  // Two self-tests that overlap, on the stand-in suites: /admin/busy names the one that runs and counts
+  // the one that waits, also after the first has ended (deploy.sh refuses a restart on that answer).
+  // A run asked for meanwhile is held: it waits with no ETA, says why, and starts when the last one ends.
+  const exists = (f) => readFile(f).then(() => true, () => false);
+  const until = async (fn, ms = 8000) => {
+    const end = Date.now() + ms;
+    while (Date.now() < end) { if (await fn()) return true; await wait(20); }
+    return false;
+  };
+  const busyNow = async () => (await admin('GET', '/admin/busy')).json ?? {};
+  const stMark = (s, what) => path.join(selftestDir, `${s}.${what}`);
+  const firstSt = admin('POST', '/admin/selftest', { body: { suite: 'containment' } });
+  await until(() => exists(stMark('containment', 'started')));
+  const secondSt = admin('POST', '/admin/selftest', { body: { suite: 'scenes' } });
+  await until(async () => (await busyNow()).selftestsWaiting === 1);
+  const busyBoth = await busyNow();
+  const heldTask = await admin('POST', '/admin/tasks', { body: { sample: 'lumen', routes: ['/'], viewports: ['mobile'], schemes: ['light'], locales: ['en'], label: 'held by a self-test' } });
+  const hid = heldTask.json?.id;
+  await wait(100);
+  const heldView = recordOf((await visitor('203.0.113.60', 'GET', `/api/tasks/${hid}`)).json);
+  const heldQueue = (await visitor('203.0.113.60', 'GET', '/status.json')).json?.queue;
+  const heldPage = (await visitor('203.0.113.60', 'GET', '/status')).text;
+  await writeFile(stMark('containment', 'go'), '');
+  const firstOut = await firstSt;
+  await until(() => exists(stMark('scenes', 'started')));
+  const busySecond = await busyNow();
+  const stillHeld = recordOf((await visitor('203.0.113.60', 'GET', `/api/tasks/${hid}`)).json);
+  await writeFile(stMark('scenes', 'go'), '');
+  const secondOut = await secondSt;
+  const heldEnd = hid ? await settle(hid) : 'no task';
+  const busyAfter = await busyNow();
+  const freeQueue = (await visitor('203.0.113.60', 'GET', '/status.json')).json?.queue;
+  const heldStates = hid ? (await readSse(`/api/tasks/${hid}/events`, viaCaddy('203.0.113.61'), 2000)).frames
+    .filter((f) => f.event === 'state').map((f) => { try { return JSON.parse(f.data); } catch { return {}; } }) : [];
+  const endsWith0 = (r, s) => r.status === 200 && new RegExp(`selftest ${s}: started, runtime \\S+\\n[\\s\\S]*1/1 ${s} checks passed[\\s\\S]*\\nselftest ${s}: exit 0\\n$`).test(r.text);
+  check('/admin/busy with two self-tests that overlap: the first runs and the second waits (selftestsWaiting 1); once the first ends, it names the second while that one runs, not null; then null and 0',
+    busyBoth.selftest === 'containment' && busyBoth.selftestsWaiting === 1 && busySecond.selftest === 'scenes' && busySecond.selftestsWaiting === 0
+      && busyAfter.selftest === null && busyAfter.selftestsWaiting === 0 && endsWith0(firstOut, 'containment') && endsWith0(secondOut, 'scenes'),
+    `both ${JSON.stringify(busyBoth)}; second ${JSON.stringify(busySecond)}; after ${JSON.stringify(busyAfter)}; ${oneLine(firstOut.text).slice(-60)} | ${oneLine(secondOut.text).slice(-60)}`);
+  check('a run that waits while a self-test holds the line: held true and no ETA on its page, in its live state and on /status (with one sentence), held through both self-tests, then it runs; afterwards held is false and the ETA is back',
+    heldTask.status === 202 && heldView?.state === 'queued' && heldView.held === true && heldView.position === 1 && heldView.etaSec === null
+      && heldQueue?.held === true && heldQueue.queued === 1 && heldQueue.running === 0 && heldQueue.etaSec === null
+      && heldPage.includes('a self-test of the sandboxes is running, and no waiting run starts until it ends')
+      && stillHeld?.state === 'queued' && stillHeld.held === true && heldEnd === 'done'
+      && heldStates.some((d) => d.state === 'queued' && d.held === true && d.etaSec === null) && heldStates.at(-1)?.state === 'done'
+      && freeQueue?.held === false && Number.isFinite(freeQueue.etaSec),
+    `view ${JSON.stringify({ state: heldView?.state, held: heldView?.held, position: heldView?.position, etaSec: heldView?.etaSec })}; /status.json queue ${JSON.stringify(heldQueue)}; `
+      + `still ${stillHeld?.state}/${stillHeld?.held}; end ${heldEnd}; states ${JSON.stringify(heldStates)}; after ${JSON.stringify(freeQueue)}`);
 
   // The loop's createSandbox: a step after Sandbox.create() that fails (here the task record cannot be
   // written) destroys the box, because the loop never gets it. A fake box: no Docker here.
@@ -1023,6 +1087,9 @@ case "$last" in
   *'/status.json'*)
     n=$(( $(cat "$d/status.n" 2> /dev/null || echo 0) + 1 ))
     echo "$n" > "$d/status.n"
+    # A read that fails (ssh, or curl -f on the VM) prints nothing and exits with that code.
+    if [ -f "$d/status-$n.code" ]; then exit "$(cat "$d/status-$n.code")"; fi
+    if [ -f "$d/status.code" ]; then exit "$(cat "$d/status.code")"; fi
     if [ -f "$d/status-$n.json" ]; then cat "$d/status-$n.json"; else cat "$d/status.json"; fi ;;
   *) echo '{}' ;;
 esac
@@ -1042,7 +1109,7 @@ esac
     agentLoop: { passed: 168, total: 168, at: '2026-11-04T15:07:00.000Z', runtime: 'runsc', commit },
   } });
   let fakeVms = 0;
-  const fakeVm = async ({ busy = { running: 0, queued: 0, selftest: null }, streams = {}, codes = {}, statuses = [], status = stored(COMMIT) } = {}) => {
+  const fakeVm = async ({ busy = { running: 0, queued: 0, selftest: null }, streams = {}, codes = {}, statuses = [], status = stored(COMMIT), statusCode = null, statusCodes = {} } = {}) => {
     const dir = path.join(stateDir, `fake-vm-${++fakeVms}`);
     await mkdir(dir, { recursive: true });
     await writeFile(path.join(dir, 'calls.log'), '');
@@ -1051,6 +1118,8 @@ esac
     for (const [s, code] of Object.entries(codes)) await writeFile(path.join(dir, `st-${s}.code`), String(code));
     for (const [i, json] of statuses.entries()) await writeFile(path.join(dir, `status-${i + 1}.json`), json);
     await writeFile(path.join(dir, 'status.json'), status);
+    if (statusCode !== null) await writeFile(path.join(dir, 'status.code'), String(statusCode));
+    for (const [n, code] of Object.entries(statusCodes)) await writeFile(path.join(dir, `status-${n}.code`), String(code));
     return dir;
   };
   const callsTo = async (dir) => {
@@ -1124,6 +1193,37 @@ esac
       && /^\/status\.json: containment 18\/18 under runsc on 0000000 at .* \(not a pass under runsc on abc1234\)$/m.test(staleStatus.stderr)
       && /does not show every suite passing under runsc on abc1234/.test(staleStatus.stderr),
     [badRuntime, badExit, noExit, badCount, noStart, staleStatus].map((r) => `exit ${r.status}, posted ${r.posted.join(' ') || 'nothing'}, ${r.statusReads} status read(s): ${deployLines(r)}`).join(' | '));
+
+  // /status.json that cannot be read after the suites passed: the deploy names the ssh/curl failure, not
+  // missing results; one failed read before a good one is only tried again.
+  const [unreadable, readLater] = await Promise.all([
+    selftestStep({ statusCode: 255 }, 2),
+    selftestStep({ statusCodes: { 1: 22 } }, 3),
+  ]);
+  check('scripts/deploy.sh --selftest: when /status.json cannot be read after every suite passed, it fails naming the ssh/curl exit code after its retries, not "no self-test results"; a read that fails once and then works passes',
+    unreadable.status !== 0 && unreadable.posted.length === 3 && unreadable.statusReads === 2
+      && /^could not read \/status\.json on the VM \(ssh\/curl exit 255\)$/m.test(unreadable.stderr)
+      && /deploy: every suite passed \(lines above\), but \/status\.json could not be read on the VM after 2 tries \(ssh\/curl exit 255\)/.test(unreadable.stderr)
+      && !/no self-test results/.test(unreadable.stdout + unreadable.stderr)
+      && readLater.status === 0 && readLater.statusReads === 2 && /^\/status\.json: scenes 20\/20 under runsc on abc1234/m.test(readLater.stdout),
+    [unreadable, readLater].map((r) => `exit ${r.status}, posted ${r.posted.join(' ') || 'nothing'}, ${r.statusReads} status read(s): ${deployLines(r)}`).join(' | '));
+
+  // Step 7 checks the queue again just before the swap: steps 5 and 6 take half a minute or more, and a
+  // task that started meanwhile would be interrupted by the restart. Refused, nothing is swapped.
+  const swaps = (r) => (r.log.match(/^CALL .* deploy@192\.0\.2\.1 rsync -a --delete .* \/srv\/mantis-ring\/ ring-prev\/ && rsync -a --delete .* ring-next\/ \/srv\/mantis-ring\/$/gm) ?? []).length;
+  const [swapIdle, swapBusy, swapSelftest, swapForced] = await Promise.all([
+    deployStep('force=no; swap_in', {}),
+    deployStep('force=no; swap_in', { busy: { running: 1, queued: 0, selftest: null, selftestsWaiting: 0 } }),
+    deployStep('force=no; swap_in', { busy: { running: 0, queued: 0, selftest: 'scenes', selftestsWaiting: 1 } }),
+    deployStep('force=yes; swap_in', { busy: { running: 0, queued: 1, selftest: null, selftestsWaiting: 0 } }),
+  ]);
+  check('scripts/deploy.sh step 7 asks /admin/busy again just before the swap and the restart: a task that runs or waits, or a self-test, stops it with the live tree untouched (no swap), and says so; idle, or with --force, it swaps',
+    swapIdle.status === 0 && swaps(swapIdle) === 1 && /^idle: no task running or waiting, no self-test$/m.test(swapIdle.stdout)
+      && swapBusy.status !== 0 && swaps(swapBusy) === 0
+      && /deploy: 1 task\(s\) running, 0 waiting, self-test: none\. A restart would stop them\. Wait, or pass --force \(the staged tree is in ring-next\/; the live tree and the service were not touched\)/.test(swapBusy.stderr)
+      && swapSelftest.status !== 0 && swaps(swapSelftest) === 0 && /0 task\(s\) running, 0 waiting, self-test: scenes\./.test(swapSelftest.stderr)
+      && swapForced.status === 0 && swaps(swapForced) === 1 && /^0 running, 1 waiting, self-test none; going on anyway \(--force\)$/m.test(swapForced.stdout),
+    [swapIdle, swapBusy, swapSelftest, swapForced].map((r) => `exit ${r.status}, ${swaps(r)} swap(s) ${deployLines(r)}`).join(' | '));
 
   // The outside checks of scripts/deploy.sh against a fake site on 127.0.0.1 that stands in for Caddy
   // and the app: RING_HEALTHCHECK's script when it is set, the built-in health check otherwise.

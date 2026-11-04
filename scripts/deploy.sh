@@ -4,9 +4,12 @@
 # to a staging folder on the VM first (~/ring-next), where the VM's own Node 22 checks it: syntax,
 # every module imported, and the Docker-free test suites. Only then is the live tree saved
 # (~/ring-prev) and replaced. A restart that does not come up, or comes up without the agent loop,
-# the probe, the vision check or the spend ledger, is rolled back to the saved tree. It refuses to
-# restart while a task runs or waits, or a self-test runs (a restart kills them), and ends with the
-# checks a judge would see from outside: the pages answer, gVisor is on, /admin/* is a 404 through
+# the probe, the vision check or the spend ledger, is rolled back to the saved tree. A restart
+# interrupts every task that runs or waits and kills a self-test, and nothing holds the queue across
+# it: the script refuses to go on while a task runs or waits, or a self-test waits or runs, both
+# before it copies the code and again just before it swaps the tree in and restarts, so only a run
+# that starts in the few seconds between that last check and the restart is interrupted. It ends with
+# the checks a judge would see from outside: the pages answer, gVisor is on, /admin/* is a 404 through
 # Caddy, and both public switches (runs of the sample, runs on GitHub repositories) are still closed.
 #
 # Usage: scripts/deploy.sh [--dirty] [--force] [--selftest]
@@ -99,19 +102,20 @@ busy_state() {
   echo "$running $queued ${selftest:-none}"
 }
 
-# require_idle WHAT: stop unless nothing runs, waits or self-tests on the VM (or --force).
+# require_idle WHAT [NOTE]: stop unless nothing runs, waits or self-tests on the VM (or --force). NOTE,
+# when given, ends the refusal: what has and has not been done on the VM so far.
 require_idle() {
-  local state running queued selftest
+  local state running queued selftest note=${2:+ ($2)}
   state=$(busy_state)
   case "$state" in
     down) echo "nothing answers on 127.0.0.1:8080 on the VM (connection refused): nothing to protect" ;;
     unknown)
-      [ "$force" = yes ] || die "the app answered, but its queue could not be read (or it timed out): check it, or pass --force"
+      [ "$force" = yes ] || die "the app answered, but its queue could not be read (or it timed out): check it, or pass --force$note"
       echo "the queue on the VM is unknown; going on anyway (--force)" ;;
     *)
       read -r running queued selftest <<< "$state"
       if [ "$running" != 0 ] || [ "$queued" != 0 ] || [ "$selftest" != none ]; then
-        [ "$force" = yes ] || die "$running task(s) running, $queued waiting, self-test: $selftest. $1 would stop them. Wait, or pass --force"
+        [ "$force" = yes ] || die "$running task(s) running, $queued waiting, self-test: $selftest. $1 would stop them. Wait, or pass --force$note"
         echo "$running running, $queued waiting, self-test $selftest; going on anyway (--force)"
       else
         echo "idle: no task running or waiting, no self-test"
@@ -199,15 +203,21 @@ run_selftests() {
   done
   echo
   printf '%s\n' "${summaries[@]}"
+  # A read that fails (ssh, or curl on the VM: the app restarting, say) is told apart from results that
+  # are not there yet, so the last try names what really went wrong.
   for ((try = 1; try <= STATUS_TRIES; try++)); do
-    out=$("${S[@]}" 'curl -fsS -m 10 http://127.0.0.1:8080/status.json' 2> /dev/null || true)
-    if verdict=$(printf '%s' "$out" | selftest_results "$commit"); then
+    rc=0
+    out=$("${S[@]}" 'curl -fsS -m 10 http://127.0.0.1:8080/status.json' 2> /dev/null) || rc=$?
+    if [ "$rc" != 0 ]; then
+      verdict="could not read /status.json on the VM (ssh/curl exit $rc)"
+    elif verdict=$(printf '%s' "$out" | selftest_results "$commit"); then
       printf '%s\n' "$verdict"
       return 0
     fi
     [ "$try" = "$STATUS_TRIES" ] || sleep "$STATUS_PAUSE"
   done
   printf '%s\n' "$verdict" >&2
+  [ "$rc" = 0 ] || die "every suite passed (lines above), but /status.json could not be read on the VM after $STATUS_TRIES tries (ssh/curl exit $rc)"
   die "/status.json does not show every suite passing under runsc on $commit (lines above)"
 }
 
@@ -286,6 +296,15 @@ outside_checks() {
   echo "public runs: sample ${sample_runs:-unknown}, GitHub ${github_runs:-unknown}"
 }
 
+# swap_in: step 7. The busy check again, just before the live tree changes: step 6 takes half a minute or
+# more, and a task that started meanwhile would be interrupted by the restart. Then the live tree is saved
+# to ring-prev/ and the staged one put in its place. A refusal leaves the live tree and the service as
+# they were.
+swap_in() {
+  require_idle "A restart" "the staged tree is in ring-next/; the live tree and the service were not touched"
+  "${S[@]}" "rsync -a --delete $EXCLUDES /srv/mantis-ring/ ring-prev/ && rsync -a --delete $EXCLUDES ring-next/ /srv/mantis-ring/"
+}
+
 # Sourced by a test (only with RING_TEST=1, so the guard above has run): the functions are defined, and
 # nothing below runs.
 if [ "${BASH_SOURCE[0]}" != "$0" ]; then
@@ -299,7 +318,7 @@ for arg in "$@"; do
     --dirty) dirty=yes ;;
     --force) force=yes ;;
     --selftest) selftest=yes ;;
-    -h | --help) sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h | --help) sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "usage: scripts/deploy.sh [--dirty] [--force] [--selftest]" >&2; exit 64 ;;
   esac
 done
@@ -332,7 +351,7 @@ is_dirty=false
 printf '{"commit":"%s","dirty":%s,"deployedAt":"%s"}\n' "$(git rev-parse --short HEAD)" "$is_dirty" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > app/VERSION.json
 cat app/VERSION.json
 
-# 4. Busy check: a restart kills running tasks, the queue and a self-test.
+# 4. Busy check: a restart kills running tasks, the queue and a self-test (checked again in step 7).
 say "4/11 busy check"
 require_idle "A restart"
 # The commit the VM runs now, for the rollback message and the reminder in step 11.
@@ -354,9 +373,9 @@ for t in "agent-loop.mjs --unit" "app-api.mjs"; do
   if clean node test/$t > "$log" 2>&1; then tail -n 1 "$log"; rm -f "$log"; else grep -E "^FAIL" "$log" | head -n 20; tail -n 3 "$log"; rm -f "$log"; exit 1; fi
 done' || die "the VM's Node 22 rejects the staged tree (lines above); the live tree and the service were not touched"
 
-# 7. Save the live tree, then put the staged one in its place.
-say "7/11 save the live tree to ring-prev/ and swap ring-next/ in"
-"${S[@]}" "rsync -a --delete $EXCLUDES /srv/mantis-ring/ ring-prev/ && rsync -a --delete $EXCLUDES ring-next/ /srv/mantis-ring/"
+# 7. The busy check again, then save the live tree and put the staged one in its place.
+say "7/11 busy check again, then save the live tree to ring-prev/ and swap ring-next/ in"
+swap_in
 
 # 8. Restart, wait for /status.json, and check that every part of the app loaded. Roll back otherwise.
 say "8/11 restart mantis-ring"
