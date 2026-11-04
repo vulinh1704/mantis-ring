@@ -3,7 +3,7 @@
 // PASS or FAIL. These are the "blast radius" claims made in the README, measured.
 // Usage: node test/containment.mjs   (after scripts/setup.sh; RING_RUNTIME=runsc runs the sandboxes in gVisor)
 // At exit it writes ~/.ring/selftest/containment.json, the result the app shows on /status.
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -60,6 +60,184 @@ try {
 /** The own network of every sandbox this suite makes: none may be left at the end. */
 const networks = [];
 
+// --- The probes that run inside a sandbox -------------------------------------------------------------
+// node -e, the first lines of PROBE and HOST_PROBE: tcp(host, port) resolves with "connected" or the
+// reason it did not (an error code, or "timeout" after 3 s). A link-local IPv6 address is tried
+// through the sandbox's own interface.
+const TCP = [
+  'const net = require("net"), http = require("http"), os = require("os");',
+  'const T = 3000;',
+  'let ifs = {}; try { ifs = os.networkInterfaces(); } catch {}',
+  'const myIf = Object.keys(ifs).find((n) => (ifs[n] ?? []).some((a) => !a.internal)) ?? "eth0";',
+  'const scoped = (a) => (/^fe80:/i.test(a) ? a + "%" + myIf : a);',
+  'const tcp = (host, port) => new Promise((ok) => {',
+  '  let s;',
+  '  try { s = net.connect(port, host); } catch (e) { ok(e.code || "error"); return; }',
+  '  const t = setTimeout(() => { s.destroy(); ok("timeout"); }, T);',
+  '  s.on("connect", () => { clearTimeout(t); s.destroy(); ok("connected"); });',
+  '  s.on("error", (e) => { clearTimeout(t); ok(e.code || "error"); });',
+  '});',
+];
+// node -e SERVE: a server on port 3000 on every address the sandbox has (IPv4, and IPv6 where it has it).
+const SERVE = 'const h = require("http"), answer = (q, s) => s.end("ring-peer-ok"); h.createServer(answer).listen(3000, "0.0.0.0"); '
+  + 'h.createServer(answer).on("error", () => {}).listen({ port: 3000, host: "::", ipv6Only: true });';
+// node -e ADDRESSES: every address the sandbox has but loopback, as one line of JSON.
+const ADDRESSES = 'let ifs = {}; try { ifs = require("os").networkInterfaces(); } catch {} const out = []; for (const [iface, list] of Object.entries(ifs)) '
+  + 'for (const a of list ?? []) if (!a.internal) out.push({ address: a.address, family: a.family, iface }); console.log(JSON.stringify(out));';
+// node -e PROBE <peer addresses, JSON> <own ip> <peer ip> <peer name>: one line of JSON with what each try got.
+const PROBE = [
+  ...TCP,
+  'const [list, own, peer, peerName] = process.argv.slice(1);',
+  'const get = (host, port) => new Promise((ok) => {',
+  '  let q;',
+  '  try { q = http.get({ host, port, path: "/", timeout: T }, (r) => { let b = ""; r.on("data", (d) => { b += d; }); r.on("end", () => ok(r.statusCode + " " + b.slice(0, 40))); }); } catch (e) { ok(e.code || "error"); return; }',
+  '  q.on("timeout", () => { q.destroy(); ok("timeout"); });',
+  '  q.on("error", (e) => ok(e.code || "error"));',
+  '});',
+  'const viaProxy = (head) => new Promise((ok) => {',
+  '  const s = net.connect(8888, "ring-proxy");',
+  '  const t = setTimeout(() => { s.destroy(); ok("timeout"); }, T);',
+  '  s.on("connect", () => s.write(head + "\\r\\n\\r\\n"));',
+  '  s.once("data", (d) => { clearTimeout(t); s.destroy(); ok(String(d).split("\\r\\n")[0]); });',
+  '  s.on("error", (e) => { clearTimeout(t); ok(e.code || "error"); });',
+  '});',
+  '(async () => {',
+  '  let self = "";',
+  '  for (let i = 0; i < 20; i++) { self = await get(own, 3000); if (self.startsWith("200")) break; await new Promise((r) => setTimeout(r, 250)); }',
+  '  const out = { self, peer: [] };',
+  '  for (const a of JSON.parse(list)) out.peer.push({ address: a, tcp: await tcp(scoped(a), 3000), http: await get(scoped(a), 3000) });',
+  '  out.proxyTcp = await tcp("ring-proxy", 8888);',
+  '  out.proxyGet = await viaProxy("GET http://" + peer + ":3000/ HTTP/1.1\\r\\nHost: " + peer + ":3000\\r\\nConnection: close");',
+  '  out.proxyConnect = await viaProxy("CONNECT " + peer + ":443 HTTP/1.1\\r\\nHost: " + peer + ":443");',
+  '  out.proxyByName = await viaProxy("GET http://" + peerName + ":3000/ HTTP/1.1\\r\\nHost: " + peerName + ":3000\\r\\nConnection: close");',
+  '  console.log(JSON.stringify(out));',
+  '})();',
+].join('\n');
+// node -e HOST_PROBE <addresses, JSON> <ports, JSON>: a TCP connect to every port of every address,
+// all at once, and one to the proxy; one line of JSON, with the sandbox's own addresses.
+const HOST_PROBE = [
+  ...TCP,
+  'const [list, portList] = process.argv.slice(1);',
+  '(async () => {',
+  '  const ports = JSON.parse(portList);',
+  '  const own = Object.values(ifs).flat().filter((a) => a && !a.internal).map((a) => a.address);',
+  '  const tries = await Promise.all(JSON.parse(list).flatMap((a) => ports.map(async (port) => ({ address: a, port, tcp: await tcp(scoped(a), port) }))));',
+  '  console.log(JSON.stringify({ own, proxy: await tcp("ring-proxy", 8888), tries }));',
+  '})();',
+].join('\n');
+// perl -e PING <IPv4 address>...: an ICMP echo to each through an unprivileged ping socket (Linux and
+// gVisor both have them); prints one word per address: "reply", "no-reply", "unreachable" or why it
+// could not try. Every probe pings the proxy too: its answer shows that ICMP works in the sandbox.
+const PING = [
+  'use Socket;',
+  'sub ping {',
+  '  my ($ip) = @_;',
+  '  return "none" unless $ip;',
+  '  socket(my $s, PF_INET, SOCK_DGRAM, 1) or return "no-socket";',
+  '  send($s, pack("CCnnnA4", 8, 0, 0, 0, 1, "ring"), 0, sockaddr_in(0, inet_aton($ip))) or return "unreachable";',
+  '  my $r = ""; vec($r, fileno($s), 1) = 1;',
+  '  select($r, undef, undef, 2) > 0 or return "no-reply";',
+  '  defined(recv($s, my $b, 1500, 0)) or return "recv-error";',
+  '  my $t = unpack("C", $b);',
+  '  $t = unpack("C", substr($b, ($t & 15) * 4, 1)) if ($t >> 4) == 4;',
+  '  return $t == 0 ? "reply" : "icmp-$t";',
+  '}',
+  'print join(" ", map { ping($_) } @ARGV), "\\n";',
+].join('\n');
+const IPV4 = /^\d{1,3}(\.\d{1,3}){3}$/;
+/** {network: IPv4 address} of a container, as Docker reports it. */
+const addresses = async (name) => {
+  const r = await run('docker', ['inspect', '-f', '{{json .NetworkSettings.Networks}}', name], { timeoutMs: 30_000 });
+  try { return Object.fromEntries(Object.entries(JSON.parse(r.stdout)).map(([k, v]) => [k, v?.IPAddress ?? ''])); } catch { return {}; }
+};
+const status = (s) => /^HTTP\/1\.[01] (\d{3})/.exec(s ?? '')?.[1] ?? String(s);
+
+// --- Can a sandbox reach the host it runs on? ---------------------------------------------------------
+/** The ports tried on every address of the host: sshd, Caddy (HTTP, HTTPS), the app's port and one more. */
+const HOST_PORTS = [22, 80, 443, 8080, 9000];
+/** Every address of this host but loopback, as Node lists them, with its interface. */
+const hostAddresses = () => {
+  let ifs = {};
+  try { ifs = os.networkInterfaces(); } catch { ifs = {}; }
+  return Object.entries(ifs).flatMap(([iface, list]) => (list ?? []).filter((a) => !a.internal).map((a) => ({ address: a.address, iface })));
+};
+/** The first host address of an IPv4 subnet ("172.21.0.0/16" → "172.21.0.1"), the one Docker takes as a network's gateway. */
+const firstHost = (subnet) => {
+  const m = /^(\d+)\.(\d+)\.(\d+)\.(\d+)\/\d+$/.exec(subnet ?? '');
+  return m ? `${m[1]}.${m[2]}.${m[3]}.${Number(m[4]) + 1}` : '';
+};
+const PRIVATE = /^(10\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)/;
+/** What the ports of one address got: "22/80/443 timeout" when they agree, else "22 x, 80 y". */
+const byPort = (tries) => {
+  const kinds = [...new Set(tries.map((t) => t.tcp))];
+  return kinds.length === 1 ? `${tries.map((t) => t.port).join('/')} ${kinds[0]}` : tries.map((t) => `${t.port} ${t.tcp}`).join(', ');
+};
+
+/**
+ * Whether sandbox `b` can reach the host it runs on. On the host: the bridge of the sandbox's network
+ * and what the host has on it, who holds which address on the network, and every address the host
+ * has (Node's list: the public one, Docker's other bridges, IPv6 ones). Docker's gateway address for
+ * the network is tried too, unless a container holds it: with inhibit_ipv4 Docker does not keep it
+ * for the bridge, and the first container on the network, the proxy, gets it. In the sandbox: a TCP
+ * connect to each target on HOST_PORTS, all at once, and an ICMP echo to each IPv4 one. The proxy
+ * must answer both a TCP connect and its echo, so a probe that cannot reach anything at all does not
+ * pass.
+ * @returns {Promise<{bridge: {pass: boolean, detail: string}, reach: {pass: boolean, detail: string}}>}
+ */
+async function hostReach(b) {
+  const ins = await run('docker', ['network', 'inspect', '--format', '{{json .}}', b.network], { timeoutMs: 30_000 });
+  let n = {};
+  try { n = JSON.parse(ins.stdout.trim().split('\n').pop()); } catch { n = {}; }
+  const ipam = (n?.IPAM?.Config ?? []).find((c) => IPV4.test(c?.Gateway ?? '') || IPV4.test(String(c?.Subnet ?? '').split('/')[0])) ?? {};
+  const listed = IPV4.test(ipam.Gateway ?? '') ? ipam.Gateway : '';
+  const gateway = listed || firstHost(ipam.Subnet);
+  const members = Object.values(n?.Containers ?? {}).map((c) => ({ name: String(c?.Name ?? '?'), address: String(c?.IPv4Address ?? '').split('/')[0] }));
+  const holder = members.find((m) => m.address === gateway)?.name;
+  const bridge = n?.Options?.['com.docker.network.bridge.name'] || (typeof n?.Id === 'string' ? `br-${n.Id.slice(0, 12)}` : '');
+  const host = hostAddresses();
+  const where = new Map(host.map((a) => [a.address, a.iface]));
+  const onBridge = host.filter((a) => a.iface === bridge);
+  const bridge4 = onBridge.filter((a) => IPV4.test(a.address)).map((a) => a.address);
+  const bridge6 = onBridge.filter((a) => !IPV4.test(a.address)).map((a) => a.address);
+  const seen = bridge !== '' && existsSync(`/sys/class/net/${bridge}`);
+  let v6off = '';
+  try { v6off = readFileSync(`/proc/sys/net/ipv6/conf/${bridge}/disable_ipv6`, 'utf8').trim(); } catch { v6off = ''; }
+  const gatewayName = listed ? 'Docker\'s gateway address' : 'the subnet\'s first address (Docker lists no gateway)';
+  const gatewayText = `${gatewayName} ${gateway || 'unknown'}${holder ? ` is ${holder}'s` : bridge4.includes(gateway) ? ' is the host\'s' : ', held by no container'}`;
+  const bridgeDetail = !bridge ? `no bridge found for ${b.network}` : !seen ? `${bridge} is not an interface of this host`
+    : `${bridge}: ${bridge4.join(' ') || 'no IPv4 address'}; on ${b.network}: ${members.map((m) => `${m.name} ${m.address || 'no IPv4'}`).join(', ') || 'no container'}; `
+      + `${gatewayText}; IPv6 on the bridge: ${bridge6.join(' ') || 'no address'}${v6off === '1' ? ' (off)' : ''}`;
+
+  // The gateway address is tried unless a container holds it, then every address of the host.
+  const targets = [...new Set([...(gateway && !holder ? [gateway] : []), ...host.map((a) => a.address)].filter(Boolean))];
+  const v4 = targets.filter((a) => IPV4.test(a));
+  const p = await b.execArgs(['node', '-e', HOST_PROBE, JSON.stringify(targets), JSON.stringify(HOST_PORTS)], { timeoutMs: 60_000 });
+  let r;
+  try { r = JSON.parse(p.stdout.trim().split('\n').pop()); } catch { r = { error: (p.stderr || p.stdout || `exit ${p.code}`).trim().split('\n').pop() }; }
+  const proxyIp = (await addresses('ring-proxy'))[b.network] ?? '';
+  const icmp = await b.execArgs(['perl', '-e', PING, proxyIp, ...v4], { timeoutMs: 30_000 + 3_000 * v4.length });
+  const [pingProxy, ...pingHost] = icmp.code === 0 ? icmp.stdout.trim().split(/\s+/) : [];
+  const tries = Array.isArray(r.tries) ? r.tries : [];
+  const own = Array.isArray(r.own) ? r.own : [];
+  // The host's own addresses must be known (Node listed at least one IPv4 address), and so must the gateway.
+  const reachOk = !r.error && IPV4.test(gateway) && host.some((a) => IPV4.test(a.address)) && tries.length === targets.length * HOST_PORTS.length
+    && tries.every((t) => t.tcp !== 'connected') && r.proxy === 'connected'
+    && pingProxy === 'reply' && pingHost.length === v4.length && pingHost.every((x) => x !== 'reply');
+  const label = (a) => {
+    const what = [a === gateway ? 'gateway' : '', where.get(a) ?? '', IPV4.test(a) && !PRIVATE.test(a) ? 'public' : ''].filter(Boolean).join(', ');
+    return what ? `${a} (${what})` : a;
+  };
+  const rows = targets.map((a) => {
+    const mine = tries.filter((t) => t.address === a).sort((x, y) => x.port - y.port);
+    const i = v4.indexOf(a);
+    return `${label(a)}: TCP ${mine.length ? byPort(mine) : 'not tried'}${i >= 0 ? `, ping ${pingHost[i] ?? 'not tried'}` : ''}`;
+  });
+  const reachDetail = r.error ? `the probe failed (${r.error})`
+    : `${holder ? `${gatewayName} ${gateway} is ${holder}'s, not the host's, so it is not tried; ` : ''}${rows.join('; ')}; `
+      + `the sandbox has ${own.join(' ') || 'no address'}${own.some((a) => !IPV4.test(a)) ? '' : ' (no IPv6)'}; ring-proxy:8888 ${r.proxy}, ping ${pingProxy ?? 'not tried'}`;
+  return { bridge: { pass: seen && bridge4.length === 0, detail: bridgeDetail }, reach: { pass: reachOk, detail: reachDetail } };
+}
+
 // A secret on the host that must never reach the sandbox.
 process.env.RING_FAKE_API_KEY = 'sk-should-never-leak';
 
@@ -79,6 +257,13 @@ try {
 
   const direct = await box.exec(`node -e "require('net').connect(443, '1.1.1.1').on('connect', () => process.exit(0)).on('error', () => process.exit(1)); setTimeout(() => process.exit(2), 5000)"`, { timeoutMs: 15_000 });
   check('no direct route to the internet', direct.code !== 0, direct.code === 2 ? 'connect timed out' : 'connect refused');
+
+  // The VM itself: sshd, Caddy and the app run there. Docker puts a network's gateway address on its
+  // bridge unless told otherwise (inhibit_ipv4), and a sandbox could then connect to the host there.
+  const reach = await hostReach(box);
+  check('the host has no IPv4 address on a sandbox\'s network (its bridge has none)', reach.bridge.pass, reach.bridge.detail);
+  check(`a sandbox cannot reach the VM host: no address of the host answers TCP on ports ${HOST_PORTS.join(', ')} or a ping (nor does the network's gateway address, when no container holds it), while the proxy answers both`,
+    reach.reach.pass, reach.reach.detail);
 
   const gh = await box.exec('git ls-remote https://github.com/vulinh1704/mantis HEAD', { timeoutMs: 30_000 });
   check('allowlisted host works through the proxy (github.com)', gh.code === 0, gh.code === 0 ? 'git ls-remote ok' : gh.stderr.trim().split('\n').pop());
@@ -111,84 +296,10 @@ check('container is gone after destroy()', await gone(box.name));
 // proxy answers its echo, which shows that ICMP works in the sandbox at all. The proxy is on both
 // networks and relays only to the four allowlisted hosts. The CONNECT asks for port 443, the one port
 // tinyproxy allows for CONNECT, so that the allowlist is what refuses it.
-const SERVE = 'const h = require("http"), answer = (q, s) => s.end("ring-peer-ok"); h.createServer(answer).listen(3000, "0.0.0.0"); '
-  + 'h.createServer(answer).on("error", () => {}).listen({ port: 3000, host: "::", ipv6Only: true });';
-// node -e ADDRESSES: every address the sandbox has but loopback, as one line of JSON.
-const ADDRESSES = 'let ifs = {}; try { ifs = require("os").networkInterfaces(); } catch {} const out = []; for (const [iface, list] of Object.entries(ifs)) '
-  + 'for (const a of list ?? []) if (!a.internal) out.push({ address: a.address, family: a.family, iface }); console.log(JSON.stringify(out));';
-// node -e PROBE <peer addresses, JSON> <own ip> <peer ip> <peer name> <gateway>: one line of JSON with what each try got.
-const PROBE = [
-  'const net = require("net"), http = require("http"), os = require("os");',
-  'const [list, own, peer, peerName, gw] = process.argv.slice(1);',
-  'const T = 3000;',
-  // A link-local IPv6 address is tried through this sandbox's own interface.
-  'let ifs = {}; try { ifs = os.networkInterfaces(); } catch {}',
-  'const myIf = Object.keys(ifs).find((n) => (ifs[n] ?? []).some((a) => !a.internal)) ?? "eth0";',
-  'const scoped = (a) => (/^fe80:/i.test(a) ? a + "%" + myIf : a);',
-  'const tcp = (host, port) => new Promise((ok) => {',
-  '  let s;',
-  '  try { s = net.connect(port, host); } catch (e) { ok(e.code || "error"); return; }',
-  '  const t = setTimeout(() => { s.destroy(); ok("timeout"); }, T);',
-  '  s.on("connect", () => { clearTimeout(t); s.destroy(); ok("connected"); });',
-  '  s.on("error", (e) => { clearTimeout(t); ok(e.code || "error"); });',
-  '});',
-  'const get = (host, port) => new Promise((ok) => {',
-  '  let q;',
-  '  try { q = http.get({ host, port, path: "/", timeout: T }, (r) => { let b = ""; r.on("data", (d) => { b += d; }); r.on("end", () => ok(r.statusCode + " " + b.slice(0, 40))); }); } catch (e) { ok(e.code || "error"); return; }',
-  '  q.on("timeout", () => { q.destroy(); ok("timeout"); });',
-  '  q.on("error", (e) => ok(e.code || "error"));',
-  '});',
-  'const viaProxy = (head) => new Promise((ok) => {',
-  '  const s = net.connect(8888, "ring-proxy");',
-  '  const t = setTimeout(() => { s.destroy(); ok("timeout"); }, T);',
-  '  s.on("connect", () => s.write(head + "\\r\\n\\r\\n"));',
-  '  s.once("data", (d) => { clearTimeout(t); s.destroy(); ok(String(d).split("\\r\\n")[0]); });',
-  '  s.on("error", (e) => { clearTimeout(t); ok(e.code || "error"); });',
-  '});',
-  '(async () => {',
-  '  let self = "";',
-  '  for (let i = 0; i < 20; i++) { self = await get(own, 3000); if (self.startsWith("200")) break; await new Promise((r) => setTimeout(r, 250)); }',
-  '  const out = { self, peer: [] };',
-  '  for (const a of JSON.parse(list)) out.peer.push({ address: a, tcp: await tcp(scoped(a), 3000), http: await get(scoped(a), 3000) });',
-  '  out.proxyTcp = await tcp("ring-proxy", 8888);',
-  '  out.proxyGet = await viaProxy("GET http://" + peer + ":3000/ HTTP/1.1\\r\\nHost: " + peer + ":3000\\r\\nConnection: close");',
-  '  out.proxyConnect = await viaProxy("CONNECT " + peer + ":443 HTTP/1.1\\r\\nHost: " + peer + ":443");',
-  '  out.proxyByName = await viaProxy("GET http://" + peerName + ":3000/ HTTP/1.1\\r\\nHost: " + peerName + ":3000\\r\\nConnection: close");',
-  '  if (gw) out.host = await tcp(gw, 22);',
-  '  console.log(JSON.stringify(out));',
-  '})();',
-].join('\n');
-// perl -e PING <proxy ip> <peer ip>: an ICMP echo to each through an unprivileged ping socket (Linux
-// and gVisor both have them); prints "reply", "no-reply", "unreachable" or why it could not try.
-// The proxy's answer shows whether ICMP works in the sandbox at all.
-const PING = [
-  'use Socket;',
-  'sub ping {',
-  '  my ($ip) = @_;',
-  '  return "none" unless $ip;',
-  '  socket(my $s, PF_INET, SOCK_DGRAM, 1) or return "no-socket";',
-  '  send($s, pack("CCnnnA4", 8, 0, 0, 0, 1, "ring"), 0, sockaddr_in(0, inet_aton($ip))) or return "unreachable";',
-  '  my $r = ""; vec($r, fileno($s), 1) = 1;',
-  '  select($r, undef, undef, 2) > 0 or return "no-reply";',
-  '  defined(recv($s, my $b, 1500, 0)) or return "recv-error";',
-  '  my $t = unpack("C", $b);',
-  '  $t = unpack("C", substr($b, ($t & 15) * 4, 1)) if ($t >> 4) == 4;',
-  '  return $t == 0 ? "reply" : "icmp-$t";',
-  '}',
-  'print join(" ", ping($ARGV[0]), ping($ARGV[1])), "\\n";',
-].join('\n');
-const IPV4 = /^\d{1,3}(\.\d{1,3}){3}$/;
-/** {network: IPv4 address} of a container, as Docker reports it. */
-const addresses = async (name) => {
-  const r = await run('docker', ['inspect', '-f', '{{json .NetworkSettings.Networks}}', name], { timeoutMs: 30_000 });
-  try { return Object.fromEntries(Object.entries(JSON.parse(r.stdout)).map(([k, v]) => [k, v?.IPAddress ?? ''])); } catch { return {}; }
-};
-const status = (s) => /^HTTP\/1\.[01] (\d{3})/.exec(s ?? '')?.[1] ?? String(s);
 const pairName = 'two sandboxes at once cannot reach each other (TCP and HTTP on each of their addresses, ping; through the proxy by address, by CONNECT to 443 and by name), and each still reaches the proxy, which answers its ping';
 const made = await Promise.allSettled([Sandbox.create({ runtime }), Sandbox.create({ runtime })]);
 const pair = made.flatMap((m) => (m.status === 'fulfilled' ? [m.value] : []));
 networks.push(...pair.map((b) => b.network));
-const notes = [];
 try {
   if (pair.length < 2) throw new Error(`a sandbox did not start: ${made.find((m) => m.status === 'rejected')?.reason?.message}`);
   for (const b of pair) await b.execDetached(`node -e '${SERVE}'`, '/tmp/serve.log');
@@ -196,21 +307,20 @@ try {
   const views = [];
   for (const [i, b] of pair.entries()) {
     const nets = await addresses(b.name);
-    const gw = await run('docker', ['network', 'inspect', '-f', '{{range .IPAM.Config}}{{.Gateway}} {{end}}', b.network], { timeoutMs: 30_000 });
     // Every address the sandbox has: Docker's IPv4 address, and what the sandbox itself lists (IPv6 too).
     const inside = await b.execArgs(['node', '-e', ADDRESSES], { timeoutMs: 30_000 });
     let listed = [];
     try { listed = JSON.parse(inside.stdout.trim().split('\n').pop()); } catch { listed = []; }
     const ip = nets[b.network] ?? '';
     const all = [...new Set([ip, ...(Array.isArray(listed) ? listed : []).map((a) => a?.address)].filter((a) => typeof a === 'string' && a !== ''))];
-    views.push({ tag: 'AB'[i], box: b, nets, ip, all, proxyIp: proxyAt[b.network] ?? '', gateway: gw.stdout.trim().split(/\s+/).find((s) => IPV4.test(s)) ?? '' });
+    views.push({ tag: 'AB'[i], box: b, nets, ip, all, proxyIp: proxyAt[b.network] ?? '' });
   }
   const layout = views.every((v) => Object.keys(v.nets).length === 1 && IPV4.test(v.ip) && IPV4.test(v.proxyIp)) && views[0].box.network !== views[1].box.network;
   const rows = [`${views.map((v) => `${v.tag} ${v.all.join(' ') || 'no address'} alone on ${Object.keys(v.nets).join('+') || 'no network'}, ring-proxy ${v.proxyIp || 'absent'} there`).join('; ')}`];
   let apart = layout;
   for (const [i, me] of views.entries()) {
     const peer = views[1 - i];
-    const p = await me.box.execArgs(['node', '-e', PROBE, JSON.stringify(peer.all), me.ip, peer.ip, peer.box.name, me.gateway], { timeoutMs: 90_000 });
+    const p = await me.box.execArgs(['node', '-e', PROBE, JSON.stringify(peer.all), me.ip, peer.ip, peer.box.name], { timeoutMs: 90_000 });
     let r;
     try { r = JSON.parse(p.stdout.trim().split('\n').pop()); } catch { r = { error: (p.stderr || p.stdout || `exit ${p.code}`).trim().split('\n').pop() }; }
     const icmp = await me.box.execArgs(['perl', '-e', PING, me.proxyIp, peer.ip], { timeoutMs: 30_000 });
@@ -224,7 +334,6 @@ try {
     apart &&= ok;
     rows.push(r.error ? `${me.tag}→${peer.tag}: the probe failed (${r.error})`
       : `${me.tag}→${peer.tag}: ${tried.map((x) => `${x.address} TCP ${x.tcp}, HTTP ${x.http}`).join('; ') || 'no address tried'}; ping ${pingPeer} (to the proxy: ${pingProxy}); through the proxy GET ${status(r.proxyGet)}, CONNECT :443 ${status(r.proxyConnect)}, by name ${status(r.proxyByName)}; ${me.tag}→proxy:8888 ${r.proxyTcp}; ${me.tag}'s own server ${String(r.self).split(' ')[0]}`);
-    if (r.host !== undefined) notes.push(`${me.tag} → the host through its network's gateway ${me.gateway}:22: ${r.host}`);
   }
   check(pairName, apart, rows.join('; '));
 } catch (err) {
@@ -232,7 +341,6 @@ try {
 } finally {
   await Promise.allSettled(pair.map((b) => b.destroy()));
 }
-for (const n of notes) console.log(`note  ${n} (not part of the check)`);
 check('both of their containers are gone after destroy()', pair.length === 2 && (await Promise.all(pair.map((b) => gone(b.name)))).every(Boolean), pair.map((b) => b.name).join(', '));
 
 // Fork bomb last, in its own sandbox: once the cap is hit nothing new can start inside, so the
