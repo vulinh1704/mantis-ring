@@ -14,7 +14,7 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import http from 'node:http';
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -1066,6 +1066,16 @@ console.log('1/1 ${s} checks passed');
       && speedBad.every((r) => r.status !== 0 && /speed must be a number from 0\.5 to 2/.test(r.stderr)) && callsAfter === sshCalls + 1,
     `slow: exit ${ttsSlow.status} ${oneLine(ttsSlow.stdout)} ${oneLine(ttsSlow.stderr)}; body ${JSON.stringify(slowBody)}; `
       + `bad: ${speedBad.map((r) => `${r.status} ${oneLine(r.stderr)}`).join(' / ')}; ${callsAfter - sshCalls} more call(s) reached ssh`);
+
+  // Every script in scripts/ is run as a command (the README, deploy.sh, the docs), so each keeps its
+  // executable bit. An edit saved from Windows through \\wsl.localhost drops it without a word.
+  const scriptsDir = path.dirname(ringSh);
+  const scriptModes = await Promise.all((await readdir(scriptsDir)).filter((f) => f.endsWith('.sh'))
+    .map(async (f) => [f, (await stat(path.join(scriptsDir, f))).mode & 0o111]));
+  const notExecutable = scriptModes.filter(([, bits]) => bits === 0).map(([f]) => f);
+  check('every scripts/*.sh keeps its executable bit',
+    scriptModes.length > 0 && notExecutable.length === 0,
+    `${scriptModes.length} script(s); not executable: ${notExecutable.join(' ') || 'none'}`);
 
   // scripts/ring.sh selftest and the --selftest step of scripts/deploy.sh, against a stand-in for ssh that
   // plays the app's answers from files in RING_FAKE_DIR: a suite's stream for POST /admin/selftest, JSON
