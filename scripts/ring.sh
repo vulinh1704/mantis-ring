@@ -30,12 +30,14 @@
 #   mem [seconds]             the VM's memory, read-only (scripts/vm-mem.sh): free -m, then what each container (the
 #                             sandboxes, the proxy), the app, Caddy and Docker hold now, at most and at their limit;
 #                             with seconds (at most 600), first the least memory available over that long
-#   tts <model> <text-file> <out-file> [voice]
+#   tts <model> <text-file> <out-file> [voice|- [speed]]
 #                             POST /admin/speech: the VM speaks the text file in English (at most 800 characters;
 #                             white space becomes single spaces) with a priced speech model of the catalogue, such
-#                             as chatterbox or qwen3-tts-12hz-1.7b, and a built-in voice. The audio comes back into
-#                             <out-file>, whose extension picks the format (.mp3 .wav .flac .opus); the key stays on
-#                             the VM. A call goes out only if its estimate fits $0.05 and today's $0.50 (see spend)
+#                             as chatterbox or qwen3-tts-12hz-1.7b, and a built-in voice (- for the model's own).
+#                             speed, from 0.5 to 2, slows or quickens the reading; the provider bills the seconds
+#                             before it. The audio comes back into <out-file>, whose extension picks the format
+#                             (.mp3 .wav .flac .opus); the key stays on the VM. A call goes out only if its
+#                             estimate fits $0.05 and today's $0.50 (see spend)
 # Environment, for tests only: RING_SSH (a program to use instead of ssh; it must be executable) and
 # RING_HOST. With RING_TEST=1 the script refuses the real ssh and the real VM.
 set -euo pipefail
@@ -172,10 +174,14 @@ case "$cmd" in
     { [[ $secs =~ ^[0-9]{1,3}$ ]] && [ "$secs" -le 600 ]; } || die "usage: ring.sh mem [seconds, 0 to 600]"
     "${S[@]}" "sh -s $secs" < "$(dirname -- "$0")/vm-mem.sh" ;;
   tts)
-    { [ "$#" -ge 3 ] && [ "$#" -le 4 ]; } || die "usage: ring.sh tts <model> <text-file> <out-file> [voice]"
-    model=$1 textfile=$2 out=$3 voice=${4:-}
+    { [ "$#" -ge 3 ] && [ "$#" -le 5 ]; } || die "usage: ring.sh tts <model> <text-file> <out-file> [voice|- [speed]]"
+    model=$1 textfile=$2 out=$3 voice=${4:-} speed=${5:-}
+    if [ "$voice" = - ]; then voice=; fi
     [[ $model =~ ^[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}$ ]] || die "not a model id: $model"
     [ -z "$voice" ] || [[ $voice =~ ^[a-z][a-z0-9_]{0,39}$ ]] || die "not a voice name: $voice"
+    # The app takes a speed from 0.5 to 2 (a JSON number); anything else stops here, before ssh.
+    [ -z "$speed" ] || { [[ $speed =~ ^[0-9](\.[0-9]{1,3})?$ ]] && awk -v s="$speed" 'BEGIN { exit !(s >= 0.5 && s <= 2) }'; } \
+      || die "speed must be a number from 0.5 to 2: $speed"
     { [ -f "$textfile" ] && [ -r "$textfile" ]; } || die "cannot read the text file: $textfile"
     fmt=${out##*.}
     case "$fmt" in
@@ -185,12 +191,13 @@ case "$cmd" in
     [ -d "$(dirname -- "$out")" ] || die "no such folder for the out file: $(dirname -- "$out")"
     # The body, as JSON on stdin: the text with its white space folded into single spaces.
     body=$(node -e 'const fs = require("node:fs");
-      const [model, file, format, voice] = process.argv.slice(1);
+      const [model, file, format, voice, speed] = process.argv.slice(1);
       if (fs.statSync(file).size > 16384) { console.error("the text file is larger than 16 KB"); process.exit(1); }
       const input = fs.readFileSync(file, "utf8").replace(/^﻿/, "").replace(/\s+/g, " ").trim();
       const b = { model, input, format, language: "English" };
       if (voice) b.voice = voice;
-      process.stdout.write(JSON.stringify(b));' "$model" "$textfile" "$fmt" "$voice") || die "could not read the text file: $textfile"
+      if (speed) b.speed = Number(speed);
+      process.stdout.write(JSON.stringify(b));' "$model" "$textfile" "$fmt" "$voice" "$speed") || die "could not read the text file: $textfile"
     # The audio arrives on stdout, the response headers (what it cost) on stderr.
     hdr=$(mktemp /tmp/ring-tts.XXXXXX)
     part="$out.part"
@@ -205,8 +212,8 @@ case "$cmd" in
     fi
     mv -f -- "$part" "$out"
     field() { grep -i -m 1 "^$1:" "$hdr" | cut -d: -f2- | tr -d '\r' | sed 's/^ *//' || true; }
-    printf 'wrote %s (%s bytes): %s, voice %s, %s characters, %s s of audio billed, $%s (%s); speech today $%s\n' \
-      "$out" "$(wc -c < "$out" | tr -d ' ')" "$(field x-ring-speech-model)" "$(field x-ring-speech-voice)" "$(field x-ring-speech-chars)" \
+    printf 'wrote %s (%s bytes): %s, voice %s%s, %s characters, %s s of audio billed, $%s (%s); speech today $%s\n' \
+      "$out" "$(wc -c < "$out" | tr -d ' ')" "$(field x-ring-speech-model)" "$(field x-ring-speech-voice)" "${speed:+, speed $speed}" "$(field x-ring-speech-chars)" \
       "$(field x-ring-speech-seconds)" "$(field x-ring-speech-usd)" "$(field x-ring-speech-usd-from)" "$(field x-ring-speech-today-usd)" ;;
   '' | -h | --help | help) usage ;;
   *) usage >&2; exit 64 ;;

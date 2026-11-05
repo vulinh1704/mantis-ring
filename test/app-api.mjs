@@ -1052,6 +1052,21 @@ console.log('1/1 ${s} checks passed');
     `ok: exit ${ttsOk.status} ${oneLine(ttsOk.stdout)} ${oneLine(ttsOk.stderr)}; body ${JSON.stringify(ttsBody)}; refused: exit ${ttsNo.status} ${oneLine(ttsNo.stderr)}, left ${leftOver.join(' ') || 'nothing'}; `
       + `bad: ${ttsBad.map((r) => `${r.status} ${oneLine(r.stderr)}`).join(' / ')}; ${sshCalls} call(s) reached ssh`);
 
+  // ring.sh tts with a speed (the video's voice read slower): sent as a JSON number, with "-" standing for
+  // the model's own voice; a speed outside 0.5 to 2, or not a plain decimal, stops before ssh.
+  const linesBefore = (await readFile(ttsLog, 'utf8')).split('\n').length;
+  const ttsSlow = ringTts(ttsSsh, ['chatterbox', textFile, path.join(outDir, 'slow.wav'), '-', '0.85']);
+  const slowSent = (await readFile(ttsLog, 'utf8')).split('\n').slice(linesBefore - 1);
+  let slowBody = null;
+  try { slowBody = JSON.parse(slowSent.find((l) => l.startsWith('{')) ?? ''); } catch { slowBody = null; }
+  const speedBad = ['3', '0.4', 'fast', '1e0', '0.85x', '-1'].map((s) => ringTts(ttsSsh, ['chatterbox', textFile, path.join(outDir, 'y.wav'), 'default', s]));
+  const callsAfter = (await readFile(ttsLog, 'utf8')).split('\n').filter((l) => l.includes('/admin/speech')).length;
+  check('scripts/ring.sh tts sends a speed from 0.5 to 2 as a number ("-" keeps the model\'s own voice) and prints it; any other speed stops before ssh',
+    ttsSlow.status === 0 && slowBody?.speed === 0.85 && slowBody !== null && !Object.hasOwn(slowBody, 'voice') && /, speed 0\.85,/.test(ttsSlow.stdout)
+      && speedBad.every((r) => r.status !== 0 && /speed must be a number from 0\.5 to 2/.test(r.stderr)) && callsAfter === sshCalls + 1,
+    `slow: exit ${ttsSlow.status} ${oneLine(ttsSlow.stdout)} ${oneLine(ttsSlow.stderr)}; body ${JSON.stringify(slowBody)}; `
+      + `bad: ${speedBad.map((r) => `${r.status} ${oneLine(r.stderr)}`).join(' / ')}; ${callsAfter - sshCalls} more call(s) reached ssh`);
+
   // scripts/ring.sh selftest and the --selftest step of scripts/deploy.sh, against a stand-in for ssh that
   // plays the app's answers from files in RING_FAKE_DIR: a suite's stream for POST /admin/selftest, JSON
   // for /admin/busy and /status.json. deploy.sh is sourced with RING_TEST=1, so it only defines its
