@@ -51,7 +51,8 @@ S=("$SSH_BIN" "${SSH_OPTS[@]}" "$H")
 APP=http://127.0.0.1:8080
 
 die() { printf 'ring.sh: %s\n' "$*" >&2; exit 1; }
-usage() { sed -n '8,40p' "$0" | sed 's/^# \{0,1\}//'; }
+# The help is the comment block from line 8 down to `set -euo pipefail`, however long it grows.
+usage() { sed -n '8,/^set -euo pipefail$/{/^#/p;}' "$0" | sed 's/^# \{0,1\}//'; }
 if [ -n "${RING_SSH:-}" ] && [ ! -x "$RING_SSH" ]; then die "RING_SSH is set but is not an executable file: $RING_SSH"; fi
 if [ "${RING_TEST:-}" = 1 ]; then
   [ "$HOST_ADDR" != "$REAL_HOST" ] || die "RING_TEST=1, but the host is the real VM: set RING_HOST"
@@ -180,8 +181,8 @@ case "$cmd" in
     [[ $model =~ ^[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}$ ]] || die "not a model id: $model"
     [ -z "$voice" ] || [[ $voice =~ ^[a-z][a-z0-9_]{0,39}$ ]] || die "not a voice name: $voice"
     # The app takes a speed from 0.5 to 2 (a JSON number); anything else stops here, before ssh.
-    [ -z "$speed" ] || { [[ $speed =~ ^[0-9](\.[0-9]{1,3})?$ ]] && awk -v s="$speed" 'BEGIN { exit !(s >= 0.5 && s <= 2) }'; } \
-      || die "speed must be a number from 0.5 to 2: $speed"
+    [ -z "$speed" ] || { [[ $speed =~ ^[0-9](\.[0-9]+)?$ ]] && awk -v s="$speed" 'BEGIN { exit !(s >= 0.5 && s <= 2) }'; } \
+      || die "speed must be a decimal from 0.5 to 2, such as 0.75: $speed"
     { [ -f "$textfile" ] && [ -r "$textfile" ]; } || die "cannot read the text file: $textfile"
     fmt=${out##*.}
     case "$fmt" in

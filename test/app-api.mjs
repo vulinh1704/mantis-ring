@@ -1053,19 +1053,33 @@ console.log('1/1 ${s} checks passed');
       + `bad: ${ttsBad.map((r) => `${r.status} ${oneLine(r.stderr)}`).join(' / ')}; ${sshCalls} call(s) reached ssh`);
 
   // ring.sh tts with a speed (the video's voice read slower): sent as a JSON number, with "-" standing for
-  // the model's own voice; a speed outside 0.5 to 2, or not a plain decimal, stops before ssh.
+  // the model's own voice; both ends (0.5 and 2) and any number of decimals pass, and a speed outside 0.5
+  // to 2, or not a plain decimal, stops before ssh.
   const linesBefore = (await readFile(ttsLog, 'utf8')).split('\n').length;
   const ttsSlow = ringTts(ttsSsh, ['chatterbox', textFile, path.join(outDir, 'slow.wav'), '-', '0.85']);
-  const slowSent = (await readFile(ttsLog, 'utf8')).split('\n').slice(linesBefore - 1);
-  let slowBody = null;
-  try { slowBody = JSON.parse(slowSent.find((l) => l.startsWith('{')) ?? ''); } catch { slowBody = null; }
-  const speedBad = ['3', '0.4', 'fast', '1e0', '0.85x', '-1'].map((s) => ringTts(ttsSsh, ['chatterbox', textFile, path.join(outDir, 'y.wav'), 'default', s]));
+  const speedEdges = ['0.5', '2', '0.8125'].map((s) => ringTts(ttsSsh, ['chatterbox', textFile, path.join(outDir, 'edge.wav'), 'default', s]));
+  const speedBodies = (await readFile(ttsLog, 'utf8')).split('\n').slice(linesBefore - 1).filter((l) => l.startsWith('{'))
+    .map((l) => { try { return JSON.parse(l); } catch { return null; } });
+  const slowBody = speedBodies[0] ?? null;
+  const speedBad = ['3', '0.4', 'fast', '1e0', '0.85x', '-1', '.5', '1.'].map((s) => ringTts(ttsSsh, ['chatterbox', textFile, path.join(outDir, 'y.wav'), 'default', s]));
   const callsAfter = (await readFile(ttsLog, 'utf8')).split('\n').filter((l) => l.includes('/admin/speech')).length;
   check('scripts/ring.sh tts sends a speed from 0.5 to 2 as a number ("-" keeps the model\'s own voice) and prints it; any other speed stops before ssh',
-    ttsSlow.status === 0 && slowBody?.speed === 0.85 && slowBody !== null && !Object.hasOwn(slowBody, 'voice') && /, speed 0\.85,/.test(ttsSlow.stdout)
-      && speedBad.every((r) => r.status !== 0 && /speed must be a number from 0\.5 to 2/.test(r.stderr)) && callsAfter === sshCalls + 1,
-    `slow: exit ${ttsSlow.status} ${oneLine(ttsSlow.stdout)} ${oneLine(ttsSlow.stderr)}; body ${JSON.stringify(slowBody)}; `
-      + `bad: ${speedBad.map((r) => `${r.status} ${oneLine(r.stderr)}`).join(' / ')}; ${callsAfter - sshCalls} more call(s) reached ssh`);
+    ttsSlow.status === 0 && slowBody !== null && slowBody.speed === 0.85 && !Object.hasOwn(slowBody, 'voice') && /, speed 0\.85,/.test(ttsSlow.stdout)
+      && speedEdges.every((r) => r.status === 0) && speedBodies.map((b) => b?.speed).join(' ') === '0.85 0.5 2 0.8125'
+      && speedBad.every((r) => r.status !== 0 && /speed must be a decimal from 0\.5 to 2/.test(r.stderr)) && callsAfter === sshCalls + 4,
+    `slow: exit ${ttsSlow.status} ${oneLine(ttsSlow.stdout)} ${oneLine(ttsSlow.stderr)}; speeds sent ${speedBodies.map((b) => b?.speed).join(' ')}; `
+      + `edges: ${speedEdges.map((r) => r.status).join(' ')}; bad: ${speedBad.map((r) => `${r.status} ${oneLine(r.stderr)}`).join(' / ')}; ${callsAfter - sshCalls} more call(s) reached ssh`);
+
+  // ring.sh help prints the whole comment header, down to the line before `set -euo pipefail`; a fixed
+  // line range once cut its last lines when the tts help grew.
+  const ringHelp = spawnSync('bash', [ringSh, 'help'], {
+    encoding: 'utf8', timeout: 20_000,
+    env: { PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin', HOME: stateDir, LANG: 'C.UTF-8', RING_TEST: '1', RING_HOST: '192.0.2.1', RING_SSH: ttsSsh },
+  });
+  check('scripts/ring.sh help prints the whole header: from "Usage:" to the RING_TEST note, and no code',
+    ringHelp.status === 0 && /^Usage: scripts\/ring\.sh <command> \[args\]$/m.test(ringHelp.stdout) && /tts <model> <text-file> <out-file> \[voice\|- \[speed\]\]/.test(ringHelp.stdout)
+      && /With RING_TEST=1 the script refuses the real ssh and the real VM\.$/m.test(ringHelp.stdout) && !/set -euo pipefail|REAL_HOST=/.test(ringHelp.stdout),
+    `exit ${ringHelp.status}; ${ringHelp.stdout.split('\n').length} line(s); last: ${oneLine(ringHelp.stdout.trim().split('\n').slice(-1)[0] ?? '')}`);
 
   // Every script in scripts/ is run as a command (the README, deploy.sh, the docs), so each keeps its
   // executable bit. An edit saved from Windows through \\wsl.localhost drops it without a word.
